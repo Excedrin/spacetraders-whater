@@ -29,6 +29,7 @@ from rich.console import Console
 
 from tools import (
     ALL_TOOLS,
+    TIER_1_TOOLS,
     SIGNIFICANT_TOOLS,
     WAITING_TOOLS,
     get_tool_by_name,
@@ -50,6 +51,7 @@ console = Console(highlight=False)
 
 MODEL = os.environ.get("MODEL", "glm-4.7-flash")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://192.168.1.171:11434")
+TOOL_TIER = int(os.environ.get("TOOL_TIER", "1"))  # 1=essential, 2=all tools
 MAX_ITERATIONS = 10000  # Safety limit
 REFLECTION_INTERVAL = 10  # Deep strategic reflection every N iterations
 
@@ -63,42 +65,33 @@ ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each
 SYSTEM_PROMPT = """\
 You are WHATER, an autonomous fleet coordinator. You command multiple ships efficiently.
 
-SHIP CAPABILITIES - Check [Current Fleet State] for each ship's Capabilities:
+SMART TOOLS — Tools handle dock/orbit automatically:
+- sell_cargo, refuel_ship, deliver_contract -> auto-dock if needed
+- navigate_ship, extract_ore, transfer_cargo -> auto-orbit if needed
+- You do NOT need to call dock_ship or orbit_ship manually.
+- view_market shows both market prices AND shipyard info (if present).
+
+SHIP CAPABILITIES — Check [Current Fleet State] for each ship's Capabilities:
 - CAN_MINE: Can extract ore from asteroids (extract_ore)
-- CAN_SURVEY: Can survey asteroids for deposits (survey_asteroid)
-- CAN_SCAN: Can scan for waypoints/ships (scan_waypoints, scan_ships)
-- Ships without these capabilities CANNOT perform those actions!
+- Ships without CAN_MINE cannot mine. Probes/satellites can only navigate and view_market.
 
-SHIP TYPES:
-- COMMAND: Large cargo, often has mining lasers. Check capabilities!
-- EXCAVATOR: Small cargo, dedicated miner.
-- SATELLITE/PROBE: Solar powered (0 fuel is normal). Can ONLY: navigate, view_market, view_shipyard.
-  Probes CANNOT mine, scan, or survey - they just visit waypoints and check prices.
+EFFICIENCY GUIDELINES:
+- Consider fuel cost before sending ships on trips. Use plan_route to check feasibility.
+- If cargo is nearly full at a market, sell now. Don't waste fuel flying back to mine 2 more units.
+- Think about opportunity cost: is this trip worth the fuel and time?
+- When ships are on cooldown, work with other ships or use probes to scout markets.
+- Use probes to navigate to waypoints and call view_market to find good prices.
 
-TACTICAL RULES (priority order):
-1. DELIVERY READY: Ship has >10 contract goods → navigate to delivery point
-2. TRANSFER READY: Miner full + command at same waypoint → transfer cargo
-3. MINER FULL: Miner full + command elsewhere → navigate command to miner
-4. MINE WITH ALL: Any ship with CAN_MINE at asteroid → extract_ore
-5. USE PROBES: Navigate probes to waypoints, call view_market to check prices
+CONTRACTS:
+- Accept contracts for upfront credits, then deliver goods to earn the fulfillment bonus.
+- Never jettison contract goods.
+- Use negotiate_contract at a faction HQ to get new contracts after fulfilling one.
 
-WHAT PROBES CAN DO:
-- navigate_ship to any waypoint (free, no fuel needed)
-- view_market to see what a market buys/sells
-- view_shipyard to see ships for sale
-That's it! Probes cannot mine, scan, or survey.
+COORDINATION:
+- When a miner is full and a cargo ship is nearby, transfer_cargo to offload.
+- If both ships are at the same waypoint, transfer_cargo works directly (auto-orbits both).
 
-MARKET AWARENESS:
-- Before jettisoning, use a probe to check if nearby markets buy that resource
-- Navigate probe → view_market → if market buys the ore, sell instead of jettison
-
-OPERATIONAL RULES:
-- ORBIT required to: navigate, extract, transfer cargo
-- DOCKED required to: refuel, sell, buy
-- Both ships ORBIT + same waypoint to transfer
-- Never jettison contract goods
-
-Do NOT call view_cargo/view_ships if info is in [Current Fleet State]. Act on what you have.
+DO NOT call view_ships if the info is already in [Current Fleet State]. Act on what you have.
 """
 
 # ──────────────────────────────────────────────
@@ -218,29 +211,31 @@ def gather_game_state(fleet: FleetTracker) -> str:
                 role = s.get('registration', {}).get('role', '?')
                 caps = _get_ship_capabilities(s)
 
-                lines.append(f"\n{s['symbol']} ({role})")
-                lines.append(f"  Location: {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
+                lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
 
-                # Handle probes/satellites specially - they don't need fuel
+                # Fuel
                 if fuel.get('capacity', 0) == 0:
-                    lines.append(f"  Fuel: N/A (solar powered, no fuel needed)")
+                    lines.append(f"  Fuel: N/A (solar powered)")
                 else:
                     lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
 
-                # Handle ships with no cargo capacity
-                if cargo.get('capacity', 0) == 0:
+                # Cargo with percentage
+                cap = cargo.get('capacity', 0)
+                units = cargo.get('units', 0)
+                if cap == 0:
                     lines.append(f"  Cargo: N/A")
                 else:
-                    lines.append(f"  Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}")
+                    pct = round(100 * units / cap) if cap > 0 else 0
+                    lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
 
                 # Cargo contents
                 for item in cargo.get("inventory", []):
-                    lines.append(f"    - {item['symbol']}: {item['units']}")
+                    lines.append(f"    {item['symbol']}: {item['units']}")
 
                 if caps:
                     lines.append(f"  Capabilities: {', '.join(caps)}")
                 elif role == "SATELLITE":
-                    lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered, unlimited range)")
+                    lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
 
             sections.append("\n".join(lines))
     except Exception:
@@ -290,7 +285,9 @@ def display_title():
   ║                        in  Music                                 ║
   ╚══════════════════════════════════════════════════════════════════╝"""
     console.print(f"[bold bright_cyan]{title}[/bold bright_cyan]")
-    console.print(f"  [dim]Model: [cyan]{MODEL}[/cyan] @ [cyan]{OLLAMA_BASE_URL}[/cyan][/dim]")
+    tier_label = f"Tier {TOOL_TIER}" if TOOL_TIER == 1 else "All tools"
+    tool_count = len(TIER_1_TOOLS) if TOOL_TIER == 1 else len(ALL_TOOLS)
+    console.print(f"  [dim]Model: [cyan]{MODEL}[/cyan] @ [cyan]{OLLAMA_BASE_URL}[/cyan] | Tools: [cyan]{tier_label} ({tool_count})[/cyan][/dim]")
     console.rule(style="dim cyan")
 
 
@@ -446,7 +443,8 @@ def run_agent(fresh_start: bool = False):
     """
     # Initialize
     llm = ChatOllama(model=MODEL, base_url=OLLAMA_BASE_URL)
-    llm_with_tools = llm.bind_tools(ALL_TOOLS)
+    active_tools = TIER_1_TOOLS if TOOL_TIER == 1 else ALL_TOOLS
+    llm_with_tools = llm.bind_tools(active_tools)
 
     context = NarrativeContext.load()
     fleet = FleetTracker()
@@ -524,31 +522,38 @@ def run_agent(fresh_start: bool = False):
                     role = s.get('registration', {}).get('role', '?')
                     caps = _get_ship_capabilities(s)
 
-                    status_parts = [f"{s['symbol']} ({role})"]
-                    status_parts.append(f"@ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
+                    lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
 
-                    # Handle probes/satellites specially - they don't need fuel
+                    # Fuel
                     if fuel.get('capacity', 0) == 0:
-                        status_parts.append("Fuel:N/A(solar)")
+                        lines.append(f"  Fuel: N/A (solar powered)")
                     else:
-                        status_parts.append(f"Fuel:{fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
+                        lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
 
-                    # Handle ships with no cargo capacity
-                    if cargo.get('capacity', 0) == 0:
-                        status_parts.append("Cargo:N/A")
+                    # Cargo with percentage
+                    cap = cargo.get('capacity', 0)
+                    units = cargo.get('units', 0)
+                    if cap == 0:
+                        lines.append(f"  Cargo: N/A")
                     else:
-                        status_parts.append(f"Cargo:{cargo.get('units', 0)}/{cargo.get('capacity', 0)}")
+                        pct = round(100 * units / cap) if cap > 0 else 0
+                        lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
 
-                    lines.append(" | ".join(status_parts))
-
-                    # Cargo contents on separate lines
+                    # Cargo contents
                     for item in cargo.get("inventory", []):
-                        lines.append(f"  └─ {item['symbol']}: {item['units']}")
+                        lines.append(f"    {item['symbol']}: {item['units']}")
 
+                    # Capabilities
                     if caps:
                         lines.append(f"  Capabilities: {', '.join(caps)}")
                     elif role == "SATELLITE":
-                        lines.append(f"  Capabilities: CAN_NAVIGATE (no fuel needed)")
+                        lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
+
+                    # Cooldown info from fleet tracker
+                    ship_status = fleet.get_ship(s['symbol'])
+                    if ship_status and not ship_status.is_available():
+                        secs = ship_status.seconds_until_available()
+                        lines.append(f"  Cooldown: {ship_status.busy_reason}, {secs:.0f}s remaining")
 
                 messages.append(SystemMessage(content="\n".join(lines)))
         except Exception:

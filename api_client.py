@@ -59,6 +59,9 @@ class SpaceTradersClient:
     def list_ships(self) -> dict:
         return self._request("GET", "/my/ships")
 
+    def get_ship(self, ship: str) -> dict:
+        return self._request("GET", f"/my/ships/{ship}")
+
     def purchase_ship(self, ship_type: str, waypoint: str) -> dict:
         return self._request("POST", "/my/ships", json={
             "shipType": ship_type,
