@@ -1,6 +1,8 @@
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -9,6 +11,38 @@ from api_client import SpaceTradersClient
 
 load_dotenv()
 client = SpaceTradersClient(os.environ["TOKEN"])
+
+
+MARKET_CACHE_FILE = Path("market_cache.json")
+
+
+def load_market_cache() -> dict:
+    """Load cached market data."""
+    if MARKET_CACHE_FILE.exists():
+        try:
+            return json.loads(MARKET_CACHE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_market_to_cache(waypoint_symbol: str, data: dict):
+    """Save market data to cache after a view_market call."""
+    cache = load_market_cache()
+    entry = {}
+    for section in ("exports", "imports", "exchange"):
+        items = data.get(section, [])
+        if items:
+            entry[section] = [i["symbol"] for i in items]
+    trade_goods = data.get("tradeGoods", [])
+    if trade_goods:
+        entry["trade_goods"] = [
+            {"symbol": g["symbol"], "sellPrice": g.get("sellPrice"), "tradeVolume": g.get("tradeVolume")}
+            for g in trade_goods
+        ]
+    if entry:
+        cache[waypoint_symbol] = entry
+        MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
 def _ensure_orbit(ship_symbol: str) -> str | None:
@@ -296,6 +330,8 @@ def view_market(system_symbol: str, waypoint_symbol: str) -> str:
             for g in trade_goods:
                 lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} "
                               f"(volume: {g.get('tradeVolume', '?')})")
+        # Cache market data for future reference
+        _save_market_to_cache(waypoint_symbol, data)
     else:
         lines.append(f"No market at {waypoint_symbol}.")
 
@@ -728,23 +764,15 @@ def fulfill_contract(contract_id: str) -> str:
 
 
 # ──────────────────────────────────────────────
-#  Wait tool
+#  Planning tool
 # ──────────────────────────────────────────────
 
 @tool
-def wait(seconds: int) -> str:
-    """Wait for a specified number of seconds. Use this when all your ships are on cooldown or in transit and there's nothing else to do. Maximum wait is 300 seconds (5 minutes)."""
-    import time
-    # Cap at 5 minutes
-    seconds = min(seconds, 300)
-    if seconds <= 0:
-        return "No waiting needed."
-
-    time.sleep(seconds)
-    return f"Waited {seconds} seconds. Ships may now be available."
-
-# Track wait time for the bot loop
-wait._last_wait = 0.0
+def update_plan(plan: str) -> str:
+    """Write or update your current plan. The plan is shown to you at the start of every turn in [Current Plan]. Use this to record what you intend to do and why, track multi-step goals, and note important discoveries. The plan is also visible to the human operator who can edit it."""
+    from pathlib import Path
+    Path("plan.txt").write_text(plan, encoding="utf-8")
+    return f"Plan updated ({len(plan)} chars). It will appear in your next game state."
 
 
 # ──────────────────────────────────────────────
@@ -764,6 +792,8 @@ TIER_1_TOOLS = [
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Info (view_market includes shipyard data)
     view_market, view_ships, find_waypoints, view_contracts,
+    # Planning
+    update_plan,
 ]
 
 # All tools (tier 2) — includes advanced/exploration tools
@@ -785,6 +815,8 @@ ALL_TOOLS = [
     scan_waypoints, scan_ships, chart_waypoint,
     # Inter-system travel
     jump_ship, warp_ship, set_flight_mode,
+    # Planning
+    update_plan,
 ]
 
 # Tools that are "significant" actions worth narrating

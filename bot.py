@@ -34,6 +34,7 @@ from tools import (
     WAITING_TOOLS,
     get_tool_by_name,
     get_last_wait,
+    load_market_cache,
 )
 from narrative import NarrativeContext, generate_narrative, generate_strategic_reflection, NarrativeSegment
 from ship_status import FleetTracker
@@ -65,33 +66,38 @@ ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each
 SYSTEM_PROMPT = """\
 You are WHATER, an autonomous fleet coordinator. You command multiple ships efficiently.
 
+PLANNING — Think before acting:
+- Your [Current Plan] is shown every turn. Keep it updated with update_plan.
+- Before taking actions, review the plan. Update it if the situation has changed.
+- A good plan includes: current goal, why, specific next steps for each ship, and what to do after.
+- The human operator can see and edit plan.txt. Write plans clearly.
+
 SMART TOOLS — Tools handle dock/orbit automatically:
 - sell_cargo, refuel_ship, deliver_contract -> auto-dock if needed
 - navigate_ship, extract_ore, transfer_cargo -> auto-orbit if needed
 - You do NOT need to call dock_ship or orbit_ship manually.
 - view_market shows both market prices AND shipyard info (if present).
+- Known market data is cached in [Known Markets] so you don't need to re-check.
 
-SHIP CAPABILITIES — Check [Current Fleet State] for each ship's Capabilities:
+SHIP CAPABILITIES — Check [Fleet Status] for each ship's Capabilities:
 - CAN_MINE: Can extract ore from asteroids (extract_ore)
 - Ships without CAN_MINE cannot mine. Probes/satellites can only navigate and view_market.
 
-EFFICIENCY GUIDELINES:
-- Consider fuel cost before sending ships on trips. Use plan_route to check feasibility.
-- If cargo is nearly full at a market, sell now. Don't waste fuel flying back to mine 2 more units.
-- Think about opportunity cost: is this trip worth the fuel and time?
+EFFICIENCY:
+- Use plan_route before trips to check fuel feasibility.
+- If cargo is nearly full at a market, sell now. Don't waste fuel to mine 2 more units.
 - When ships are on cooldown, work with other ships or use probes to scout markets.
-- Use probes to navigate to waypoints and call view_market to find good prices.
 
 CONTRACTS:
-- Accept contracts for upfront credits, then deliver goods to earn the fulfillment bonus.
+- Accept contracts for upfront credits, then deliver goods for the fulfillment bonus.
 - Never jettison contract goods.
-- Use negotiate_contract at a faction HQ to get new contracts after fulfilling one.
+- Use negotiate_contract at a faction HQ for new contracts after fulfilling one.
 
 COORDINATION:
 - When a miner is full and a cargo ship is nearby, transfer_cargo to offload.
-- If both ships are at the same waypoint, transfer_cargo works directly (auto-orbits both).
+- transfer_cargo auto-orbits both ships at the same waypoint.
 
-DO NOT call view_ships if the info is already in [Current Fleet State]. Act on what you have.
+DO NOT call view_ships if the info is already in [Fleet Status]. Act on what you have.
 """
 
 # ──────────────────────────────────────────────
@@ -174,14 +180,76 @@ def clear_session():
         SESSION_FILE.unlink()
 
 
+PLAN_FILE = Path("plan.txt")
+
+
+def load_plan() -> str:
+    """Load the current plan from plan.txt."""
+    if PLAN_FILE.exists():
+        try:
+            return PLAN_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
+    """Build fleet status lines from API ship data. Shared by gather_game_state and iteration loop."""
+    from tools import _get_ship_capabilities
+
+    lines = []
+    for s in ships_data:
+        nav = s.get("nav", {})
+        fuel = s.get("fuel", {})
+        cargo = s.get("cargo", {})
+        role = s.get('registration', {}).get('role', '?')
+        caps = _get_ship_capabilities(s)
+
+        lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
+
+        # Fuel
+        if fuel.get('capacity', 0) == 0:
+            lines.append(f"  Fuel: N/A (solar powered)")
+        else:
+            lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
+
+        # Cargo with percentage
+        cap = cargo.get('capacity', 0)
+        units = cargo.get('units', 0)
+        if cap == 0:
+            lines.append(f"  Cargo: N/A")
+        else:
+            pct = round(100 * units / cap) if cap > 0 else 0
+            lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
+
+        # Cargo contents
+        for item in cargo.get("inventory", []):
+            lines.append(f"    {item['symbol']}: {item['units']}")
+
+        # Capabilities
+        if caps:
+            lines.append(f"  Capabilities: {', '.join(caps)}")
+        elif role == "SATELLITE":
+            lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
+
+        # Cooldown info from fleet tracker
+        ship_status = fleet.get_ship(s['symbol'])
+        if ship_status and not ship_status.is_available():
+            secs = ship_status.seconds_until_available()
+            lines.append(f"  Cooldown: {ship_status.busy_reason}, {secs:.0f}s remaining")
+
+    return lines
+
+
 def gather_game_state(fleet: FleetTracker) -> str:
     """
     Gather comprehensive game state from the API.
 
-    Returns a formatted string with all relevant state info that can be
-    injected directly into the LLM context, avoiding multiple tool calls.
+    Returns a single formatted string with ALL relevant state:
+    agent info, fleet status, contracts, and known markets.
+    This is the ONLY game state injection — no separate fleet injection.
     """
-    from tools import client, _get_ship_capabilities
+    from tools import client
 
     sections = []
 
@@ -198,46 +266,13 @@ def gather_game_state(fleet: FleetTracker) -> str:
     except Exception:
         pass
 
-    # Ships with full details
+    # Fleet status
     try:
         ships_data = client.list_ships()
         if isinstance(ships_data, list):
             fleet.update_from_api(ships_data)
-            lines = ["[Fleet Status]"]
-            for s in ships_data:
-                nav = s.get("nav", {})
-                fuel = s.get("fuel", {})
-                cargo = s.get("cargo", {})
-                role = s.get('registration', {}).get('role', '?')
-                caps = _get_ship_capabilities(s)
-
-                lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
-
-                # Fuel
-                if fuel.get('capacity', 0) == 0:
-                    lines.append(f"  Fuel: N/A (solar powered)")
-                else:
-                    lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
-
-                # Cargo with percentage
-                cap = cargo.get('capacity', 0)
-                units = cargo.get('units', 0)
-                if cap == 0:
-                    lines.append(f"  Cargo: N/A")
-                else:
-                    pct = round(100 * units / cap) if cap > 0 else 0
-                    lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
-
-                # Cargo contents
-                for item in cargo.get("inventory", []):
-                    lines.append(f"    {item['symbol']}: {item['units']}")
-
-                if caps:
-                    lines.append(f"  Capabilities: {', '.join(caps)}")
-                elif role == "SATELLITE":
-                    lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
-
-            sections.append("\n".join(lines))
+            fleet_lines = ["[Fleet Status]"] + _build_fleet_lines(ships_data, fleet)
+            sections.append("\n".join(fleet_lines))
     except Exception:
         pass
 
@@ -265,6 +300,28 @@ def gather_game_state(fleet: FleetTracker) -> str:
             sections.append("[Contracts]\nNo contracts available.")
     except Exception:
         pass
+
+    # Known markets (from cache)
+    market_cache = load_market_cache()
+    if market_cache:
+        lines = ["[Known Markets]"]
+        for wp_symbol, mdata in market_cache.items():
+            lines.append(f"\n{wp_symbol}:")
+            if mdata.get("exports"):
+                lines.append(f"  Exports: {', '.join(mdata['exports'])}")
+            if mdata.get("imports"):
+                lines.append(f"  Imports: {', '.join(mdata['imports'])}")
+            if mdata.get("exchange"):
+                lines.append(f"  Exchange: {', '.join(mdata['exchange'])}")
+            if mdata.get("trade_goods"):
+                for g in mdata["trade_goods"]:
+                    lines.append(f"  {g['symbol']}: sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
+        sections.append("\n".join(lines))
+
+    # Current plan (from file)
+    plan = load_plan()
+    if plan:
+        sections.append(f"[Current Plan]\n{plan}")
 
     if sections:
         return "=== CURRENT GAME STATE ===\n\n" + "\n\n".join(sections)
@@ -496,7 +553,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             messages.append(SystemMessage(content=fresh_state))
 
         messages.append(HumanMessage(
-            content="Review the game state above. Decide what to do next and start working towards your goals."
+            content="Review the game state above. First, call update_plan to write a plan covering your goals and next steps for each ship. Then start executing the plan."
         ))
 
     for iteration in range(start_iteration, MAX_ITERATIONS):
@@ -508,60 +565,10 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         if len(messages) < old_count:
             console.print(f"  [dim yellow]Pruned {old_count - len(messages)} old messages[/dim yellow]")
 
-        # Inject current fleet state before every decision
-        # Use fresh API data for accuracy (cargo contents, etc.)
-        try:
-            from tools import client, _get_ship_capabilities
-            ships_data = client.list_ships()
-            if isinstance(ships_data, list):
-                fleet.update_from_api(ships_data)
-                lines = ["[Current Fleet State]"]
-                for s in ships_data:
-                    nav = s.get("nav", {})
-                    fuel = s.get("fuel", {})
-                    cargo = s.get("cargo", {})
-                    role = s.get('registration', {}).get('role', '?')
-                    caps = _get_ship_capabilities(s)
-
-                    lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
-
-                    # Fuel
-                    if fuel.get('capacity', 0) == 0:
-                        lines.append(f"  Fuel: N/A (solar powered)")
-                    else:
-                        lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
-
-                    # Cargo with percentage
-                    cap = cargo.get('capacity', 0)
-                    units = cargo.get('units', 0)
-                    if cap == 0:
-                        lines.append(f"  Cargo: N/A")
-                    else:
-                        pct = round(100 * units / cap) if cap > 0 else 0
-                        lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
-
-                    # Cargo contents
-                    for item in cargo.get("inventory", []):
-                        lines.append(f"    {item['symbol']}: {item['units']}")
-
-                    # Capabilities
-                    if caps:
-                        lines.append(f"  Capabilities: {', '.join(caps)}")
-                    elif role == "SATELLITE":
-                        lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
-
-                    # Cooldown info from fleet tracker
-                    ship_status = fleet.get_ship(s['symbol'])
-                    if ship_status and not ship_status.is_available():
-                        secs = ship_status.seconds_until_available()
-                        lines.append(f"  Cooldown: {ship_status.busy_reason}, {secs:.0f}s remaining")
-
-                messages.append(SystemMessage(content="\n".join(lines)))
-        except Exception:
-            # Fall back to cached fleet state
-            fleet_status = fleet.fleet_summary()
-            if fleet_status and fleet_status != "(No ships tracked yet)":
-                messages.append(SystemMessage(content=f"[Current Fleet State]\n{fleet_status}"))
+        # Inject unified game state (agent + fleet + contracts + markets + plan)
+        game_state = gather_game_state(fleet)
+        if game_state:
+            messages.append(SystemMessage(content=game_state))
 
         display_thinking(messages)
 
@@ -696,27 +703,13 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         fleet_state = ""
         if has_significant_action:
             try:
-                from tools import client, _get_ship_capabilities
+                from tools import client
                 ships_data = client.list_ships()
                 if isinstance(ships_data, list):
                     fleet.update_from_api(ships_data)
-                    # Build detailed fleet state with cargo contents
-                    lines = []
-                    for s in ships_data:
-                        nav = s.get("nav", {})
-                        fuel = s.get("fuel", {})
-                        cargo = s.get("cargo", {})
-                        caps = _get_ship_capabilities(s)
-                        line = f"• {s['symbol']} ({s.get('registration', {}).get('role', '?')}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]"
-                        line += f" Fuel:{fuel.get('current', '?')}/{fuel.get('capacity', '?')}"
-                        line += f" Cargo:{cargo.get('units', 0)}/{cargo.get('capacity', 0)}"
-                        lines.append(line)
-                        # Add cargo contents
-                        for item in cargo.get("inventory", []):
-                            lines.append(f"    └─ {item['symbol']}: {item['units']}")
-                    fleet_state = "\n".join(lines)
-            except Exception as e:
-                fleet_state = fleet.fleet_summary()  # Fall back to cached
+                    fleet_state = "\n".join(_build_fleet_lines(ships_data, fleet))
+            except Exception:
+                fleet_state = fleet.fleet_summary()
 
         # Optional: Generate narrative after each significant action
         # This doubles inference time per iteration, so disabled by default
@@ -799,6 +792,8 @@ if __name__ == "__main__":
         Path("story.jsonl").unlink(missing_ok=True)
         Path("events.jsonl").unlink(missing_ok=True)
         Path("fleet_state.json").unlink(missing_ok=True)
+        Path("plan.txt").unlink(missing_ok=True)
+        Path("market_cache.json").unlink(missing_ok=True)
         print("Cleared all saved state.")
         sys.exit(0)
 
