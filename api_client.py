@@ -96,3 +96,78 @@ class SpaceTradersClient:
             "symbol": symbol,
             "units": units,
         })
+
+    def transfer_cargo(self, from_ship: str, to_ship: str, symbol: str, units: int) -> dict:
+        return self._request("POST", f"/my/ships/{from_ship}/transfer", json={
+            "shipSymbol": to_ship,
+            "tradeSymbol": symbol,
+            "units": units,
+        })
+
+    # --- Advanced Ship Operations ---
+
+    def survey(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/survey")
+
+    def extract_with_survey(self, ship: str, survey: dict) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/extract/survey", json={
+            "survey": survey,
+        })
+
+    def scan_waypoints(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/scan/waypoints")
+
+    def scan_ships(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/scan/ships")
+
+    def scan_systems(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/scan/systems")
+
+    def jump(self, ship: str, system: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/jump", json={
+            "systemSymbol": system,
+        })
+
+    def warp(self, ship: str, waypoint: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/warp", json={
+            "waypointSymbol": waypoint,
+        })
+
+    def negotiate_contract(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/negotiate/contract")
+
+    def chart(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/chart")
+
+    def refine(self, ship: str, produce: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/refine", json={
+            "produce": produce,
+        })
+
+    def siphon(self, ship: str) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/siphon")
+
+    def get_cooldown(self, ship: str) -> dict:
+        return self._request("GET", f"/my/ships/{ship}/cooldown")
+
+    def set_flight_mode(self, ship: str, mode: str) -> dict:
+        return self._request("PATCH", f"/my/ships/{ship}/nav", json={
+            "flightMode": mode,
+        })
+
+    # --- Jump Gate ---
+
+    def get_jump_gate(self, system: str, waypoint: str) -> dict:
+        return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/jump-gate")
+
+    # --- Construction ---
+
+    def get_construction(self, system: str, waypoint: str) -> dict:
+        return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/construction")
+
+    def supply_construction(self, system: str, waypoint: str, ship: str, symbol: str, units: int) -> dict:
+        return self._request("POST", f"/systems/{system}/waypoints/{waypoint}/construction/supply", json={
+            "shipSymbol": ship,
+            "tradeSymbol": symbol,
+            "units": units,
+        })
