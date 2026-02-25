@@ -15,6 +15,9 @@ class SpaceTradersClient:
         if method == "POST" and "json" not in kwargs:
             kwargs["json"] = {}
         resp = self.session.request(method, f"{BASE_URL}{path}", **kwargs)
+        # Handle 204 No Content (e.g. cooldown endpoint when no cooldown active)
+        if resp.status_code == 204 or not resp.content:
+            return {}
         body = resp.json()
         if "error" in body:
             return {"error": body["error"].get("message", str(body["error"]))}

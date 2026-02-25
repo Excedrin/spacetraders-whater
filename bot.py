@@ -435,11 +435,12 @@ def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeCo
 #  Agent loop
 # ──────────────────────────────────────────────
 
-def run_agent(fresh_start: bool = False):
+def run_agent(fresh_start: bool = False, debug: bool = False):
     """Main agent loop with integrated narrative.
 
     Args:
         fresh_start: If True, ignore saved session and start fresh.
+        debug: If True, dump full LLM prompt before each decision.
     """
     # Initialize
     llm = ChatOllama(model=MODEL, base_url=OLLAMA_BASE_URL)
@@ -563,6 +564,22 @@ def run_agent(fresh_start: bool = False):
                 messages.append(SystemMessage(content=f"[Current Fleet State]\n{fleet_status}"))
 
         display_thinking(messages)
+
+        # Debug: dump full prompt
+        if debug:
+            console.print("\n[bold yellow]===== DEBUG: Full LLM Prompt =====[/bold yellow]")
+            for i, msg in enumerate(messages):
+                msg_type = type(msg).__name__
+                content = msg.content if hasattr(msg, 'content') else str(msg)
+                # Truncate very long messages in debug output
+                if len(content) > 2000:
+                    content = content[:2000] + f"\n... ({len(content)} chars total)"
+                console.print(f"[yellow]--- [{i}] {msg_type} ---[/yellow]")
+                console.print(f"[dim]{content}[/dim]")
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    console.print(f"[dim cyan]  tool_calls: {msg.tool_calls}[/dim cyan]")
+            console.print(f"[yellow]--- Tool schemas: {[t.name for t in active_tools]} ---[/yellow]")
+            console.print("[bold yellow]===== END DEBUG =====[/bold yellow]\n")
 
         # 1. DECIDE — call LLM with tools
         try:
@@ -769,6 +786,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Clear all saved state (session, narrative) and exit",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Dump full LLM prompt before each decision",
+    )
     args = parser.parse_args()
 
     if args.clear:
@@ -781,4 +803,4 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print(f"SpaceTraders bot starting (model: {MODEL})")
-    run_agent(fresh_start=args.fresh)
+    run_agent(fresh_start=args.fresh, debug=args.debug)
