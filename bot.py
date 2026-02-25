@@ -57,8 +57,16 @@ MAX_ITERATIONS = 10000  # Safety limit
 REFLECTION_INTERVAL = 10  # Deep strategic reflection every N iterations
 
 # Context management
-MAX_MESSAGES = 50  # Keep last N messages (plus system prompt)
+MAX_RECENT_TURNS = 6  # Keep last N full turns (AIMessage + ToolMessages)
 MAX_TOKENS_ESTIMATE = 8000  # Target max tokens (rough estimate)
+
+# Tools whose successful results are already captured in game state and can be compressed
+REDUNDANT_RESULT_TOOLS = {
+    "update_plan",      # plan is in [Current Plan]
+    "view_ships",       # fleet is in [Fleet Status]
+    "view_agent",       # agent is in [Agent]
+    "view_contracts",   # contracts is in [Contracts]
+}
 
 # Narrative generation (doubles inference time per iteration)
 ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each action
@@ -66,22 +74,27 @@ ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each
 SYSTEM_PROMPT = """\
 You are WHATER, an autonomous fleet coordinator. You command multiple ships efficiently.
 
-PLANNING — Think before acting:
+PLANNING IMPORTANT!!!
 - Your [Current Plan] is shown every turn. Keep it updated with update_plan.
 - Before taking actions, review the plan. Update it if the situation has changed.
 - A good plan includes: current goal, why, specific next steps for each ship, and what to do after.
 - The human operator can see and edit plan.txt. Write plans clearly.
+- Manage CARGO space by selling or jettisoning undesirable items.
 
-SMART TOOLS — Tools handle dock/orbit automatically:
-- sell_cargo, refuel_ship, deliver_contract -> auto-dock if needed
-- navigate_ship, extract_ore, transfer_cargo -> auto-orbit if needed
-- You do NOT need to call dock_ship or orbit_ship manually.
-- view_market shows both market prices AND shipyard info (if present).
+TOOLS
+- sell_cargo, refuel_ship, deliver_contract
+- navigate_ship, extract_ore, transfer_cargo
+- view_market shows both market prices AND/OR shipyard info.
 - Known market data is cached in [Known Markets] so you don't need to re-check.
 
-SHIP CAPABILITIES — Check [Fleet Status] for each ship's Capabilities:
+SHIP CAPABILITIES
 - CAN_MINE: Can extract ore from asteroids (extract_ore)
 - Ships without CAN_MINE cannot mine. Probes/satellites can only navigate and view_market.
+
+PROBE and SATELLITE use
+- PROBES and SATELLITEs can view market and shipyard data for any planet they're orbiting
+- They can move without using fuel
+- They can't do anything else, like carry cargo or extract ore
 
 EFFICIENCY:
 - Use plan_route before trips to check fuel feasibility.
@@ -95,7 +108,7 @@ CONTRACTS:
 
 COORDINATION:
 - When a miner is full and a cargo ship is nearby, transfer_cargo to offload.
-- transfer_cargo auto-orbits both ships at the same waypoint.
+- transfer_cargo requires both ships at the same waypoint.
 
 DO NOT call view_ships if the info is already in [Fleet Status]. Act on what you have.
 """
@@ -104,45 +117,59 @@ DO NOT call view_ships if the info is already in [Fleet Status]. Act on what you
 #  Session persistence
 # ──────────────────────────────────────────────
 
-def prune_messages(messages: list, max_messages: int = MAX_MESSAGES, max_tokens: int = MAX_TOKENS_ESTIMATE) -> list:
+def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max_tokens: int = MAX_TOKENS_ESTIMATE) -> list:
     """
     Prune message history to keep context manageable.
 
-    Keeps:
-    - First message (system prompt)
-    - Last N messages
-    - Ensures we stay under token budget
+    Strategy: work on turn boundaries (AIMessage + its ToolMessages = one turn).
+    - Always keep: system prompt, game state SystemMessages, opening HumanMessage
+    - Keep the last N complete turns fully
+    - Drop older turns entirely (game state already captures world state)
+    - If still over token budget, drop oldest turns
     """
-    if len(messages) <= max_messages:
-        return messages
-
-    # Always keep the system prompt (first message)
-    system_msgs = []
-    other_msgs = []
+    # Separate anchored messages (system prompt, game state, initial human) from turns
+    anchored = []
+    turn_msgs = []
 
     for msg in messages:
-        if isinstance(msg, SystemMessage) and msg.content.startswith("You are WHATER"):
-            system_msgs.append(msg)
+        if isinstance(msg, SystemMessage):
+            anchored.append(msg)
+        elif isinstance(msg, HumanMessage) and not turn_msgs:
+            # First HumanMessage is the opening prompt — anchor it
+            anchored.append(msg)
         else:
-            other_msgs.append(msg)
+            turn_msgs.append(msg)
 
-    # Keep only the last N non-system messages
-    keep_count = max_messages - len(system_msgs)
-    pruned_others = other_msgs[-keep_count:] if len(other_msgs) > keep_count else other_msgs
+    # Group turn_msgs into turns: each turn starts with an AIMessage
+    turns = []
+    current_turn = []
+    for msg in turn_msgs:
+        if isinstance(msg, AIMessage) and current_turn:
+            turns.append(current_turn)
+            current_turn = []
+        current_turn.append(msg)
+    if current_turn:
+        turns.append(current_turn)
 
-    # Combine: system prompt + recent messages
-    result = system_msgs + pruned_others
+    # Keep only the last N turns
+    if len(turns) > max_recent_turns:
+        turns = turns[-max_recent_turns:]
 
-    # Additional pruning by token estimate if still too large
-    while len(result) > 10:  # Keep at least 10 messages
+    # Flatten back
+    result = anchored
+    for turn in turns:
+        result.extend(turn)
+
+    # Token budget check — drop oldest turns if over budget
+    while len(turns) > 1:
         chars, tokens = estimate_token_count(result)
         if tokens <= max_tokens:
             break
-        # Remove oldest non-system message
-        for i, msg in enumerate(result):
-            if not (isinstance(msg, SystemMessage) and msg.content.startswith("You are WHATER")):
-                result.pop(i)
-                break
+        # Drop the oldest turn
+        dropped = turns.pop(0)
+        result = anchored
+        for turn in turns:
+            result.extend(turn)
 
     return result
 
@@ -150,10 +177,19 @@ def prune_messages(messages: list, max_messages: int = MAX_MESSAGES, max_tokens:
 def save_session(messages: list, iteration: int):
     """Save message history for restart recovery."""
     try:
+        # Filter out temporary game state SystemMessages before saving
+        # These are regenerated every iteration and shouldn't be persisted
+        filtered_messages = []
+        for msg in messages:
+            # Skip SystemMessages containing injected game state
+            if isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content:
+                continue
+            filtered_messages.append(msg)
+
         # Convert messages to serializable format
         data = {
             "iteration": iteration,
-            "messages": messages_to_dict(messages),
+            "messages": messages_to_dict(filtered_messages),
         }
         SESSION_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -241,13 +277,13 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
     return lines
 
 
-def gather_game_state(fleet: FleetTracker) -> str:
+def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> str:
     """
     Gather comprehensive game state from the API.
 
     Returns a single formatted string with ALL relevant state:
-    agent info, fleet status, contracts, and known markets.
-    This is the ONLY game state injection — no separate fleet injection.
+    agent info, fleet status, contracts, known markets, and strategic context.
+    This is the ONLY game state injection — no separate fleet or narrative injection.
     """
     from tools import client
 
@@ -322,6 +358,23 @@ def gather_game_state(fleet: FleetTracker) -> str:
     plan = load_plan()
     if plan:
         sections.append(f"[Current Plan]\n{plan}")
+
+    # Strategic context (mission, tactical plan, insights)
+    if context and (context.segments or context.current_goal != "No active goal"):
+        lines = []
+        if context.current_goal != "No active goal":
+            lines.append(f"[Current Mission]\n{context.current_goal}")
+            if context.progress:
+                lines.append(f"Progress: {context.progress}")
+        if context.tactical_plan:
+            plan_steps = "\n".join(f"{i}. {step}" for i, step in enumerate(context.tactical_plan, 1))
+            lines.append(f"[Tactical Plan]\n{plan_steps}")
+        if context.strategic_insight:
+            lines.append(f"[Strategic Insight]\n{context.strategic_insight}")
+        if context.reflection:
+            lines.append(f"[Next Actions]\n{context.reflection}")
+        if lines:
+            sections.append("\n\n".join(lines))
 
     if sections:
         return "=== CURRENT GAME STATE ===\n\n" + "\n\n".join(sections)
@@ -522,7 +575,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             console.print(f"  [dim]Loaded {len(messages)} messages from previous session[/dim]")
 
             # Fetch and inject FRESH game state on resume
-            fresh_state = gather_game_state(fleet)
+            fresh_state = gather_game_state(fleet, context)
             if fresh_state:
                 console.print(f"  [dim]Injected fresh game state[/dim]")
                 messages.append(SystemMessage(content=fresh_state))
@@ -537,18 +590,15 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             SystemMessage(content=SYSTEM_PROMPT),
         ]
 
-        # Inject narrative context if we have any
-        if context.segments or context.current_goal != "No active goal":
-            messages.append(SystemMessage(content=context.to_prompt_block()))
-            console.print("  [dim]Loaded narrative context from previous session[/dim]")
+        if context.current_goal != "No active goal":
             console.print(f"  [dim]Goal: {context.current_goal}[/dim]")
             if context.progress:
                 console.print(f"  [dim]Progress: {context.progress}[/dim]")
             console.print()
 
-        # Gather and inject full game state upfront
+        # Gather and inject full game state upfront (includes strategic context)
         console.print("  [dim]Gathering game state...[/dim]")
-        fresh_state = gather_game_state(fleet)
+        fresh_state = gather_game_state(fleet, context)
         if fresh_state:
             messages.append(SystemMessage(content=fresh_state))
 
@@ -565,8 +615,15 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         if len(messages) < old_count:
             console.print(f"  [dim yellow]Pruned {old_count - len(messages)} old messages[/dim yellow]")
 
-        # Inject unified game state (agent + fleet + contracts + markets + plan)
-        game_state = gather_game_state(fleet)
+        # Remove stale game state before injecting fresh one
+        messages = [
+            msg for msg in messages
+            if not (isinstance(msg, SystemMessage) and
+                    "=== CURRENT GAME STATE ===" in msg.content)
+        ]
+
+        # Inject unified game state (agent + fleet + contracts + markets + plan + strategy)
+        game_state = gather_game_state(fleet, context)
         if game_state:
             messages.append(SystemMessage(content=game_state))
 
@@ -673,9 +730,12 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                         elif tool_name == "extract_ore":
                             fleet.set_extraction_cooldown(ship_symbol, wait_time)
 
-            # Add tool message for LLM context
+            # Add tool message for LLM context (compress redundant results)
+            msg_content = result
+            if not is_error and tool_name in REDUNDANT_RESULT_TOOLS:
+                msg_content = "OK"
             messages.append(ToolMessage(
-                content=result,
+                content=msg_content,
                 tool_call_id=tool_call["id"],
             ))
 
@@ -750,11 +810,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 context.persist_full()
                 display_strategic_reflection(reflection_segment, context)
 
-                # Always inject context after strategic reflection
-                messages.append(SystemMessage(content=context.to_prompt_block()))
-        elif iteration % 5 == 0:
-            # Regular context injection every 5 iterations
-            messages.append(SystemMessage(content=context.to_prompt_block()))
+                # Strategic context will be included in next iteration's game state
 
         # Save session state for restart recovery
         save_session(messages, iteration)
