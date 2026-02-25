@@ -1,0 +1,6 @@
+langchain
+langchain-ollama
+python-dotenv
+requests
+rich
+ollama
