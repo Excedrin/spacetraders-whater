@@ -66,62 +66,23 @@ class NarrativeSegment:
 @dataclass
 class NarrativeContext:
     """
-    The bot's narrative memory and strategic awareness.
+    The bot's narrative memory - captain's log only.
 
-    Maintains:
-    - Current goal/mission
-    - Progress (quantified)
-    - Recent narrative segments
-    - Current reflection/strategy
-    - Strategic insights from deep reflection
-    - Tactical plan (actionable steps)
-    - Chapter number for story structure
+    Strategic planning is handled by plan.txt (updated via strategic reflection).
+    This class only maintains the factual captain's log segments.
     """
-    current_goal: str = "No active goal"
-    progress: str = ""
-    reflection: str = ""
-    strategic_insight: str = ""  # Longer-term strategic thinking
-    tactical_plan: list[str] = field(default_factory=list)  # Actionable steps
     segments: list[NarrativeSegment] = field(default_factory=list)
     chapter: int = 1  # Current chapter number
     chapter_title: str = "Awakening"  # Current chapter title
 
     def to_prompt_block(self) -> str:
-        """Render the narrative context for injection into the decision prompt."""
-        lines = [f"=== SITUATION REPORT ===", ""]
+        """Render recent captain's log entries (if any)."""
+        if not self.segments:
+            return ""
 
-        # Mission/Goal
-        lines.append("[Current Mission]")
-        lines.append(self.current_goal)
-        if self.progress:
-            lines.append(f"Progress: {self.progress}")
-        lines.append("")
-
-        # Tactical plan (if any)
-        if self.tactical_plan:
-            lines.append("[Tactical Plan]")
-            for i, step in enumerate(self.tactical_plan, 1):
-                lines.append(f"{i}. {step}")
-            lines.append("")
-
-        # Next action
-        if self.reflection:
-            lines.append("[Next Actions]")
-            lines.append(self.reflection)
-            lines.append("")
-
-        # Strategic insight (from deep reflection)
-        if self.strategic_insight:
-            lines.append("[Strategic Insight]")
-            lines.append(self.strategic_insight)
-            lines.append("")
-
-        # Recent log entries (brief)
-        if self.segments:
-            lines.append("[Recent Log]")
-            for seg in self.segments[-3:]:  # Last 3 for prompt
-                lines.append(f"• {seg.narrative}")
-            lines.append("")
+        lines = ["[Recent Log]"]
+        for seg in self.segments[-3:]:  # Last 3 entries
+            lines.append(f"• {seg.narrative}")
 
         return "\n".join(lines)
 
@@ -147,17 +108,7 @@ class NarrativeContext:
             self.segments = self.segments[-MAX_SEGMENTS:]
 
     def update_from_response(self, response: dict):
-        """Update goal, progress, reflection from narrative generation response."""
-        if "current_goal" in response:
-            self.current_goal = response["current_goal"]
-        if "progress" in response:
-            self.progress = response["progress"]
-        if "reflection" in response:
-            self.reflection = response["reflection"]
-        if "strategic_insight" in response:
-            self.strategic_insight = response["strategic_insight"]
-        if "tactical_plan" in response and isinstance(response["tactical_plan"], list):
-            self.tactical_plan = response["tactical_plan"]
+        """Update chapter info from narrative generation response."""
         if "new_chapter" in response and response["new_chapter"]:
             self.chapter += 1
             if "chapter_title" in response:
@@ -174,11 +125,6 @@ class NarrativeContext:
     def persist_full(self):
         """Write full context state (for recovery)."""
         state = {
-            "current_goal": self.current_goal,
-            "progress": self.progress,
-            "reflection": self.reflection,
-            "strategic_insight": self.strategic_insight,
-            "tactical_plan": self.tactical_plan,
             "chapter": self.chapter,
             "chapter_title": self.chapter_title,
             "segments": [s.to_dict() for s in self.segments],
@@ -196,11 +142,6 @@ class NarrativeContext:
         if state_file.exists():
             try:
                 state = json.loads(state_file.read_text())
-                context.current_goal = state.get("current_goal", "No active goal")
-                context.progress = state.get("progress", "")
-                context.reflection = state.get("reflection", "")
-                context.strategic_insight = state.get("strategic_insight", "")
-                context.tactical_plan = state.get("tactical_plan", [])
                 context.chapter = state.get("chapter", 1)
                 context.chapter_title = state.get("chapter_title", "Awakening")
                 context.segments = [
@@ -268,9 +209,6 @@ def generate_narrative(
 PREVIOUS LOG ENTRIES:
 {story_so_far}
 
-CURRENT MISSION: {context.current_goal}
-PROGRESS: {context.progress if context.progress else "Starting"}
-
 ACTIONS JUST COMPLETED:
 {events_block}
 
@@ -278,10 +216,7 @@ Record this in the captain's log. Be factual and brief.
 
 Respond in JSON format:
 {{
-  "narrative": "1-2 factual sentences. State what happened, current state, and next step.",
-  "current_goal": "Current objective",
-  "progress": "Quantified (e.g., '10/73 ICE_WATER delivered, WHATER-3 cargo 8/15')",
-  "reflection": "Next action and why"
+  "narrative": "1-2 factual sentences. State what happened and current state."
 }}"""
 
     try:
@@ -326,7 +261,7 @@ def generate_strategic_reflection(
     context: NarrativeContext,
     game_state: str,
     model: str = MODEL,
-) -> Optional[NarrativeSegment]:
+) -> tuple[Optional[NarrativeSegment], Optional[dict]]:
     """
     Generate a deep strategic reflection every ~10 cycles.
 
@@ -342,7 +277,8 @@ def generate_strategic_reflection(
         model: Model to use for generation
 
     Returns:
-        NarrativeSegment with strategic reflection, or None if generation fails
+        Tuple of (NarrativeSegment, response_dict) or (None, None) if generation fails
+        The response_dict contains the full JSON including recommended_plan
     """
     # Build a summary of recent narrative
     recent_narrative = "\n".join(
@@ -356,14 +292,8 @@ def generate_strategic_reflection(
 CURRENT GAME STATE:
 {game_state}
 
-CURRENT GOAL: {context.current_goal}
-PROGRESS: {context.progress}
-
 RECENT ACTIVITY:
 {recent_narrative}
-
-PREVIOUS STRATEGIC INSIGHT:
-{context.strategic_insight if context.strategic_insight else "(None yet)"}
 
 Analyze the situation and create an actionable plan.
 
@@ -375,19 +305,28 @@ ANALYSIS QUESTIONS:
 
 OUTPUT FORMAT (JSON):
 {{
-  "narrative": "2-3 sentences. Factual assessment of current situation and what needs to change.",
-  "current_goal": "Primary objective",
-  "progress": "Quantified progress",
-  "reflection": "Immediate next 2-3 actions to take",
-  "strategic_insight": "Key realization about how to improve. Be specific.",
-  "tactical_plan": [
-    "Step 1: specific action",
-    "Step 2: specific action",
-    "Step 3: specific action"
-  ],
+  "narrative": "2-3 sentences. Factual assessment of current situation.",
+  "recommended_plan": "Action plan with numbered steps (see rules below)",
   "new_chapter": false,
   "chapter_title": "Only if new_chapter is true"
 }}
+
+CRITICAL RULES for recommended_plan:
+- Write ONLY actionable steps (what to DO next)
+- DO NOT include current state (ship positions, fuel levels, cargo contents, distances)
+- DO NOT repeat information already in game state sections
+- Focus on GOALS and ACTIONS, not status documentation
+- Keep it concise - the bot has full context in game state
+
+Good example:
+"1. Use DRIFT mode to reach nearest fuel station
+2. Refuel both ships
+3. Navigate to asteroid and mine aluminum ore
+4. Deliver to contract waypoint"
+
+Bad example (DO NOT DO THIS):
+"WHATER-1 @ B13 with 97/400 fuel, needs 248 more to reach B6 which is 315.7 away, cargo: 1 ALUMINUM_ORE..."
+This is BAD because it's documenting state instead of planning actions.
 
 Set new_chapter=true only if: completed a major contract, acquired new ship, or discovered new system."""
 
@@ -418,11 +357,11 @@ Set new_chapter=true only if: completed a major contract, acquired new ship, or 
         # Update context with all fields including strategic insight
         context.update_from_response(data)
 
-        return segment
+        return segment, data
 
     except (json.JSONDecodeError, KeyError) as e:
         print(f"  [strategic] Failed to parse response: {e}")
-        return None
+        return None, None
     except Exception as e:
         print(f"  [strategic] Generation error: {e}")
-        return None
+        return None, None

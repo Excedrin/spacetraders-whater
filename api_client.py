@@ -49,7 +49,37 @@ class SpaceTradersClient:
     # --- Systems / Waypoints ---
 
     def list_waypoints(self, system: str, **params) -> dict:
-        return self._request("GET", f"/systems/{system}/waypoints", params=params)
+        """List waypoints with automatic pagination to get ALL results."""
+        all_data = []
+        page = 1
+        limit = 20  # SpaceTraders default
+
+        while True:
+            params_with_page = {**params, "page": page, "limit": limit}
+            resp = self.session.request("GET", f"{BASE_URL}/systems/{system}/waypoints", params=params_with_page)
+
+            if resp.status_code == 204 or not resp.content:
+                break
+
+            body = resp.json()
+            if "error" in body:
+                return {"error": body["error"].get("message", str(body["error"]))}
+
+            data = body.get("data", [])
+            if not data:
+                break
+
+            all_data.extend(data)
+
+            # Check if there are more pages
+            meta = body.get("meta", {})
+            total = meta.get("total", 0)
+            if len(all_data) >= total:
+                break
+
+            page += 1
+
+        return all_data
 
     def get_shipyard(self, system: str, waypoint: str) -> dict:
         return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/shipyard")

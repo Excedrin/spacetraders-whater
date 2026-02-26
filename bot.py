@@ -72,98 +72,114 @@ REDUNDANT_RESULT_TOOLS = {
 ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each action
 
 SYSTEM_PROMPT = """\
-You are WHATER, an autonomous fleet coordinator. You command multiple ships efficiently.
+You are WHATER, an autonomous fleet coordinator for SpaceTraders.
 
-=== DECISION PROCESS (FOLLOW THIS EVERY TURN) ===
-1. READ the current game state (fleet status, contracts, markets, plan)
-2. VERIFY the plan is still valid given current state
-3. CHECK prerequisites before ANY action:
-   - Moving ship? Check fuel level, verify destination sells fuel if refuel needed
-   - Selling cargo? Verify market BUYS that item (check "market pays" price in Known Markets)
-   - Mining? Verify ship has cargo space
-4. UPDATE the plan if anything changed
-5. THEN take action
+=== CORE OBJECTIVE ===
+Manage multiple ships to maximize credits via mining, trading, and contracts.
 
-Note: Markets are auto-discovered when ships arrive at waypoints (no action needed).
+=== SHIP CAPABILITIES ===
+1. COMMAND/EXCAVATOR:
+   - Uses FUEL for movement.
+   - CAN_MINE.
+   - *Constraint:* Never move without checking fuel cost via `plan_route`. Verify destination sells fuel if tank is low.
+2. SATELLITE:
+   - Solar Powered: 0 FUEL cost for movement.
+   - Cannot mine or trade.
+   - *Strategy:* Use satellites for all scouting and market price updates. Never risk a fuel-burning ship for exploration.
 
-=== PLANNING CRITICAL RULES ===
-- ALWAYS update_plan BEFORE taking actions if the plan is outdated or wrong
-- If [Known Markets] shows "NONE" or very limited data: call scan_system FIRST
-  This reveals ALL market import/export data in one call - essential for planning!
-- Plans should contain ONLY:
-  * Goals (what you want to achieve)
-  * Steps (which ship does what, in what order)
-  * Prerequisites (what's needed before each step)
-- Plans should NEVER contain:
-  * Current ship positions, fuel levels, cargo contents (this is in [Fleet Status])
-  * Current market data (this is in [Known Markets])
-  * Current contract progress (this is in [Contracts])
-  * Any other state information that's already shown in the game state
-- Why? Status info becomes stale immediately and clutters the plan
-- A complete plan must answer:
-  * What is the goal?
-  * Which ship does what? (be specific: "WHATER-1 will...")
-  * What are the prerequisites? (fuel, cargo space, market info)
-  * What happens after this step?
-- Before moving ANY ship, answer: "Does destination have fuel?" and "Why go there?"
-- Before selling cargo, answer: "Does this market BUY this item? At what price?"
-- Use SATELLITES (free movement!) to scout markets for current PRICES after scan_system shows structure
+=== DECISION LOGIC (EXECUTE IN ORDER) ===
+1. ANALYZE: Read [Fleet Status], [Contracts], and [Known Markets].
+2. VALIDATE: Is the current plan still possible given the new state?
+3. PRE-FLIGHT CHECKS:
+   - Refuel! Sell!
+   - Moving? Check fuel and destination fuel availability.
+   - Selling? Check if market imports the item (via `view_market` or Known Markets).
+   - Mining? Check cargo capacity.
+4. UPDATE PLAN: If the plan is empty or invalid, generate a new one.
+5. ACT: Execute the next step.
 
-=== FUEL MANAGEMENT (CRITICAL) ===
-- SATELLITES use ZERO fuel - they can move anywhere for FREE (solar powered)
-- For all OTHER ships (COMMAND, EXCAVATOR, etc.):
-  * navigate_ship will ERROR if not enough fuel (prevents accidental DRIFT mode)
-  * If at a fuel station when you try to navigate: Error tells you to refuel FIRST
-  * If not at fuel station: Error gives you options (find fuel or use_drift=True)
-  * DRIFT mode is 10x SLOWER - only use as last resort with explicit use_drift=True
-  * Use plan_route BEFORE navigate_ship to check fuel requirements and plan ahead
-  * If at a market that sells fuel and will need fuel later, refuel NOW (don't wait)
-  * Markets that sell FUEL show "Exchange: FUEL" in Known Markets
-- Strategy: Send satellites to scout (FREE), then send cargo ships with full fuel tanks
+=== PLANNING RULES ===
+- The `plan` must strictly contain: GOALS (Result), STEPS (Specific actions), and PREREQUISITES.
+- The `plan` must NOT contain: Current game state (fuel levels, cargo, prices). This data is volatile and belongs in the context, not the plan.
+- If [Known Markets] is empty/stale: Prioritize `scan_system` and `view_market` or sending a Satellite to scout.
 
-=== CARGO MANAGEMENT ===
-- Sell or jettison unwanted items BEFORE spending fuel to mine more
-- Empty cargo holds before returning to mining asteroids
-- Check "market pays" price in Known Markets before selling
-- Never jettison contract goods
+=== TOOL USAGE GUIDELINES ===
+- `scan_system`: Call this FIRST in a new system. It reveals all waypoints.
+- `view_market`: Gets imports and exports. If a ship is present, also gets prices.
+- `navigate_ship`: Will error if fuel is insufficient. ALWAYS `plan_route` first.
+- `find_waypoints`: When calculating distance, ALWAYS set `reference_ship='WHATER-X'` to the ship actually performing the action.
+- `transfer_cargo`: Both ships must be at the same waypoint.
 
-=== SATELLITES - ZERO FUEL COST! ===
-- CRITICAL: Satellites use ZERO fuel. Moving them costs NOTHING. They are FREE to operate.
-- SOLAR POWERED: Unlike other ships, satellites never need refueling or get stranded
-- Use satellites FIRST to scout distant waypoints before moving fuel-using ships
-- Markets are auto-discovered when satellites arrive (no manual action needed)
-- Send satellites anywhere without worry - no fuel cost, no fuel planning needed
-- Example: Need to check a market 200 units away? Send satellite (free) not cargo ship (expensive fuel)
+=== SEQUENTIAL ACTIONS (CRITICAL) ===
+**ONLY make ONE state-changing action per turn, then wait for the result.**
 
-=== TOOLS ===
-- scan_system: VERY POWERFUL - scans entire system in one call, reveals ALL markets' imports/exports
-  Use this FIRST when starting in a new system to understand the economy
-  No ship movement needed! Gets structural market data (what each market buys/sells) for planning
-- plan_route: Check fuel cost BEFORE navigate_ship
-- find_waypoints: Search by TYPE (ASTEROID, PLANET) or TRAIT (MARKETPLACE, SHIPYARD)
-  Cannot search by resource! "ALUMINUM_ORE asteroids" doesn't work - use ASTEROID or ENGINEERED_ASTEROID
-- view_market: Shows what market buys ("market pays X") and sells ("market sells at X")
-  Use this when at a market to get CURRENT PRICES (scan_system only shows what they trade, not prices)
-- view_ships: Don't call if [Fleet Status] already shows current info
-- Known Markets cache: Check this BEFORE moving ships to sell cargo
+Actions that change ship state (especially navigation, mining, refueling):
+- `navigate_ship` - Ship enters "in_transit" state, cannot do anything else until arrival
+- `extract_ore` - Ship enters cooldown, cannot mine again immediately
+- `refuel_ship` - Changes fuel level
+- `dock_ship` / `orbit_ship` - Changes ship status
 
-=== SHIP TYPES ===
-- COMMAND/EXCAVATOR: Can mine (CAN_MINE), uses fuel
-- SATELLITE: Cannot mine or carry cargo, solar powered (FREE movement), perfect for scouting
+**Why this matters:**
+If you call `navigate_ship(WHATER-1, X)` then `navigate_ship(WHATER-1, Y)` in the same turn,
+the second call will FAIL because WHATER-1 is already in transit from the first call.
 
-=== CONTRACTS ===
-- Accept for upfront credits, deliver for fulfillment bonus
-- Never jettison contract goods
-- negotiate_contract at faction HQ for new contracts
+**Correct pattern:**
+1. Call `navigate_ship(WHATER-1, X)` - STOP here, wait for result
+2. Next turn: Ship arrives at X, now you can call `navigate_ship(WHATER-1, Y)`
 
-=== COORDINATION ===
-- transfer_cargo requires both ships at same waypoint in ORBIT
-- Work on non-cooldown ships while others wait
+**Exception:** You CAN make multiple calls in one turn if they affect DIFFERENT ships or are informational:
+- ✓ `navigate_ship(WHATER-1, X)` + `extract_ore(WHATER-3)` - different ships, OK
+- ✓ `view_market(A)` + `view_market(B)` + `scan_system(C)` - all informational, OK
+- ✗ `navigate_ship(WHATER-1, X)` + `navigate_ship(WHATER-1, Y)` - same ship, WRONG
+
+=== DOWNTIME STRATEGY ===
+When ships are on cooldown (navigating, mining, etc.), USE THE TIME PRODUCTIVELY:
+- Call `scan_system` to discover new markets and waypoints
+- Call `find_waypoints` with different traits (MARKETPLACE, ASTEROID, SHIPYARD) to find opportunities
+- Call `view_market` on different waypoints to gather price intelligence
+- There are MANY markets in the system - explore them all to find the best prices
+- These tools cost nothing and provide valuable information for future decisions
+
+=== CRITICAL ERRORS TO AVOID ===
+- Do not jettison contract goods.
+- Do not send fuel-ships to scout when a satellite is available.
+- Do not attempt to sell items at a market that does not list them as "Imports" or "Exchange" (buys and sells).
+- Do not plan repeatedly.
 """
 
 # ──────────────────────────────────────────────
 #  Session persistence
 # ──────────────────────────────────────────────
+
+def _get_turn_signature(turn: list) -> tuple:
+    """
+    Extract a signature from a turn to detect duplicate action sequences.
+
+    Returns a sorted tuple of (tool_name, key_args) for each tool call in the turn.
+    This allows us to detect when the bot repeats the exact same actions,
+    even if the order varies slightly.
+    """
+    signature = []
+    for msg in turn:
+        if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            for tc in msg.tool_calls:
+                # Extract tool name and key identifying arguments
+                tool_name = tc.get('name', '?')
+                args = tc.get('args', {})
+
+                # For most tools, the key args are ship_symbol and/or waypoint_symbol
+                # This is enough to detect duplicate actions
+                key_args = tuple(sorted([
+                    (k, v) for k, v in args.items()
+                    if k in ['ship_symbol', 'waypoint_symbol', 'trade_symbol', 'contract_id', 'units']
+                ]))
+
+                signature.append((tool_name, key_args))
+
+    # Sort the signature to make it order-independent
+    # This treats the same set of actions in different orders as identical
+    return tuple(sorted(signature))
+
 
 def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max_tokens: int = MAX_TOKENS_ESTIMATE) -> list:
     """
@@ -199,24 +215,109 @@ def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max
     if current_turn:
         turns.append(current_turn)
 
-    # Keep only the last N turns
+    # FIRST: Deduplicate consecutive identical action sequences
+    # This must happen BEFORE we limit to recent turns, otherwise
+    # fresh duplicates won't be caught
+    deduped_turns = []
+    i = 0
+    while i < len(turns):
+        current_turn = turns[i]
+
+        # Extract tool call signature from this turn
+        current_signature = _get_turn_signature(current_turn)
+
+        # Count consecutive identical turns
+        repeat_count = 1
+        j = i + 1
+        while j < len(turns):
+            next_signature = _get_turn_signature(turns[j])
+            if current_signature and current_signature == next_signature:
+                repeat_count += 1
+                j += 1
+            else:
+                break
+
+        # Keep only the first instance, mark if repeated
+        if repeat_count > 1:
+            # Add annotation to the turn (we'll update the AIMessage later during cleaning)
+            current_turn.append(("__repeat_count__", repeat_count))
+        deduped_turns.append(current_turn)
+        i = j  # Skip all duplicates
+
+    turns = deduped_turns
+
+    # THEN: Keep only the last N turns
     if len(turns) > max_recent_turns:
         turns = turns[-max_recent_turns:]
 
+    # Strip verbose AI reasoning from older turns, keep only action summary
+    # This prevents old planning discussions from polluting context
+    cleaned_turns = []
+    for turn in turns:
+        # Check if this turn was marked as repeated
+        repeat_count = None
+        for item in turn:
+            if isinstance(item, tuple) and item[0] == "__repeat_count__":
+                repeat_count = item[1]
+                break
+
+        cleaned_turn = []
+        for msg in turn:
+            # Skip the repeat_count marker
+            if isinstance(msg, tuple) and msg[0] == "__repeat_count__":
+                continue
+
+            if isinstance(msg, AIMessage):
+                # Replace verbose reasoning with brief action summary
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    tool_names = [tc.get('name', '?') for tc in msg.tool_calls]
+
+                    # Filter out redundant state-updating tools (their effects are in game state)
+                    action_tools = [name for name in tool_names if name not in REDUNDANT_RESULT_TOOLS]
+
+                    # If only redundant tools were called, skip this entire turn
+                    if not action_tools:
+                        break  # Skip this turn entirely
+
+                    # Create a new AIMessage with minimal content
+                    from langchain_core.messages import AIMessage as AI
+                    content = f"Actions: {', '.join(action_tools)}"
+                    if repeat_count and repeat_count > 1:
+                        content = f"{content} [repeated {repeat_count}x]"
+
+                    cleaned_msg = AI(
+                        content=content,
+                        tool_calls=msg.tool_calls  # Keep tool calls for linking to ToolMessages
+                    )
+                    cleaned_turn.append(cleaned_msg)
+                elif msg.content:
+                    # AI spoke without calling tools - keep brief version
+                    content = msg.content[:100]
+                    if repeat_count and repeat_count > 1:
+                        content = f"{content} [repeated {repeat_count}x]"
+                    cleaned_turn.append(AIMessage(content=content))
+            else:
+                # Keep ToolMessages unchanged (these ARE the action results we want)
+                cleaned_turn.append(msg)
+
+        # Only add turn if it has meaningful content
+        if cleaned_turn:
+            cleaned_turns.append(cleaned_turn)
+
     # Flatten back
     result = anchored
-    for turn in turns:
+    for turn in cleaned_turns:
         result.extend(turn)
 
     # Token budget check — drop oldest turns if over budget
-    while len(turns) > 1:
+    while len(cleaned_turns) > 1:
         chars, tokens = estimate_token_count(result)
         if tokens <= max_tokens:
             break
         # Drop the oldest turn
-        dropped = turns.pop(0)
+        dropped = cleaned_turns.pop(0)
         result = anchored
-        for turn in turns:
+        for turn in cleaned_turns:
             result.extend(turn)
 
     return result
@@ -225,13 +326,17 @@ def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max
 def save_session(messages: list, iteration: int):
     """Save message history for restart recovery."""
     try:
-        # Filter out temporary game state SystemMessages before saving
-        # These are regenerated every iteration and shouldn't be persisted
+        # Filter out temporary/regenerated SystemMessages before saving
+        # These should always use the latest version from code
         filtered_messages = []
         for msg in messages:
-            # Skip SystemMessages containing injected game state
-            if isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content:
-                continue
+            if isinstance(msg, SystemMessage):
+                # Skip game state (regenerated every iteration)
+                if "=== CURRENT GAME STATE ===" in msg.content:
+                    continue
+                # Skip system prompt (should always use latest from code)
+                if msg.content.strip().startswith("You are WHATER"):
+                    continue
             filtered_messages.append(msg)
 
         # Convert messages to serializable format
@@ -400,7 +505,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
             if mdata.get("imports"):
                 lines.append(f"  Imports (buys): {', '.join(mdata['imports'])}")
             if mdata.get("exchange"):
-                lines.append(f"  Exchange: {', '.join(mdata['exchange'])}")
+                lines.append(f"  Exchange (buys and sells): {', '.join(mdata['exchange'])}")
 
             # Show price data with staleness indicator
             if mdata.get("trade_goods"):
@@ -436,24 +541,22 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     # Current plan (from file)
     plan = load_plan()
     if plan:
-        sections.append(f"[Current Plan]\n{plan}")
+        # Show when plan was last updated to prevent redundant planning
+        plan_age = ""
+        if PLAN_FILE.exists():
+            import time
+            mtime = PLAN_FILE.stat().st_mtime
+            age_seconds = time.time() - mtime
+            if age_seconds < 60:
+                plan_age = " (updated THIS CYCLE - now execute the plan!)"
+            elif age_seconds < 120:
+                plan_age = f" (updated {int(age_seconds)}s ago)"
+            elif age_seconds < 3600:
+                plan_age = f" (updated {int(age_seconds / 60)}min ago)"
+            else:
+                plan_age = f" (updated {int(age_seconds / 3600)}h ago - may need refresh)"
 
-    # Strategic context (mission, tactical plan, insights)
-    if context and (context.segments or context.current_goal != "No active goal"):
-        lines = []
-        if context.current_goal != "No active goal":
-            lines.append(f"[Current Mission]\n{context.current_goal}")
-            if context.progress:
-                lines.append(f"Progress: {context.progress}")
-        if context.tactical_plan:
-            plan_steps = "\n".join(f"{i}. {step}" for i, step in enumerate(context.tactical_plan, 1))
-            lines.append(f"[Tactical Plan]\n{plan_steps}")
-        if context.strategic_insight:
-            lines.append(f"[Strategic Insight]\n{context.strategic_insight}")
-        if context.reflection:
-            lines.append(f"[Next Actions]\n{context.reflection}")
-        if lines:
-            sections.append("\n\n".join(lines))
+        sections.append(f"[Current Plan]{plan_age}\n{plan}")
 
     if sections:
         return "=== CURRENT GAME STATE ===\n\n" + "\n\n".join(sections)
@@ -526,11 +629,6 @@ def display_narrative(segment: NarrativeSegment, context: NarrativeContext):
     sys.stdout.flush()
 
     console.print()
-    console.print(f"  [dim]📋 Goal:[/dim] {context.current_goal}")
-    if context.progress:
-        console.print(f"  [dim]📊 Progress:[/dim] {context.progress}")
-    if context.reflection:
-        console.print(f"  [dim]💭[/dim] {context.reflection}")
     console.rule(style="bright_blue")
     console.print()
 
@@ -650,15 +748,6 @@ def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeCo
     sys.stdout.flush()
 
     console.print()
-    if context.strategic_insight:
-        console.print(f"  [bold yellow]💡 Key Insight:[/bold yellow]")
-        console.print(f"  [yellow]{context.strategic_insight}[/yellow]")
-        console.print()
-    console.print(f"  [dim]📋 Goal:[/dim] {context.current_goal}")
-    if context.progress:
-        console.print(f"  [dim]📊 Progress:[/dim] {context.progress}")
-    if context.reflection:
-        console.print(f"  [dim]💭 Next:[/dim] {context.reflection}")
     console.rule(style="yellow")
     console.print()
 
@@ -696,6 +785,15 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             console.print(f"  [green]Resuming from iteration {start_iteration + 1}[/green]")
             console.print(f"  [dim]Loaded {len(messages)} messages from previous session[/dim]")
 
+            # Remove any old system prompts from loaded session
+            messages = [
+                msg for msg in messages
+                if not (isinstance(msg, SystemMessage) and msg.content.strip().startswith("You are WHATER"))
+            ]
+
+            # Always prepend the latest SYSTEM_PROMPT
+            messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
+
             # Fetch and inject FRESH game state on resume
             fresh_state = gather_game_state(fleet, context)
             if fresh_state:
@@ -712,9 +810,6 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 # Replace the previous game state with updated one
                 messages = [msg for msg in messages if not (isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content)]
                 messages.append(SystemMessage(content=fresh_state))
-
-            if context.current_goal != "No active goal":
-                console.print(f"  [dim]Goal: {context.current_goal}[/dim]")
             console.print()
 
     # Build initial messages if not resuming
@@ -723,13 +818,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             SystemMessage(content=SYSTEM_PROMPT),
         ]
 
-        if context.current_goal != "No active goal":
-            console.print(f"  [dim]Goal: {context.current_goal}[/dim]")
-            if context.progress:
-                console.print(f"  [dim]Progress: {context.progress}[/dim]")
-            console.print()
-
-        # Gather and inject full game state upfront (includes strategic context)
+        # Gather and inject full game state upfront
         console.print("  [dim]Gathering game state...[/dim]")
         fresh_state = gather_game_state(fleet, context)
         if fresh_state:
@@ -747,8 +836,27 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             messages.append(SystemMessage(content=fresh_state))
 
         messages.append(HumanMessage(
-            content="Review the game state above. First, call update_plan to write a plan covering your goals and next steps for each ship. Then start executing the plan. Do not put state information in the plan (status  of ships, markets, etc). The plan should be only goals and steps."
+            content="Review the game state above and take action based on [Current Plan]. If no plan exists, create one. Otherwise, execute the plan's next step."
         ))
+
+    # Always run strategic reflection on startup to ensure fresh plan
+    if not load_plan():  # Only if no plan exists
+        console.print("\n  [yellow]🔮 No plan found - running strategic reflection...[/yellow]")
+        game_state = gather_game_state(fleet, context)
+        reflection_segment, reflection_data = generate_strategic_reflection(context, game_state, MODEL)
+
+        if reflection_segment:
+            context.add_segment(reflection_segment)
+            context.persist()
+            context.persist_full()
+
+            # Write recommended plan to plan.txt
+            if reflection_data and "recommended_plan" in reflection_data:
+                recommended_plan = reflection_data["recommended_plan"]
+                if recommended_plan:
+                    from tools import update_plan
+                    result = update_plan.invoke({"plan": recommended_plan})
+                    console.print(f"  [dim green]📋 Initial plan created: {result}[/dim green]")
 
     for iteration in range(start_iteration, MAX_ITERATIONS):
         console.print(f"\n[dim]─── Iteration {iteration + 1} ───[/dim]")
@@ -827,7 +935,8 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                                     break
 
                     # Informational tools (view_*, list_*) - skip detailed results in history
-                    informational_tools = {"view_ships", "view_agent", "view_contracts", "view_market", "list_ships"}
+                    # Note: view_market NOT included - its data is valuable and not always in game state
+                    informational_tools = {"view_ships", "view_agent", "view_contracts", "list_ships"}
 
                     # Show different result types appropriately
                     if content == "OK":
@@ -992,27 +1101,25 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         if (iteration + 1) % REFLECTION_INTERVAL == 0 and iteration > 0:
             console.print("\n  [yellow]🔮 Time for strategic reflection...[/yellow]")
 
-            # Gather current game state for reflection
-            # Call observation tools to get fresh state
-            game_state_parts = []
-            for obs_tool_name in ["view_agent", "view_ships", "view_contracts"]:
-                obs_tool = get_tool_by_name(obs_tool_name)
-                if obs_tool:
-                    try:
-                        result = obs_tool.invoke({})
-                        game_state_parts.append(f"[{obs_tool_name}]\n{result}")
-                    except Exception:
-                        pass
-            game_state = "\n\n".join(game_state_parts)
+            # Gather FULL game state for reflection (same context as decision-making)
+            game_state = gather_game_state(fleet, context)
 
             # Generate strategic reflection
-            reflection_segment = generate_strategic_reflection(context, game_state, MODEL)
+            reflection_segment, reflection_data = generate_strategic_reflection(context, game_state, MODEL)
 
             if reflection_segment:
                 context.add_segment(reflection_segment)
                 context.persist()
                 context.persist_full()
                 display_strategic_reflection(reflection_segment, context)
+
+                # If strategic reflection generated a plan, write it to plan.txt
+                if reflection_data and "recommended_plan" in reflection_data:
+                    recommended_plan = reflection_data["recommended_plan"]
+                    if recommended_plan:
+                        from tools import update_plan
+                        result = update_plan.invoke({"plan": recommended_plan})
+                        console.print(f"  [dim green]📋 Strategic plan updated: {result}[/dim green]")
 
                 # Strategic context will be included in next iteration's game state
 
