@@ -570,7 +570,7 @@ def sell_cargo(ship_symbol: str, trade_symbol: str, units: int) -> str:
 
 @tool
 def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int) -> str:
-    """Jettison (discard) cargo from a ship. Use this to make room when cargo is full and you don't want to sell. Only jettison non-contract ores."""
+    """Jettison (discard) cargo from a ship. Use this to make room when cargo is full and you don't want to sell. Only jettison non-contract stuff."""
     data = client.jettison(ship_symbol, trade_symbol, units)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"

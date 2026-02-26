@@ -90,6 +90,8 @@ IMPORTANT:
 
 IMPORTANT:
 - Try to avoid getting stranded. If you move ships around carelessly, they can end up at waypoints that do not sell fuel. Then the only option is to use another ship to transfer fuel or use the DRIFT navigation mode, which is very slow.
+- FUEL transfer is possible, but it's MUCH EASIER to simply buy fuel if the ship is at a market that sells fuel.
+- Always check market availability first
 
 TOOLS
 - sell_cargo, refuel_ship, deliver_contract
@@ -103,19 +105,22 @@ SHIP CAPABILITIES
 - CAN_MINE: Can extract ore from asteroids (extract_ore)
 - Ships without CAN_MINE cannot mine. Probes/satellites can only navigate and view_market.
 
-PROBE and SATELLITE use
-- PROBES and SATELLITEs can view market and shipyard data for any planet they're orbiting
+SATELLITE use
+- important: SOLAR powered! Has zero fuel capacity and cannot store or use fuel!
+- SATELLITEs can view market and shipyard data for any planet they're orbiting
 - They can move without using fuel
 - They can't do anything else, like carry cargo or extract ore
 - SATELLITEs are very useful they are always available to send to a remote market to discover what it buys and sells.
+- SATELLITEs are never non-operational.
 
 RECON:
 - Knowing what is available is the key to setting up profitable trade routes.
+- Not all markets buy/sell all goods! This is very important to know!
 
 EFFICIENCY:
 - Use plan_route before trips to check fuel feasibility.
-- If cargo is nearly full at a market, sell now. Don't waste fuel to mine 2 more units.
-- When ships are on cooldown, work with other ships or use probes to scout markets.
+- If cargo is nearly full at a market, sell now. Don't waste fuel to mine a little more.
+- When ships are on cooldown, work with other ships or use probes/satellites to scout markets.
 
 CONTRACTS:
 - Accept contracts for upfront credits, then deliver goods for the fulfillment bonus.
