@@ -273,7 +273,12 @@ def view_ship_details(ship_symbol: str) -> str:
 
 @tool
 def find_waypoints(system_symbol: str, trait_or_type: str) -> str:
-    """Search for waypoints in a system by trait (e.g. SHIPYARD, MARKETPLACE) or type (e.g. ENGINEERED_ASTEROID). The system_symbol looks like 'X1-AB12'. Use this to find shipyards, asteroids, and markets."""
+    """Search for waypoints in a system by TRAIT (e.g. SHIPYARD, MARKETPLACE, COMMON_METAL_DEPOSITS) or TYPE (e.g. ASTEROID, ENGINEERED_ASTEROID, PLANET, GAS_GIANT).
+
+    IMPORTANT: This searches by waypoint TYPE/TRAIT, NOT by resource. You CANNOT search for 'ALUMINUM_ORE' or 'IRON_ORE' asteroids.
+    To find mineable asteroids, search for type='ASTEROID' or 'ENGINEERED_ASTEROID', then extract to see what resources they produce.
+
+    The system_symbol looks like 'X1-AB12'. Use this to find shipyards, asteroids, and markets."""
     # Try as trait first, then as type
     data = client.list_waypoints(system_symbol, traits=trait_or_type)
     if isinstance(data, dict) and "error" in data:

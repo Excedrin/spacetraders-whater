@@ -80,12 +80,24 @@ PLANNING IMPORTANT!!!
 - A good plan includes: current goal, why, specific next steps for each ship, and what to do after.
 - The human operator can see and edit plan.txt. Write plans clearly.
 - Manage CARGO space by selling or jettisoning undesirable items.
+- Try to conserve fuel and make fewer trips when possible.
+- Use a PROBE/SATELLITE to verify that a market buys the things you want to sell before sending a ship there.
+- Spend more time planning than executing plans, it is important to get the plan correct.
+
+IMPORTANT:
+- Manage CARGO space by selling or jettisoning undesirable items BEFORE spending fuel to move and extract_ore.
+- CARGO hold should be empty before leaving a market to return to an ENGINEERED_ASTEROID if possible.
+
+IMPORTANT:
+- Try to avoid getting stranded. If you move ships around carelessly, they can end up at waypoints that do not sell fuel. Then the only option is to use another ship to transfer fuel or use the DRIFT navigation mode, which is very slow.
 
 TOOLS
 - sell_cargo, refuel_ship, deliver_contract
 - navigate_ship, extract_ore, transfer_cargo
 - view_market shows both market prices AND/OR shipyard info.
 - Known market data is cached in [Known Markets] so you don't need to re-check.
+- find_waypoints searches by TYPE (ASTEROID, PLANET) or TRAIT (SHIPYARD, MARKETPLACE), NOT by resource.
+  You CANNOT search for "ALUMINUM_ORE asteroids" - just search for ASTEROID or ENGINEERED_ASTEROID, then extract to see what they produce.
 
 SHIP CAPABILITIES
 - CAN_MINE: Can extract ore from asteroids (extract_ore)
@@ -95,6 +107,10 @@ PROBE and SATELLITE use
 - PROBES and SATELLITEs can view market and shipyard data for any planet they're orbiting
 - They can move without using fuel
 - They can't do anything else, like carry cargo or extract ore
+- SATELLITEs are very useful they are always available to send to a remote market to discover what it buys and sells.
+
+RECON:
+- Knowing what is available is the key to setting up profitable trade routes.
 
 EFFICIENCY:
 - Use plan_route before trips to check fuel feasibility.
@@ -408,10 +424,9 @@ def display_tool_call(name: str, args: dict):
 
 
 def display_tool_result(name: str, result: str, is_error: bool = False):
-    """Display tool result (truncated)."""
+    """Display tool result (full, no truncation)."""
     color = "red" if is_error else "dim"
-    truncated = result[:200] + "..." if len(result) > 200 else result
-    for line in truncated.split("\n"):
+    for line in result.split("\n"):
         console.print(f"    [{color}]{line}[/{color}]")
 
 
@@ -501,14 +516,12 @@ def display_decision(response):
     if thinking:
         console.print(f"  [dim cyan]💭 Thinking:[/dim cyan]")
         thinking_text = thinking if isinstance(thinking, str) else str(thinking)
-        for line in thinking_text[:500].split('\n'):
+        for line in thinking_text.split('\n'):
             console.print(f"    [dim cyan]{line}[/dim cyan]")
-        if len(thinking_text) > 500:
-            console.print(f"    [dim cyan]... ({len(thinking_text)} chars total)[/dim cyan]")
 
     # Display main content
     if content and len(content.strip()) > 0:
-        console.print(f"  [dim italic]{content[:300]}[/dim italic]")
+        console.print(f"  [dim italic]{content}[/dim italic]")
 
 
 def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeContext):
@@ -629,20 +642,79 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
 
         display_thinking(messages)
 
-        # Debug: dump full prompt
+        # Debug: dump full prompt with clarity about what's sent to LLM
         if debug:
-            console.print("\n[bold yellow]===== DEBUG: Full LLM Prompt =====[/bold yellow]")
+            console.print("\n[bold yellow]===== DEBUG: Full LLM Context =====[/bold yellow]")
+
             for i, msg in enumerate(messages):
                 msg_type = type(msg).__name__
                 content = msg.content if hasattr(msg, 'content') else str(msg)
-                # Truncate very long messages in debug output
-                if len(content) > 2000:
-                    content = content[:2000] + f"\n... ({len(content)} chars total)"
-                console.print(f"[yellow]--- [{i}] {msg_type} ---[/yellow]")
-                console.print(f"[dim]{content}[/dim]")
-                if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                    console.print(f"[dim cyan]  tool_calls: {msg.tool_calls}[/dim cyan]")
-            console.print(f"[yellow]--- Tool schemas: {[t.name for t in active_tools]} ---[/yellow]")
+
+                # Show different message types differently
+                if isinstance(msg, SystemMessage):
+                    if "=== CURRENT GAME STATE ===" in content:
+                        # Current game state - show in full WITHOUT truncation
+                        console.print(f"[yellow]--- [{i}] CURRENT GAME STATE (injected) ---[/yellow]")
+                        console.print(f"[cyan]{content}[/cyan]")
+                    else:
+                        # System prompt
+                        console.print(f"[yellow]--- [{i}] SYSTEM PROMPT ---[/yellow]")
+                        console.print(f"[dim]{content}[/dim]")
+
+                elif isinstance(msg, HumanMessage):
+                    console.print(f"[yellow]--- [{i}] INITIAL PROMPT ---[/yellow]")
+                    console.print(f"[dim]{content}[/dim]")
+
+                elif isinstance(msg, AIMessage):
+                    # AI's decision/reasoning and tool calls
+                    console.print(f"[yellow]--- [{i}] AI DECISION ---[/yellow]")
+                    if content and content.strip():
+                        console.print(f"[dim italic]{content}[/dim italic]")
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            tool_name = tc.get('name', '?')
+                            tool_args = tc.get('args', {})
+                            # Format args nicely
+                            args_str = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                            console.print(f"[green]  → {tool_name}({args_str})[/green]")
+
+                elif isinstance(msg, ToolMessage):
+                    # Tool results - only show action summaries, not verbose data dumps
+                    tool_id = msg.tool_call_id if hasattr(msg, 'tool_call_id') else '?'
+
+                    # Find which tool this result is for (match with previous AIMessage)
+                    tool_name = "?"
+                    if i > 0:
+                        # Look back to find the tool call
+                        for j in range(i-1, -1, -1):
+                            if isinstance(messages[j], AIMessage) and hasattr(messages[j], 'tool_calls'):
+                                for tc in messages[j].tool_calls:
+                                    if tc.get('id') == tool_id:
+                                        tool_name = tc.get('name', '?')
+                                        break
+                                if tool_name != "?":
+                                    break
+
+                    # Informational tools (view_*, list_*) - skip detailed results in history
+                    informational_tools = {"view_ships", "view_agent", "view_contracts", "view_market", "list_ships"}
+
+                    # Show different result types appropriately
+                    if content == "OK":
+                        console.print(f"[dim]  ← {tool_name}: OK[/dim]")
+                    elif "Error:" in content:
+                        # Show errors in full
+                        console.print(f"[red]  ← {tool_name} ERROR: {content}[/red]")
+                    elif tool_name in informational_tools:
+                        # For informational tools, just show that they succeeded (data is in game state)
+                        console.print(f"[dim]  ← {tool_name}: [data in game state][/dim]")
+                    elif tool_name in SIGNIFICANT_TOOLS:
+                        # For action tools, show full confirmation
+                        console.print(f"[dim]  ← {tool_name}: {content}[/dim]")
+                    else:
+                        # For other tools, show full output
+                        console.print(f"[dim]  ← {tool_name}: {content}[/dim]")
+
+            console.print(f"[yellow]--- Available tools: {', '.join(t.name for t in active_tools)} ---[/yellow]")
             console.print("[bold yellow]===== END DEBUG =====[/bold yellow]\n")
 
         # 1. DECIDE — call LLM with tools
