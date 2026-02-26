@@ -27,19 +27,40 @@ def load_market_cache() -> dict:
 
 
 def _save_market_to_cache(waypoint_symbol: str, data: dict):
-    """Save market data to cache after a view_market call."""
+    """Save market data to cache after a view_market call.
+
+    Structural data (imports/exports/exchange) is stable and saved even without ship in orbit.
+    Price data (tradeGoods) requires ship in orbit and is marked with timestamp.
+    """
+    import time
     cache = load_market_cache()
-    entry = {}
+
+    # Get existing entry or create new one
+    entry = cache.get(waypoint_symbol, {})
+
+    # Structural data (stable - what market can buy/sell)
+    # Always update this if available
     for section in ("exports", "imports", "exchange"):
         items = data.get(section, [])
         if items:
             entry[section] = [i["symbol"] for i in items]
+
+    # Price data (dynamic - requires ship in orbit)
     trade_goods = data.get("tradeGoods", [])
     if trade_goods:
         entry["trade_goods"] = [
-            {"symbol": g["symbol"], "sellPrice": g.get("sellPrice"), "tradeVolume": g.get("tradeVolume")}
+            {
+                "symbol": g["symbol"],
+                "purchasePrice": g.get("purchasePrice"),  # What market PAYS for items
+                "sellPrice": g.get("sellPrice"),          # What market SELLS items for
+                "tradeVolume": g.get("tradeVolume")
+            }
             for g in trade_goods
         ]
+        # Mark when we got price data
+        entry["last_updated"] = int(time.time())
+
+    # Save even if we only got structural data (no prices)
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -182,10 +203,17 @@ def view_ships() -> str:
         cargo = s.get("cargo", {})
         caps = _get_ship_capabilities(s)
 
+        role = s.get('registration', {}).get('role', '?')
         lines.append(f"Ship: {s['symbol']}")
-        lines.append(f"  Role: {s.get('registration', {}).get('role', '?')}")
+        lines.append(f"  Role: {role}")
         lines.append(f"  Location: {nav.get('waypointSymbol', '?')}  |  Status: {nav.get('status', '?')}")
-        lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
+
+        # Make it VERY clear when ship doesn't use fuel
+        if fuel.get('capacity', 0) == 0:
+            lines.append(f"  Fuel: SOLAR POWERED (FREE MOVEMENT)")
+        else:
+            lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
+
         lines.append(f"  Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)} units")
         if caps:
             lines.append(f"  Capabilities: {', '.join(caps)}")
@@ -275,10 +303,14 @@ def view_ship_details(ship_symbol: str) -> str:
 def find_waypoints(system_symbol: str, trait_or_type: str) -> str:
     """Search for waypoints in a system by TRAIT (e.g. SHIPYARD, MARKETPLACE, COMMON_METAL_DEPOSITS) or TYPE (e.g. ASTEROID, ENGINEERED_ASTEROID, PLANET, GAS_GIANT).
 
+    Results are sorted by distance to nearest ship (closest first), so you can prioritize nearby locations to save fuel.
+
     IMPORTANT: This searches by waypoint TYPE/TRAIT, NOT by resource. You CANNOT search for 'ALUMINUM_ORE' or 'IRON_ORE' asteroids.
     To find mineable asteroids, search for type='ASTEROID' or 'ENGINEERED_ASTEROID', then extract to see what resources they produce.
 
     The system_symbol looks like 'X1-AB12'. Use this to find shipyards, asteroids, and markets."""
+    import math
+
     # Try as trait first, then as type
     data = client.list_waypoints(system_symbol, traits=trait_or_type)
     if isinstance(data, dict) and "error" in data:
@@ -287,12 +319,208 @@ def find_waypoints(system_symbol: str, trait_or_type: str) -> str:
         return f"Error: {data['error']}"
     if not data:
         return f"No waypoints found for '{trait_or_type}' in {system_symbol}."
+
+    # Get ship positions for distance calculation
+    ships = client.list_ships()
+    ship_positions = []
+    if isinstance(ships, list):
+        for ship in ships:
+            nav = ship.get("nav", {})
+            wp_symbol = nav.get("waypointSymbol", "")
+            system = nav.get("systemSymbol", "")
+            if system == system_symbol:
+                # Get waypoint coordinates for this ship
+                waypoints = client.list_waypoints(system_symbol)
+                if isinstance(waypoints, list):
+                    for wp in waypoints:
+                        if wp.get("symbol") == wp_symbol:
+                            ship_positions.append((wp.get("x", 0), wp.get("y", 0)))
+                            break
+
+    # Calculate distance to nearest ship for each waypoint
+    def distance_to_nearest_ship(waypoint):
+        if not ship_positions:
+            return 0  # No ships to calculate from
+        wx, wy = waypoint.get("x", 0), waypoint.get("y", 0)
+        min_dist = float('inf')
+        for sx, sy in ship_positions:
+            dist = math.sqrt((wx - sx) ** 2 + (wy - sy) ** 2)
+            min_dist = min(min_dist, dist)
+        return min_dist
+
+    # Sort waypoints by distance (closest first)
+    sorted_waypoints = sorted(data, key=distance_to_nearest_ship)
+
     lines = []
-    for wp in data:
+    for wp in sorted_waypoints:
+        dist = distance_to_nearest_ship(wp)
         traits = ", ".join(t["symbol"] for t in wp.get("traits", []))
-        lines.append(f"{wp['symbol']} (type: {wp['type']})")
+
+        # Show distance if we have ship positions
+        if ship_positions:
+            lines.append(f"{wp['symbol']} (type: {wp['type']}, distance: {dist:.1f})")
+        else:
+            lines.append(f"{wp['symbol']} (type: {wp['type']})")
+
         if traits:
             lines.append(f"  Traits: {traits}")
+
+    return "\n".join(lines)
+
+
+@tool
+def scan_system(system_symbol: str) -> str:
+    """Scan all waypoints in a system to discover markets, shipyards, and resources WITHOUT requiring ship visits.
+
+    This is VERY efficient - one API call reveals structural market data (what each market imports/exports) for the entire system.
+    Use this early to understand the system's economy before moving ships around.
+
+    The system_symbol looks like 'X1-AB12'."""
+    import math
+
+    # Get all waypoints in the system
+    waypoints = client.list_waypoints(system_symbol)
+    if isinstance(waypoints, dict) and "error" in waypoints:
+        return f"Error: {waypoints['error']}"
+    if not waypoints:
+        return f"No waypoints found in system {system_symbol}."
+
+    # Get ship positions for distance calculation
+    ships = client.list_ships()
+    ship_positions = []
+    if isinstance(ships, list):
+        for ship in ships:
+            nav = ship.get("nav", {})
+            wp_symbol = nav.get("waypointSymbol", "")
+            system = nav.get("systemSymbol", "")
+            if system == system_symbol:
+                for wp in waypoints:
+                    if wp.get("symbol") == wp_symbol:
+                        ship_positions.append((wp.get("x", 0), wp.get("y", 0)))
+                        break
+
+    # Process waypoints and extract market data
+    markets_found = 0
+    shipyards_found = 0
+    asteroids_found = 0
+
+    lines = [f"System Scan: {system_symbol} ({len(waypoints)} waypoints)\n"]
+
+    # Categorize and display waypoints
+    market_waypoints = []
+    shipyard_waypoints = []
+    asteroid_waypoints = []
+    other_waypoints = []
+
+    for wp in waypoints:
+        traits = [t.get("symbol", "") for t in wp.get("traits", [])]
+
+        if "MARKETPLACE" in traits:
+            market_waypoints.append(wp)
+            markets_found += 1
+
+            # Cache structural market data if available
+            # SpaceTraders API includes imports/exports in waypoint data
+            cache = load_market_cache()
+            wp_symbol = wp.get("symbol")
+
+            # Check if waypoint has market trade data
+            if wp_symbol and wp_symbol not in cache:
+                # Extract imports/exports from traits or modifiers
+                # The API structure varies, check for 'imports', 'exports', 'exchange'
+                entry = {}
+
+                # Try to find market data in the waypoint object
+                for key in ["imports", "exports", "exchange"]:
+                    if key in wp and wp[key]:
+                        items = wp[key]
+                        if isinstance(items, list):
+                            entry[key] = [i.get("symbol") if isinstance(i, dict) else str(i) for i in items]
+
+                # Save to cache if we found any market data
+                if entry:
+                    cache[wp_symbol] = entry
+                    MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+        if "SHIPYARD" in traits:
+            shipyard_waypoints.append(wp)
+            shipyards_found += 1
+
+        wp_type = wp.get("type", "")
+        if "ASTEROID" in wp_type:
+            asteroid_waypoints.append(wp)
+            asteroids_found += 1
+        elif "MARKETPLACE" not in traits and "SHIPYARD" not in traits:
+            other_waypoints.append(wp)
+
+    # Summary
+    lines.append(f"Markets: {markets_found} | Shipyards: {shipyards_found} | Asteroids: {asteroids_found}\n")
+
+    # Show markets with structural data
+    if market_waypoints:
+        lines.append("=== MARKETS ===")
+        for wp in market_waypoints:
+            wp_symbol = wp.get("symbol")
+            traits = [t.get("symbol", "") for t in wp.get("traits", [])]
+
+            # Calculate distance if we have ship positions
+            dist_str = ""
+            if ship_positions:
+                wx, wy = wp.get("x", 0), wp.get("y", 0)
+                min_dist = min(math.sqrt((wx - sx) ** 2 + (wy - sy) ** 2) for sx, sy in ship_positions)
+                dist_str = f" (distance: {min_dist:.1f})"
+
+            lines.append(f"\n{wp_symbol}{dist_str}")
+            lines.append(f"  Type: {wp.get('type', '?')}")
+
+            # Show imports/exports if available
+            if "imports" in wp:
+                imports = [i.get("symbol") if isinstance(i, dict) else str(i) for i in wp.get("imports", [])]
+                if imports:
+                    lines.append(f"  Imports (buys): {', '.join(imports[:10])}")
+            if "exports" in wp:
+                exports = [e.get("symbol") if isinstance(e, dict) else str(e) for e in wp.get("exports", [])]
+                if exports:
+                    lines.append(f"  Exports (sells): {', '.join(exports[:10])}")
+            if "exchange" in wp:
+                exchange = [e.get("symbol") if isinstance(e, dict) else str(e) for e in wp.get("exchange", [])]
+                if exchange:
+                    lines.append(f"  Exchange: {', '.join(exchange)}")
+
+    # Show shipyards
+    if shipyard_waypoints:
+        lines.append("\n=== SHIPYARDS ===")
+        for wp in shipyard_waypoints[:5]:  # Limit to 5
+            dist_str = ""
+            if ship_positions:
+                wx, wy = wp.get("x", 0), wp.get("y", 0)
+                min_dist = min(math.sqrt((wx - sx) ** 2 + (wy - sy) ** 2) for sx, sy in ship_positions)
+                dist_str = f" (distance: {min_dist:.1f})"
+            lines.append(f"{wp.get('symbol')}{dist_str}")
+
+    # Show asteroids (brief)
+    if asteroid_waypoints:
+        lines.append(f"\n=== ASTEROIDS ({len(asteroid_waypoints)} total) ===")
+        # Show closest 5 asteroids
+        if ship_positions:
+            sorted_asteroids = sorted(asteroid_waypoints, key=lambda w: min(
+                math.sqrt((w.get("x", 0) - sx) ** 2 + (w.get("y", 0) - sy) ** 2)
+                for sx, sy in ship_positions
+            ))[:5]
+        else:
+            sorted_asteroids = asteroid_waypoints[:5]
+
+        for wp in sorted_asteroids:
+            dist_str = ""
+            if ship_positions:
+                wx, wy = wp.get("x", 0), wp.get("y", 0)
+                min_dist = min(math.sqrt((wx - sx) ** 2 + (wy - sy) ** 2) for sx, sy in ship_positions)
+                dist_str = f" (distance: {min_dist:.1f})"
+
+            traits = [t.get("symbol", "") for t in wp.get("traits", []) if t.get("symbol") not in ["MARKETPLACE", "SHIPYARD"]]
+            trait_str = f" - {', '.join(traits)}" if traits else ""
+            lines.append(f"{wp.get('symbol')} ({wp.get('type')}){dist_str}{trait_str}")
+
     return "\n".join(lines)
 
 
@@ -410,23 +638,98 @@ def dock_ship(ship_symbol: str) -> str:
 
 
 @tool
-def navigate_ship(ship_symbol: str, waypoint_symbol: str) -> str:
-    """Navigate a ship to a different waypoint in the same system. Auto-orbits if docked. Consumes fuel and takes time."""
+def navigate_ship(ship_symbol: str, waypoint_symbol: str, use_drift: bool = False) -> str:
+    """Navigate a ship to a different waypoint in the same system. Auto-orbits if docked. Consumes fuel and takes time.
+
+    IMPORTANT: If ship doesn't have enough fuel, this will return an ERROR instead of automatically using DRIFT mode.
+    DRIFT mode is 10x slower! You must explicitly set use_drift=True to confirm you want slow DRIFT navigation.
+
+    Args:
+        ship_symbol: The ship to navigate
+        waypoint_symbol: The destination waypoint
+        use_drift: Set to True to explicitly confirm DRIFT mode (slow but free). Default False.
+    """
+    import math
+
+    # Check fuel BEFORE attempting navigation
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        return f"Error: {ship['error']}"
+
+    nav = ship.get("nav", {})
+    fuel = ship.get("fuel", {})
+    current_wp = nav.get("waypointSymbol", "")
+    system = nav.get("systemSymbol", "")
+    fuel_current = fuel.get("current", 0)
+    fuel_capacity = fuel.get("capacity", 0)
+
+    # Solar powered ships don't need fuel checks
+    if fuel_capacity > 0:
+        # Calculate fuel requirement
+        waypoints = client.list_waypoints(system)
+        if isinstance(waypoints, list):
+            origin = None
+            dest = None
+            for wp in waypoints:
+                if wp.get("symbol") == current_wp:
+                    origin = wp
+                if wp.get("symbol") == waypoint_symbol:
+                    dest = wp
+
+            if origin and dest:
+                dx = dest.get("x", 0) - origin.get("x", 0)
+                dy = dest.get("y", 0) - origin.get("y", 0)
+                distance = math.sqrt(dx * dx + dy * dy)
+                est_fuel = max(1, round(distance))
+
+                # Check if we have enough fuel
+                if fuel_current < est_fuel:
+                    # Not enough fuel! Check if we're at a fuel station
+                    market_cache = load_market_cache()
+                    current_market = market_cache.get(current_wp, {})
+                    has_fuel = "FUEL" in current_market.get("exchange", [])
+
+                    if has_fuel:
+                        return (f"Error: Not enough fuel! {ship_symbol} has {fuel_current}/{fuel_capacity} fuel "
+                                f"but needs ~{est_fuel} for this trip.\n"
+                                f"You are at {current_wp} which sells FUEL. Call refuel_ship('{ship_symbol}') first!")
+
+                    # Not at fuel station - require explicit DRIFT confirmation
+                    if not use_drift:
+                        return (f"Error: Not enough fuel! {ship_symbol} has {fuel_current}/{fuel_capacity} fuel "
+                                f"but needs ~{est_fuel} for this trip.\n"
+                                f"DRIFT mode available but is 10x SLOWER (~{int(distance * 10)}s instead of ~{int(distance)}s).\n"
+                                f"Options:\n"
+                                f"1. RECOMMENDED: Find and refuel at a market with FUEL (check scan_system or Known Markets)\n"
+                                f"2. Use DRIFT: Call navigate_ship('{ship_symbol}', '{waypoint_symbol}', use_drift=True)\n"
+                                f"Do NOT use DRIFT unless absolutely necessary!")
+
+    # Fuel check passed or DRIFT explicitly confirmed - proceed with navigation
     err = _ensure_orbit(ship_symbol)
     if err:
         return f"Error: {err}"
+
     data = client.navigate(ship_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
+
     nav = data.get("nav", {})
     fuel = data.get("fuel", {})
     wait_secs = _parse_arrival(nav)
-    result = f"{ship_symbol} navigating to {waypoint_symbol}."
+
+    # Check if DRIFT was actually used
+    flight_mode = nav.get("flightMode", "CRUISE")
+    if flight_mode == "DRIFT":
+        result = f"⚠️  {ship_symbol} navigating to {waypoint_symbol} using DRIFT mode (VERY SLOW!)."
+    else:
+        result = f"{ship_symbol} navigating to {waypoint_symbol}."
+
     result += f"\nFuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}"
     if wait_secs > 0:
         result += f"\nArrival in {wait_secs:.0f}s."
     else:
         result += f"\n{ship_symbol} has arrived at {waypoint_symbol}."
+
     # Store wait time in a way the agent loop can access
     navigate_ship._last_wait = wait_secs
     return result
@@ -796,7 +1099,7 @@ TIER_1_TOOLS = [
     # Contracts
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Info (view_market includes shipyard data)
-    view_market, view_ships, find_waypoints, view_contracts,
+    scan_system, view_market, view_ships, find_waypoints, view_contracts,
     # Planning
     update_plan,
 ]
@@ -805,7 +1108,7 @@ TIER_1_TOOLS = [
 ALL_TOOLS = [
     # Observation
     view_agent, view_contracts, view_ships, view_ship_details, view_cargo,
-    find_waypoints, view_market, view_jump_gate,
+    scan_system, find_waypoints, view_market, view_jump_gate,
     # Ship operations (dock/orbit still available for edge cases)
     orbit_ship, dock_ship, navigate_ship, refuel_ship, plan_route,
     # Mining & resources

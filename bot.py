@@ -74,64 +74,91 @@ ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each
 SYSTEM_PROMPT = """\
 You are WHATER, an autonomous fleet coordinator. You command multiple ships efficiently.
 
-PLANNING IMPORTANT!!!
-- Your [Current Plan] is shown every turn. Keep it updated with update_plan.
-- Before taking actions, review the plan. Update it if the situation has changed.
-- A good plan includes: current goal, why, specific next steps for each ship, and what to do after.
-- The human operator can see and edit plan.txt. Write plans clearly.
-- Manage CARGO space by selling or jettisoning undesirable items.
-- Try to conserve fuel and make fewer trips when possible.
-- Use a PROBE/SATELLITE to verify that a market buys the things you want to sell before sending a ship there.
-- Spend more time planning than executing plans, it is important to get the plan correct.
+=== DECISION PROCESS (FOLLOW THIS EVERY TURN) ===
+1. READ the current game state (fleet status, contracts, markets, plan)
+2. VERIFY the plan is still valid given current state
+3. CHECK prerequisites before ANY action:
+   - Moving ship? Check fuel level, verify destination sells fuel if refuel needed
+   - Selling cargo? Verify market BUYS that item (check "market pays" price in Known Markets)
+   - Mining? Verify ship has cargo space
+4. UPDATE the plan if anything changed
+5. THEN take action
 
-IMPORTANT:
-- Manage CARGO space by selling or jettisoning undesirable items BEFORE spending fuel to move and extract_ore.
-- CARGO hold should be empty before leaving a market to return to an ENGINEERED_ASTEROID if possible.
+Note: Markets are auto-discovered when ships arrive at waypoints (no action needed).
 
-IMPORTANT:
-- Try to avoid getting stranded. If you move ships around carelessly, they can end up at waypoints that do not sell fuel. Then the only option is to use another ship to transfer fuel or use the DRIFT navigation mode, which is very slow.
-- FUEL transfer is possible, but it's MUCH EASIER to simply buy fuel if the ship is at a market that sells fuel.
-- Always check market availability first
+=== PLANNING CRITICAL RULES ===
+- ALWAYS update_plan BEFORE taking actions if the plan is outdated or wrong
+- If [Known Markets] shows "NONE" or very limited data: call scan_system FIRST
+  This reveals ALL market import/export data in one call - essential for planning!
+- Plans should contain ONLY:
+  * Goals (what you want to achieve)
+  * Steps (which ship does what, in what order)
+  * Prerequisites (what's needed before each step)
+- Plans should NEVER contain:
+  * Current ship positions, fuel levels, cargo contents (this is in [Fleet Status])
+  * Current market data (this is in [Known Markets])
+  * Current contract progress (this is in [Contracts])
+  * Any other state information that's already shown in the game state
+- Why? Status info becomes stale immediately and clutters the plan
+- A complete plan must answer:
+  * What is the goal?
+  * Which ship does what? (be specific: "WHATER-1 will...")
+  * What are the prerequisites? (fuel, cargo space, market info)
+  * What happens after this step?
+- Before moving ANY ship, answer: "Does destination have fuel?" and "Why go there?"
+- Before selling cargo, answer: "Does this market BUY this item? At what price?"
+- Use SATELLITES (free movement!) to scout markets for current PRICES after scan_system shows structure
 
-TOOLS
-- sell_cargo, refuel_ship, deliver_contract
-- navigate_ship, extract_ore, transfer_cargo
-- view_market shows both market prices AND/OR shipyard info.
-- Known market data is cached in [Known Markets] so you don't need to re-check.
-- find_waypoints searches by TYPE (ASTEROID, PLANET) or TRAIT (SHIPYARD, MARKETPLACE), NOT by resource.
-  You CANNOT search for "ALUMINUM_ORE asteroids" - just search for ASTEROID or ENGINEERED_ASTEROID, then extract to see what they produce.
+=== FUEL MANAGEMENT (CRITICAL) ===
+- SATELLITES use ZERO fuel - they can move anywhere for FREE (solar powered)
+- For all OTHER ships (COMMAND, EXCAVATOR, etc.):
+  * navigate_ship will ERROR if not enough fuel (prevents accidental DRIFT mode)
+  * If at a fuel station when you try to navigate: Error tells you to refuel FIRST
+  * If not at fuel station: Error gives you options (find fuel or use_drift=True)
+  * DRIFT mode is 10x SLOWER - only use as last resort with explicit use_drift=True
+  * Use plan_route BEFORE navigate_ship to check fuel requirements and plan ahead
+  * If at a market that sells fuel and will need fuel later, refuel NOW (don't wait)
+  * Markets that sell FUEL show "Exchange: FUEL" in Known Markets
+- Strategy: Send satellites to scout (FREE), then send cargo ships with full fuel tanks
 
-SHIP CAPABILITIES
-- CAN_MINE: Can extract ore from asteroids (extract_ore)
-- Ships without CAN_MINE cannot mine. Probes/satellites can only navigate and view_market.
+=== CARGO MANAGEMENT ===
+- Sell or jettison unwanted items BEFORE spending fuel to mine more
+- Empty cargo holds before returning to mining asteroids
+- Check "market pays" price in Known Markets before selling
+- Never jettison contract goods
 
-SATELLITE use
-- important: SOLAR powered! Has zero fuel capacity and cannot store or use fuel!
-- SATELLITEs can view market and shipyard data for any planet they're orbiting
-- They can move without using fuel
-- They can't do anything else, like carry cargo or extract ore
-- SATELLITEs are very useful they are always available to send to a remote market to discover what it buys and sells.
-- SATELLITEs are never non-operational.
+=== SATELLITES - ZERO FUEL COST! ===
+- CRITICAL: Satellites use ZERO fuel. Moving them costs NOTHING. They are FREE to operate.
+- SOLAR POWERED: Unlike other ships, satellites never need refueling or get stranded
+- Use satellites FIRST to scout distant waypoints before moving fuel-using ships
+- Markets are auto-discovered when satellites arrive (no manual action needed)
+- Send satellites anywhere without worry - no fuel cost, no fuel planning needed
+- Example: Need to check a market 200 units away? Send satellite (free) not cargo ship (expensive fuel)
 
-RECON:
-- Knowing what is available is the key to setting up profitable trade routes.
-- Not all markets buy/sell all goods! This is very important to know!
+=== TOOLS ===
+- scan_system: VERY POWERFUL - scans entire system in one call, reveals ALL markets' imports/exports
+  Use this FIRST when starting in a new system to understand the economy
+  No ship movement needed! Gets structural market data (what each market buys/sells) for planning
+- plan_route: Check fuel cost BEFORE navigate_ship
+- find_waypoints: Search by TYPE (ASTEROID, PLANET) or TRAIT (MARKETPLACE, SHIPYARD)
+  Cannot search by resource! "ALUMINUM_ORE asteroids" doesn't work - use ASTEROID or ENGINEERED_ASTEROID
+- view_market: Shows what market buys ("market pays X") and sells ("market sells at X")
+  Use this when at a market to get CURRENT PRICES (scan_system only shows what they trade, not prices)
+- view_ships: Don't call if [Fleet Status] already shows current info
+- Known Markets cache: Check this BEFORE moving ships to sell cargo
 
-EFFICIENCY:
-- Use plan_route before trips to check fuel feasibility.
-- If cargo is nearly full at a market, sell now. Don't waste fuel to mine a little more.
-- When ships are on cooldown, work with other ships or use probes/satellites to scout markets.
+=== SHIP TYPES ===
+- COMMAND/EXCAVATOR: Can mine (CAN_MINE), uses fuel
+- SATELLITE: Cannot mine or carry cargo, solar powered (FREE movement), perfect for scouting
 
-CONTRACTS:
-- Accept contracts for upfront credits, then deliver goods for the fulfillment bonus.
-- Never jettison contract goods.
-- Use negotiate_contract at a faction HQ for new contracts after fulfilling one.
+=== CONTRACTS ===
+- Accept for upfront credits, deliver for fulfillment bonus
+- Never jettison contract goods
+- negotiate_contract at faction HQ for new contracts
 
-COORDINATION:
-- When a miner is full and a cargo ship is nearby, transfer_cargo to offload.
-- transfer_cargo requires both ships at the same waypoint.
-
-DO NOT call view_ships if the info is already in [Fleet Status]. Act on what you have.
+=== COORDINATION ===
+- transfer_cargo requires both ships at same waypoint in ORBIT
+- Work on non-cooldown ships while others wait
 """
 
 # ──────────────────────────────────────────────
@@ -264,9 +291,9 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
 
         lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
 
-        # Fuel
+        # Fuel - make it VERY clear when ship doesn't use fuel
         if fuel.get('capacity', 0) == 0:
-            lines.append(f"  Fuel: N/A (solar powered)")
+            lines.append(f"  Fuel: SOLAR POWERED (FREE MOVEMENT - NO FUEL COST)")
         else:
             lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
 
@@ -287,7 +314,7 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
         if caps:
             lines.append(f"  Capabilities: {', '.join(caps)}")
         elif role == "SATELLITE":
-            lines.append(f"  Capabilities: CAN_NAVIGATE (solar powered)")
+            lines.append(f"  Capabilities: CAN_NAVIGATE (FREE - uses no fuel)")
 
         # Cooldown info from fleet tracker
         ship_status = fleet.get_ship(s['symbol'])
@@ -361,19 +388,50 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     # Known markets (from cache)
     market_cache = load_market_cache()
     if market_cache:
+        import time
+        now = int(time.time())
         lines = ["[Known Markets]"]
         for wp_symbol, mdata in market_cache.items():
             lines.append(f"\n{wp_symbol}:")
+
+            # Show structural data (stable)
             if mdata.get("exports"):
-                lines.append(f"  Exports: {', '.join(mdata['exports'])}")
+                lines.append(f"  Exports (sells): {', '.join(mdata['exports'])}")
             if mdata.get("imports"):
-                lines.append(f"  Imports: {', '.join(mdata['imports'])}")
+                lines.append(f"  Imports (buys): {', '.join(mdata['imports'])}")
             if mdata.get("exchange"):
                 lines.append(f"  Exchange: {', '.join(mdata['exchange'])}")
+
+            # Show price data with staleness indicator
             if mdata.get("trade_goods"):
+                last_updated = mdata.get("last_updated")
+                if last_updated:
+                    age_seconds = now - last_updated
+                    age_minutes = age_seconds // 60
+                    if age_minutes < 5:
+                        freshness = "CURRENT"
+                    elif age_minutes < 30:
+                        freshness = f"updated {age_minutes}m ago"
+                    else:
+                        age_hours = age_minutes // 60
+                        freshness = f"STALE ({age_hours}h old)"
+                else:
+                    freshness = "unknown age"
+
+                lines.append(f"  Trade Goods ({freshness}):")
                 for g in mdata["trade_goods"]:
-                    lines.append(f"  {g['symbol']}: sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
+                    buy_price = g.get('purchasePrice', '?')
+                    sell_price = g.get('sellPrice', '?')
+                    # Show what's important: buy price = what market PAYS you, sell price = what you PAY market
+                    lines.append(f"    {g['symbol']}: market pays {buy_price}, market sells at {sell_price}")
+            elif mdata.get("imports") or mdata.get("exports"):
+                # We know what it trades but no price data
+                lines.append(f"  Prices: UNKNOWN (send ship to orbit to get current prices)")
+
         sections.append("\n".join(lines))
+    else:
+        # No markets known - this is CRITICAL information!
+        sections.append("[Known Markets]\nNONE - Use satellites to scout markets! You need to know what markets buy/sell before moving ships.")
 
     # Current plan (from file)
     plan = load_plan()
@@ -529,6 +587,52 @@ def display_decision(response):
         console.print(f"  [dim italic]{content}[/dim italic]")
 
 
+def auto_discover_markets() -> list[tuple[str, str, bool]]:
+    """
+    Automatically discover markets at ship locations.
+    Returns list of (tool_name, result, is_error) tuples for discovered markets.
+    """
+    from tools import client, view_market
+
+    discovered = []
+    market_cache = load_market_cache()
+
+    # Get all current ship locations
+    ships_data = client.list_ships()
+    if not isinstance(ships_data, list):
+        return discovered
+
+    # Track waypoints we've already checked this run
+    checked = set()
+
+    for ship in ships_data:
+        nav = ship.get("nav", {})
+        wp_symbol = nav.get("waypointSymbol", "")
+        system = nav.get("systemSymbol", "")
+
+        # Skip if we already checked this waypoint or already know this market
+        if not wp_symbol or not system or wp_symbol in checked or wp_symbol in market_cache:
+            continue
+
+        checked.add(wp_symbol)
+
+        # Try to view market at this waypoint
+        try:
+            result = view_market.invoke({
+                "system_symbol": system,
+                "waypoint_symbol": wp_symbol
+            })
+
+            # Only log if we actually found market data (not "No market" error)
+            if "Market at" in result and "No market" not in result:
+                console.print(f"  [dim green]🔍 Auto-discovered market at {wp_symbol}[/dim green]")
+                discovered.append(("view_market", result, False))
+        except Exception:
+            pass  # Silently skip if waypoint has no market
+
+    return discovered
+
+
 def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeContext):
     """Display a strategic reflection with special styling."""
     console.print()
@@ -598,6 +702,17 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 console.print(f"  [dim]Injected fresh game state[/dim]")
                 messages.append(SystemMessage(content=fresh_state))
 
+            # Auto-discover markets at current ship locations
+            console.print("  [dim]Checking for undiscovered markets...[/dim]")
+            auto_discover_markets()
+
+            # Re-gather game state to include newly discovered markets
+            fresh_state = gather_game_state(fleet, context)
+            if fresh_state:
+                # Replace the previous game state with updated one
+                messages = [msg for msg in messages if not (isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content)]
+                messages.append(SystemMessage(content=fresh_state))
+
             if context.current_goal != "No active goal":
                 console.print(f"  [dim]Goal: {context.current_goal}[/dim]")
             console.print()
@@ -620,8 +735,19 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         if fresh_state:
             messages.append(SystemMessage(content=fresh_state))
 
+        # Auto-discover markets at current ship locations
+        console.print("  [dim]Checking for undiscovered markets...[/dim]")
+        auto_discover_markets()
+
+        # Re-gather game state to include newly discovered markets
+        fresh_state = gather_game_state(fleet, context)
+        if fresh_state:
+            # Replace the previous game state with updated one
+            messages = [msg for msg in messages if not (isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content)]
+            messages.append(SystemMessage(content=fresh_state))
+
         messages.append(HumanMessage(
-            content="Review the game state above. First, call update_plan to write a plan covering your goals and next steps for each ship. Then start executing the plan."
+            content="Review the game state above. First, call update_plan to write a plan covering your goals and next steps for each ship. Then start executing the plan. Do not put state information in the plan (status  of ships, markets, etc). The plan should be only goals and steps."
         ))
 
     for iteration in range(start_iteration, MAX_ITERATIONS):
@@ -816,37 +942,38 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 tool_call_id=tool_call["id"],
             ))
 
-        # Update fleet state from view_ships if it was called
-        for tool_name, result, is_error in tool_results:
-            if tool_name == "view_ships" and not is_error:
-                # Parse the view_ships output to update fleet tracker
-                # We'll do a fresh API call to get structured data
-                view_ships_tool = get_tool_by_name("view_ships")
-                if view_ships_tool:
-                    try:
-                        from tools import client
-                        ships_data = client.list_ships()
-                        if isinstance(ships_data, list):
-                            fleet.update_from_api(ships_data)
-                    except Exception:
-                        pass
-                break
+        # AUTO-DISCOVER: Check markets at ship locations automatically after tool execution
+        if tool_results:
+            discovered = auto_discover_markets()
+            # Add discovered markets to tool results so they're included in context
+            tool_results.extend(discovered)
+
+        # CRITICAL: Refresh game state immediately after tool execution
+        # This ensures the bot sees updated ship states (fuel, cargo, etc.) right away
+        # instead of waiting for the next iteration
+        if tool_results:
+            # Remove stale game state from current messages
+            messages = [
+                msg for msg in messages
+                if not (isinstance(msg, SystemMessage) and
+                        "=== CURRENT GAME STATE ===" in msg.content)
+            ]
+
+            # Inject FRESH game state with updated ship data
+            console.print("  [dim]Refreshing game state after actions...[/dim]")
+            fresh_state = gather_game_state(fleet, context)
+            if fresh_state:
+                messages.append(SystemMessage(content=fresh_state))
 
         # 3. NARRATE (non-blocking — bot continues immediately)
         # Convert tool_results to format expected by narrative generator (without error flag)
         narrative_tool_results = [(name, result) for name, result, is_err in tool_results if not is_err]
 
-        # Get FRESH fleet state from API for accurate narrative
+        # Use fleet state from the fresh game state we just gathered (no need to fetch again)
         fleet_state = ""
         if has_significant_action:
-            try:
-                from tools import client
-                ships_data = client.list_ships()
-                if isinstance(ships_data, list):
-                    fleet.update_from_api(ships_data)
-                    fleet_state = "\n".join(_build_fleet_lines(ships_data, fleet))
-            except Exception:
-                fleet_state = fleet.fleet_summary()
+            # Fleet data was already refreshed above, just format it
+            fleet_state = fleet.fleet_summary()
 
         # Optional: Generate narrative after each significant action
         # This doubles inference time per iteration, so disabled by default
