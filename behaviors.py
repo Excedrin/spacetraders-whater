@@ -37,6 +37,7 @@ class BehaviorConfig:
     parameters: dict = field(default_factory=dict)
     current_state: str = STATE_START
     error_message: str = ""
+    alert_sent: bool = False  # True after alerting on a terminal state; prevents re-alerting every tick
 
 
 _engine_instance: Optional["BehaviorEngine"] = None
@@ -73,6 +74,7 @@ class BehaviorEngine:
                         parameters=e.get("parameters", {}),
                         current_state=e.get("current_state", STATE_START),
                         error_message=e.get("error_message", ""),
+                        alert_sent=e.get("alert_sent", False),
                     )
                     self.behaviors[cfg.ship_symbol] = cfg
             except Exception:
@@ -87,6 +89,7 @@ class BehaviorEngine:
                     "parameters": c.parameters,
                     "current_state": c.current_state,
                     "error_message": c.error_message,
+                    "alert_sent": c.alert_sent,
                 }
                 for c in self.behaviors.values()
             ],
@@ -214,17 +217,25 @@ class BehaviorEngine:
             self._save()
             return None
 
-        # ── CARGO_FULL: alert until LLM intervenes ───────────────────────
+        # ── CARGO_FULL: alert once, then wait silently ───────────────────
         if state == STATE_CARGO_FULL:
-            ore_desc = ", ".join(ore_types) if ore_types else "all ores"
-            return (
-                f"{ship_symbol} MINING_LOOP: cargo full ({ore_desc}). "
-                f"Use cancel_behavior to sell manually, then reassign."
-            )
+            if not config.alert_sent:
+                config.alert_sent = True
+                self._save()
+                ore_desc = ", ".join(ore_types) if ore_types else "all ores"
+                return (
+                    f"{ship_symbol} MINING_LOOP: cargo full ({ore_desc}). "
+                    f"Use cancel_behavior to sell manually, then reassign."
+                )
+            return None
 
-        # ── ERROR: alert until LLM intervenes ───────────────────────────
+        # ── ERROR: alert once, then wait silently ────────────────────────
         if state == STATE_ERROR:
-            return f"{ship_symbol} MINING_LOOP suspended: {config.error_message}"
+            if not config.alert_sent:
+                config.alert_sent = True
+                self._save()
+                return f"{ship_symbol} MINING_LOOP suspended: {config.error_message}"
+            return None
 
         return None
 
@@ -323,14 +334,19 @@ class BehaviorEngine:
             self._save()
             return None
 
-        # ── ERROR ────────────────────────────────────────────────────────
+        # ── ERROR: alert once, then wait silently ────────────────────────
         if state == STATE_ERROR:
-            return f"{config.ship_symbol} SATELLITE_SCOUT suspended: {config.error_message}"
+            if not config.alert_sent:
+                config.alert_sent = True
+                self._save()
+                return f"{config.ship_symbol} SATELLITE_SCOUT suspended: {config.error_message}"
+            return None
 
         return None
 
     def _error(self, config: BehaviorConfig, message: str) -> str:
         config.current_state = STATE_ERROR
         config.error_message = message
+        config.alert_sent = False  # ensure the new error fires once
         self._save()
-        return f"{config.ship_symbol} MINING_LOOP error: {message}"
+        return f"{config.ship_symbol} {config.behavior_type} error: {message}"

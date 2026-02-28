@@ -1074,7 +1074,7 @@ def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
 
 @tool
 def refuel_ship(ship_symbol: str) -> str:
-    """Refuel a ship at the current waypoint. Auto-docks if in orbit. The waypoint must have a marketplace that sells fuel."""
+    """Refuel a ship at the current waypoint. The waypoint must have a marketplace that sells fuel."""
     err = _ensure_dock(ship_symbol)
     if err:
         return f"Error: {err}"
@@ -1154,24 +1154,45 @@ def _get_available_units(ship_symbol: str, trade_symbol: str, requested_units: i
     return final_units, None
 
 
+def _get_contract_goods() -> set[str]:
+    """Return the set of trade symbols required by any active, unfulfilled contract."""
+    contracts = client.list_contracts()
+    if not isinstance(contracts, list):
+        return set()
+    goods = set()
+    for c in contracts:
+        if c.get("accepted") and not c.get("fulfilled"):
+            for d in c.get("terms", {}).get("deliver", []):
+                goods.add(d["tradeSymbol"])
+    return goods
+
+
 @tool
-def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
-    """Sell cargo. Auto-docks. If units is None or exceeds inventory, sells all available."""
-    
-    # Use helper to get safe unit count
+def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+    """Sell cargo. If units is None or exceeds inventory, sells all available."""
+    # Guard: warn if this is a contract good
+    # disable force
+    if True:
+        contract_goods = _get_contract_goods()
+        if trade_symbol in contract_goods:
+            return (
+                f"Error: {trade_symbol} is required by an active contract. "
+                f"Use deliver_contract to deliver it instead. "
+                f"Call sell_cargo with force=True to sell anyway."
+            )
+
     safe_units, error = _get_available_units(ship_symbol, trade_symbol, units)
     if error:
         return error
 
-    # Proceed with action
     err = _ensure_dock(ship_symbol)
     if err:
         return f"Error: {err}"
-        
+
     data = client.sell_cargo(ship_symbol, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
-        
+
     tx = data.get("transaction", {})
     cargo = data.get("cargo", {})
     return (
@@ -1181,9 +1202,21 @@ def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
 
 
 @tool
-def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
-    """Jettison cargo. If units is None or exceeds inventory, jettisons all available."""
-    
+def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+    """Jettison cargo. If units is None or exceeds inventory, jettisons all available.
+
+    If the item is required by an active contract, returns an error to prevent accidental loss.
+    Pass force=True to jettison anyway.
+    """
+    if not force:
+        contract_goods = _get_contract_goods()
+        if trade_symbol in contract_goods:
+            return (
+                f"Error: {trade_symbol} is required by an active contract. "
+                f"Use deliver_contract to deliver it instead. "
+                f"Call jettison_cargo with force=True to jettison anyway."
+            )
+
     safe_units, error = _get_available_units(ship_symbol, trade_symbol, units)
     if error:
         return error
@@ -1191,7 +1224,7 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> st
     data = client.jettison(ship_symbol, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
-        
+
     cargo = data.get("cargo", {})
     return (
         f"Jettisoned {safe_units} {trade_symbol}.\n"
@@ -1369,7 +1402,7 @@ def set_flight_mode(ship_symbol: str, mode: str) -> str:
 
 @tool
 def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> str:
-    """Deliver goods to fulfill a contract. Auto-docks if in orbit. Ship must be at the contract's delivery waypoint with the required goods."""
+    """Deliver goods to fulfill a contract. Ship must be at the contract's delivery waypoint with the required goods."""
     err = _ensure_dock(ship_symbol)
     if err:
         return f"Error: {err}"

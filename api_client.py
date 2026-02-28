@@ -1,6 +1,11 @@
+import time
 import requests
 
 BASE_URL = "https://api.spacetraders.io/v2"
+_RETRYABLE = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
 
 
 class SpaceTradersClient:
@@ -11,17 +16,42 @@ class SpaceTradersClient:
             "Content-Type": "application/json",
         })
 
-    def _request(self, method: str, path: str, **kwargs) -> dict:
+    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
         if method == "POST" and "json" not in kwargs:
             kwargs["json"] = {}
-        resp = self.session.request(method, f"{BASE_URL}{path}", **kwargs)
-        # Handle 204 No Content (e.g. cooldown endpoint when no cooldown active)
-        if resp.status_code == 204 or not resp.content:
-            return {}
-        body = resp.json()
-        if "error" in body:
-            return {"error": body["error"].get("message", str(body["error"]))}
-        return body.get("data", body)
+
+        last_err = None
+        for attempt in range(retries):
+            try:
+                resp = self.session.request(
+                    method, f"{BASE_URL}{path}", timeout=30, **kwargs
+                )
+            except _RETRYABLE as e:
+                last_err = str(e)
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                continue
+            except requests.exceptions.RequestException as e:
+                return {"error": str(e)}
+
+            # Rate limited — wait and retry
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 2))
+                if attempt < retries - 1:
+                    time.sleep(retry_after)
+                    continue
+                return {"error": "Rate limited, all retries exhausted"}
+
+            # 204 No Content (e.g. cooldown endpoint when no cooldown active)
+            if resp.status_code == 204 or not resp.content:
+                return {}
+
+            body = resp.json()
+            if "error" in body:
+                return {"error": body["error"].get("message", str(body["error"]))}
+            return body.get("data", body)
+
+        return {"error": f"Connection failed after {retries} attempts: {last_err}"}
 
     # --- Agent ---
 
