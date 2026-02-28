@@ -128,7 +128,7 @@ def _parse_arrival(nav: dict) -> float:
 
 @tool
 def view_agent() -> str:
-    """View your agent's credits, headquarters location, and ship count. Call this first to understand your current situation."""
+    """[READ-ONLY] View your agent's credits, headquarters location, and ship count."""
     data = client.get_agent()
     if "error" in data:
         return f"Error: {data['error']}"
@@ -143,7 +143,7 @@ def view_agent() -> str:
 
 @tool
 def view_contracts() -> str:
-    """List all your contracts with their status, terms, and delivery requirements. Use this to find contracts to accept and track delivery progress."""
+    """[READ-ONLY] List all contracts with status, terms, and delivery requirements."""
     data = client.list_contracts()
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -190,7 +190,7 @@ def _get_ship_capabilities(ship: dict) -> list[str]:
 
 @tool
 def view_ships() -> str:
-    """List all ships with location, fuel, status, cooldowns, and cargo. Use this to track your fleet."""
+    """[READ-ONLY] List all ships with location, fuel, status, cooldowns, and cargo."""
     data = client.list_ships()
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -316,7 +316,7 @@ def find_nearest(ship_symbol: str, target: str) -> str:
 
 @tool
 def view_cargo(ship_symbol: str) -> str:
-    """View the cargo contents of a specific ship. Use this to check what ores and goods you're carrying before selling or delivering."""
+    """[READ-ONLY] View the cargo contents of a specific ship."""
     data = client.get_cargo(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -333,7 +333,7 @@ def view_cargo(ship_symbol: str) -> str:
 
 @tool
 def view_ship_details(ship_symbol: str) -> str:
-    """View detailed ship information including mounts (weapons, mining lasers, etc.) and modules (cargo, refineries, etc.). Use this to understand what a ship can do."""
+    """[READ-ONLY] View detailed ship info: mounts, modules, capabilities."""
     ships = client.list_ships()
     if isinstance(ships, dict) and "error" in ships:
         return f"Error: {ships['error']}"
@@ -787,7 +787,7 @@ def view_market(waypoint_symbol: str) -> str:
 
 @tool
 def accept_contract(contract_id: str) -> str:
-    """Accept a contract to start working on it. You must accept before you can deliver goods. Accepting often gives you an upfront credit payment."""
+    """[STATE: credits, contract status] Accept a contract. Gives upfront credit payment."""
     data = client.accept_contract(contract_id)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -801,7 +801,7 @@ def accept_contract(contract_id: str) -> str:
 
 @tool
 def purchase_ship(ship_type: str, waypoint_symbol: str) -> str:
-    """Purchase a ship at a shipyard waypoint. Common types: SHIP_MINING_DRONE, SHIP_PROBE. You need a ship present at the waypoint and enough credits."""
+    """[STATE: credits, fleet] Purchase a ship at a shipyard. Need a ship present and enough credits."""
     data = client.purchase_ship(ship_type, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -815,7 +815,7 @@ def purchase_ship(ship_type: str, waypoint_symbol: str) -> str:
 
 @tool
 def orbit_ship(ship_symbol: str) -> str:
-    """Put a ship into orbit at its current waypoint. Ships must be in orbit to navigate or extract ores. Call this after docking or when a ship is docked."""
+    """[STATE: nav_status] Put a ship into orbit. Required before navigating or extracting."""
     data = client.orbit(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -825,7 +825,7 @@ def orbit_ship(ship_symbol: str) -> str:
 
 @tool
 def dock_ship(ship_symbol: str) -> str:
-    """Dock a ship at its current waypoint. Ships must be docked to refuel, sell cargo, or purchase ships. Call this before refueling or selling."""
+    """[STATE: nav_status] Dock a ship. Required before refueling, selling, or purchasing."""
     data = client.dock(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -923,16 +923,12 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
 
 @tool
 def navigate_ship(ship_symbol: str, waypoint_symbol: str, mode: str = "CRUISE") -> str:
-    """Navigate a ship to a different waypoint. Consumes fuel and takes time.
+    """[STATE: position, fuel] Navigate a ship to a waypoint. Auto-orbits, auto-refuels if possible.
 
     Args:
         ship_symbol: The ship to navigate
         waypoint_symbol: The destination waypoint (e.g., X1-AB12-C3)
-        mode: Flight mode. 
-              'CRUISE' (Standard, 1x fuel), 
-              'DRIFT' (Slow, 1 fuel total), 
-              'BURN' (Fast, 2x fuel), 
-              'STEALTH' (Standard, reduced visibility)
+        mode: Flight mode: CRUISE (1x fuel), DRIFT (1 fuel total), BURN (2x fuel), STEALTH (1x fuel)
     """
     import math
 
@@ -971,20 +967,34 @@ def navigate_ship(ship_symbol: str, waypoint_symbol: str, mode: str = "CRUISE") 
         distance, fuel_cost, _ = _calculate_travel_cost(ship, dest, origin, mode)
 
         if fuel_current < fuel_cost:
-            # Not enough fuel logic
+            # Auto-refuel if current location has fuel
             market_cache = load_market_cache()
             current_market = market_cache.get(current_wp_symbol, {})
             has_fuel = "FUEL" in current_market.get("exchange", []) or "FUEL" in current_market.get("exports", [])
 
-            err_msg = (f"Error: Not enough fuel! {ship_symbol} needs {fuel_cost} for {mode} but has {fuel_current}.\n")
-            
             if has_fuel:
-                err_msg += f"You are at {current_wp_symbol} which sells FUEL. Call refuel_ship('{ship_symbol}') first!"
-            elif mode != "DRIFT":
-                # Check if DRIFT is an option (cost is always 1)
-                err_msg += f"Try using mode='DRIFT' (costs 1 fuel) if you are stranded, or find a fuel station."
-            
-            return err_msg
+                # Auto-dock, refuel, re-orbit
+                dock_err = _ensure_dock(ship_symbol)
+                if dock_err:
+                    return f"Error: Auto-refuel failed (dock): {dock_err}"
+                refuel_data = client.refuel(ship_symbol)
+                if isinstance(refuel_data, dict) and "error" in refuel_data:
+                    return f"Error: Auto-refuel failed: {refuel_data['error']}"
+                orbit_err = _ensure_orbit(ship_symbol)
+                if orbit_err:
+                    return f"Error: Auto-refuel failed (re-orbit): {orbit_err}"
+                # Update fuel from refuel response
+                new_fuel = refuel_data.get("fuel", {})
+                fuel_current = new_fuel.get("current", fuel_current)
+                # Re-check if we have enough now
+                if fuel_current < fuel_cost:
+                    return (f"Error: Still not enough fuel after refueling! "
+                            f"{ship_symbol} has {fuel_current} but needs {fuel_cost} for {mode}.")
+            else:
+                err_msg = (f"Error: Not enough fuel! {ship_symbol} needs {fuel_cost} for {mode} but has {fuel_current}.\n")
+                if mode != "DRIFT":
+                    err_msg += f"Try using mode='DRIFT' (costs 1 fuel) if you are stranded, or find a fuel station."
+                return err_msg
 
     # 3. Execution
     err = _ensure_orbit(ship_symbol)
@@ -1016,7 +1026,7 @@ navigate_ship._last_wait = 0.0
 
 @tool
 def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
-    """Calculate distance and fuel cost for a specific flight mode. Use this to check feasibility before flying."""
+    """[READ-ONLY] Calculate distance and fuel cost for a route. Check feasibility before flying."""
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         return f"Error: {ship['error']}"
@@ -1074,7 +1084,7 @@ def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
 
 @tool
 def refuel_ship(ship_symbol: str) -> str:
-    """Refuel a ship at the current waypoint. The waypoint must have a marketplace that sells fuel."""
+    """[STATE: fuel, credits] Refuel a ship at current waypoint. Auto-docks. Waypoint must sell fuel."""
     err = _ensure_dock(ship_symbol)
     if err:
         return f"Error: {err}"
@@ -1091,7 +1101,7 @@ def refuel_ship(ship_symbol: str) -> str:
 
 @tool
 def extract_ore(ship_symbol: str) -> str:
-    """Extract ores and minerals from an asteroid. Auto-orbits if docked. Ship must be at an asteroid with a mining laser. Cooldown applies between extractions."""
+    """[STATE: cargo, cooldown] Extract ores from an asteroid. Auto-orbits. Cooldown applies between extractions."""
     # Check cooldown first
     cooldown = client.get_cooldown(ship_symbol)
     if isinstance(cooldown, dict) and not cooldown.get("error"):
@@ -1169,7 +1179,7 @@ def _get_contract_goods() -> set[str]:
 
 @tool
 def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
-    """Sell cargo. If units is None or exceeds inventory, sells all available."""
+    """[STATE: cargo, credits] Sell cargo at current market. Auto-docks. Refuses to sell contract goods."""
     # Guard: warn if this is a contract good
     # disable force
     if True:
@@ -1203,11 +1213,7 @@ def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bo
 
 @tool
 def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
-    """Jettison cargo. If units is None or exceeds inventory, jettisons all available.
-
-    If the item is required by an active contract, returns an error to prevent accidental loss.
-    Pass force=True to jettison anyway.
-    """
+    """[STATE: cargo] Jettison cargo into space. Refuses to jettison contract goods unless force=True."""
     if not force:
         contract_goods = _get_contract_goods()
         if trade_symbol in contract_goods:
@@ -1234,7 +1240,7 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force
 
 @tool
 def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
-    """Transfer cargo. Auto-orbits. If units is None or exceeds inventory, transfers all available."""
+    """[STATE: cargo] Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint."""
     
     # Check source ship inventory
     safe_units, error = _get_available_units(from_ship, trade_symbol, units)
@@ -1261,7 +1267,7 @@ def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int =
 
 @tool
 def survey_asteroid(ship_symbol: str) -> str:
-    """Survey an asteroid field to find rich deposits. The ship must be in orbit at an asteroid. Surveys improve extraction yields but expire after a few minutes. Returns survey data to use with extract_with_survey."""
+    """[STATE: cooldown] Survey an asteroid field for rich deposits. Ship must be in orbit at an asteroid."""
     data = client.survey(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1278,7 +1284,7 @@ def survey_asteroid(ship_symbol: str) -> str:
 
 @tool
 def scan_waypoints(ship_symbol: str) -> str:
-    """Scan for waypoints from current location. Reveals nearby waypoints in the system. Ship must be in orbit."""
+    """[STATE: cooldown] Scan for waypoints from current location. Ship must be in orbit."""
     data = client.scan_waypoints(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1295,7 +1301,7 @@ def scan_waypoints(ship_symbol: str) -> str:
 
 @tool
 def scan_ships(ship_symbol: str) -> str:
-    """Scan for other ships in the area. Ship must be in orbit."""
+    """[STATE: cooldown] Scan for other ships in the area. Ship must be in orbit."""
     data = client.scan_ships(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1310,7 +1316,7 @@ def scan_ships(ship_symbol: str) -> str:
 
 @tool
 def jump_ship(ship_symbol: str, system_symbol: str) -> str:
-    """Jump ship to another star system through a jump gate. Ship must be at a jump gate waypoint and in orbit. Requires antimatter fuel."""
+    """[STATE: position, cooldown] Jump to another star system via jump gate. Requires antimatter."""
     data = client.jump(ship_symbol, system_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1325,7 +1331,7 @@ def jump_ship(ship_symbol: str, system_symbol: str) -> str:
 
 @tool
 def warp_ship(ship_symbol: str, waypoint_symbol: str) -> str:
-    """Warp ship to a waypoint in another system. Uses antimatter. Ship must be in orbit."""
+    """[STATE: position, fuel] Warp to a waypoint in another system. Uses antimatter."""
     data = client.warp(ship_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1339,7 +1345,7 @@ def warp_ship(ship_symbol: str, waypoint_symbol: str) -> str:
 
 @tool
 def negotiate_contract(ship_symbol: str) -> str:
-    """Negotiate a new contract at a faction headquarters. Ship must be docked at a faction HQ waypoint."""
+    """[STATE: contracts] Negotiate a new contract. Ship must be docked at a faction HQ."""
     data = client.negotiate_contract(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1356,7 +1362,7 @@ def negotiate_contract(ship_symbol: str) -> str:
 
 @tool
 def chart_waypoint(ship_symbol: str) -> str:
-    """Chart the current waypoint to add it to your known waypoints. Useful for unexplored locations."""
+    """[STATE: waypoint data] Chart the current waypoint to add it to known waypoints."""
     data = client.chart(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1393,7 +1399,7 @@ def view_jump_gate(waypoint_symbol: str) -> str:
 
 @tool
 def set_flight_mode(ship_symbol: str, mode: str) -> str:
-    """Set ship flight mode. Modes: CRUISE (balanced), BURN (fast, uses more fuel), DRIFT (slow, no fuel), STEALTH (avoid detection)."""
+    """[STATE: flight_mode] Set ship flight mode: CRUISE, BURN (2x fuel), DRIFT (1 fuel), STEALTH."""
     data = client.set_flight_mode(ship_symbol, mode.upper())
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1402,7 +1408,7 @@ def set_flight_mode(ship_symbol: str, mode: str) -> str:
 
 @tool
 def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> str:
-    """Deliver goods to fulfill a contract. Ship must be at the contract's delivery waypoint with the required goods."""
+    """[STATE: cargo, contract] Deliver goods for a contract. Auto-docks. Ship must be at delivery waypoint."""
     err = _ensure_dock(ship_symbol)
     if err:
         return f"Error: {err}"
@@ -1419,7 +1425,7 @@ def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, unit
 
 @tool
 def fulfill_contract(contract_id: str) -> str:
-    """Complete a contract after all deliveries are done. This collects the final payment. Only call this when all required goods have been delivered."""
+    """[STATE: credits, contract] Complete a contract after all deliveries. Collects final payment."""
     data = client.fulfill_contract(contract_id)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1431,12 +1437,153 @@ def fulfill_contract(contract_id: str) -> str:
 
 
 # ──────────────────────────────────────────────
+#  Trade analysis
+# ──────────────────────────────────────────────
+
+
+@tool
+def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) -> str:
+    """[READ-ONLY] Find profitable trade routes from cached market data.
+
+    Compares buy prices (exports/exchange) with sell prices (imports/exchange) across
+    all known markets. Only uses cached price data — send ships to markets for fresh prices.
+
+    Args:
+        ship_symbol: Optional. If given, shows distance from this ship and sorts by profit/distance.
+        good: Optional. Filter to a specific trade good (e.g. "IRON_ORE").
+        min_profit: Minimum profit per unit to include (default: 1).
+    """
+    import math
+    import time
+
+    cache = load_market_cache()
+    if not cache:
+        return "No market data cached. Send ships to markets or run scan_system first."
+
+    # Build per-good source/sink lists from markets that have price data
+    # source = where to BUY (exports/exchange) — cost is sellPrice (what you pay the market)
+    # sink = where to SELL (imports/exchange) — revenue is purchasePrice (what market pays you)
+    sources = {}  # good -> [(market_wp, buy_cost, volume)]
+    sinks = {}    # good -> [(market_wp, sell_revenue, volume)]
+
+    for wp, mdata in cache.items():
+        trade_goods = mdata.get("trade_goods")
+        if not trade_goods:
+            continue
+
+        exports = set(mdata.get("exports", []))
+        imports = set(mdata.get("imports", []))
+        exchange = set(mdata.get("exchange", []))
+        source_goods = exports | exchange
+        sink_goods = imports | exchange
+
+        for tg in trade_goods:
+            sym = tg["symbol"]
+            buy_cost = tg.get("sellPrice")       # what you PAY the market
+            sell_revenue = tg.get("purchasePrice")  # what market PAYS you
+
+            if sym in source_goods and buy_cost is not None:
+                sources.setdefault(sym, []).append((wp, buy_cost, tg.get("tradeVolume", 0)))
+            if sym in sink_goods and sell_revenue is not None:
+                sinks.setdefault(sym, []).append((wp, sell_revenue, tg.get("tradeVolume", 0)))
+
+    # Filter to specific good if requested
+    if good:
+        good = good.upper()
+        all_goods = {good} if good in sources and good in sinks else set()
+    else:
+        all_goods = set(sources.keys()) & set(sinks.keys())
+
+    if not all_goods:
+        if good:
+            return f"No trade routes found for {good}. Need both a source (exports/exchange) and sink (imports/exchange) with price data."
+        return "No trade routes found. Need more market price data — send ships to scout markets."
+
+    # Build routes: pair each source with each sink, compute profit
+    routes = []
+    now = time.time()
+
+    for sym in all_goods:
+        for src_wp, buy_cost, src_vol in sources.get(sym, []):
+            for snk_wp, sell_rev, snk_vol in sinks.get(sym, []):
+                if src_wp == snk_wp:
+                    continue
+                profit = sell_rev - buy_cost
+                if profit < min_profit:
+                    continue
+                volume = min(src_vol, snk_vol)
+                # Check staleness of both markets
+                src_updated = cache.get(src_wp, {}).get("last_updated", 0)
+                snk_updated = cache.get(snk_wp, {}).get("last_updated", 0)
+                oldest = min(src_updated, snk_updated)
+                stale = (now - oldest) > 7200 if oldest else True  # >2h
+                routes.append({
+                    "good": sym,
+                    "src": src_wp,
+                    "snk": snk_wp,
+                    "buy": buy_cost,
+                    "sell": sell_rev,
+                    "profit": profit,
+                    "volume": volume,
+                    "stale": stale,
+                })
+
+    if not routes:
+        return f"No profitable routes found (min_profit={min_profit}). Try lowering min_profit or scouting more markets."
+
+    # If ship_symbol given, compute distance from ship to source and sort by efficiency
+    ship_wp = None
+    ship_pos = None
+    wp_coords = {}
+
+    if ship_symbol:
+        ship = client.get_ship(ship_symbol)
+        if isinstance(ship, dict) and "error" not in ship:
+            nav = ship.get("nav", {})
+            ship_wp = nav.get("waypointSymbol", "")
+            system_symbol = nav.get("systemSymbol", "")
+
+            waypoints = client.list_waypoints(system_symbol)
+            if isinstance(waypoints, list):
+                for wp in waypoints:
+                    wp_coords[wp["symbol"]] = (wp.get("x", 0), wp.get("y", 0))
+                ship_pos = wp_coords.get(ship_wp)
+
+    if ship_pos:
+        # Add distance info and sort by profit / distance (efficiency)
+        for r in routes:
+            src_pos = wp_coords.get(r["src"])
+            if src_pos:
+                dist = math.sqrt((src_pos[0] - ship_pos[0])**2 + (src_pos[1] - ship_pos[1])**2)
+                r["dist"] = max(dist, 1.0)  # avoid div by zero
+            else:
+                r["dist"] = None
+        routes.sort(key=lambda r: r["profit"] / r["dist"] if r.get("dist") else 0, reverse=True)
+    else:
+        # Sort by raw profit per unit
+        routes.sort(key=lambda r: r["profit"], reverse=True)
+
+    # Format top 10
+    lines = ["Top trade routes (from cached prices):\n"]
+    for r in routes[:10]:
+        lines.append(f"  {r['good']}: buy at {r['src']} ({r['buy']}/unit) -> sell at {r['snk']} ({r['sell']}/unit)")
+        detail = f"    Profit: {r['profit']}/unit | Volume: {r['volume']}"
+        if ship_pos and r.get("dist"):
+            detail += f" | Dist: {r['dist']:.1f} from {ship_symbol}"
+        if r["stale"]:
+            detail += " | STALE PRICES (2h+)"
+        lines.append(detail)
+
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 #  Planning tool
 # ──────────────────────────────────────────────
 
 @tool
 def update_plan(plan: str) -> str:
-    """Write or update your current plan. The plan is shown to you at the start of every turn in [Current Plan]. Use this to record what you intend to do and why, track multi-step goals, and note important discoveries. The plan is also visible to the human operator who can edit it."""
+    """[STATE: plan file] Write or update your plan. Shown in [Current Plan] every turn. Visible to the operator."""
     from pathlib import Path
     import time
 
@@ -1456,40 +1603,56 @@ def update_plan(plan: str) -> str:
 
 
 # ──────────────────────────────────────────────
-#  Behavior assignment tools
+#  Behavior tools (step-sequence engine)
 # ──────────────────────────────────────────────
 
 
 @tool
-def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") -> str:
-    """Assign an automated MINING_LOOP behavior to a ship.
+def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
+    """[STATE: behavior] Create an automated step-sequence behavior for a ship.
 
-    The ship will orbit the asteroid, continuously extract ore, and jettison
-    non-target ores. You will only be called when cargo is full or an error occurs.
-    Do NOT manually navigate or mine a ship that has an active MINING_LOOP.
+    Steps execute in order automatically. Each step auto-handles dock/orbit.
+
+    Steps (comma-separated):
+      mine WAYPOINT [ORE1 ORE2]  - Navigate to asteroid, mine until cargo full, jettison non-targets
+      goto WAYPOINT              - Navigate to waypoint, wait for arrival
+      sell ITEM or sell *         - Sell cargo at current market (skips contract goods)
+      deliver CONTRACT ITEM [N]  - Deliver cargo for contract
+      refuel                     - Refuel at current market
+      scout                      - View market prices at current location
+      alert MESSAGE              - Pause and alert you
+      repeat                     - Restart from step 1
 
     Args:
-        ship_symbol: Ship to assign (must already be at the asteroid waypoint).
-        asteroid_wp: Waypoint symbol of the asteroid to mine.
-        ore_types: Comma-separated ore symbols to KEEP (e.g. "IRON_ORE,COPPER_ORE").
-                   Everything else is jettisoned automatically.
-                   Leave empty to keep all ores (you will be alerted when cargo is full).
+        start_step: Step index to begin at (0-based). Use to spread multiple ships
+                    across the same sequence so they don't converge on the first step.
+
+    Example: "mine X1-AST IRON_ORE, goto X1-MKT, sell IRON_ORE, goto X1-AST, repeat"
     """
     from behaviors import get_engine
-    params: dict = {"asteroid_wp": asteroid_wp}
-    if ore_types:
-        params["ore_types"] = [s.strip() for s in ore_types.split(",") if s.strip()]
-    get_engine().assign(ship_symbol, "MINING_LOOP", params)
-    ore_desc = f"keeping {params['ore_types']}" if ore_types else "keeping all ores"
-    return f"Assigned MINING_LOOP to {ship_symbol}: mining at {asteroid_wp}, {ore_desc}."
+    result = get_engine().assign(ship_symbol, steps, start_step=start_step)
+    return result
+
+
+@tool
+def resume_behavior(ship_symbol: str) -> str:
+    """[STATE: behavior] Resume a paused behavior after handling an alert. Advances past the alert step."""
+    from behaviors import get_engine
+    return get_engine().resume(ship_symbol)
+
+
+@tool
+def skip_step(ship_symbol: str) -> str:
+    """[STATE: behavior] Skip the current step of a behavior and advance to the next one."""
+    from behaviors import get_engine
+    return get_engine().skip_step(ship_symbol)
 
 
 @tool
 def cancel_behavior(ship_symbol: str) -> str:
-    """Cancel a ship's automated behavior and return it to manual LLM control.
+    """[STATE: behavior] Cancel a ship's behavior. Ship returns to IDLE (manual LLM control).
 
-    Use this when a ship needs manual direction (e.g. navigate to sell cargo,
-    or when a behavior raised an alert that requires repositioning).
+    Cancel before manually operating a ship that has an active behavior.
     """
     from behaviors import get_engine
     engine = get_engine()
@@ -1500,57 +1663,79 @@ def cancel_behavior(ship_symbol: str) -> str:
 
 
 @tool
-def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str:
-    """Assign SATELLITE_SCOUT behavior to one or more satellites.
+def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") -> str:
+    """[STATE: behavior] Convenience: assign a mine-sell loop. Builds a step sequence internally.
 
-    Satellites cycle through a market list, keeping price data fresh. They are
-    distributed evenly so each starts at a different offset with minimal overlap.
+    Args:
+        ship_symbol: Ship to assign.
+        asteroid_wp: Asteroid waypoint to mine at.
+        ore_types: Comma-separated ore symbols to KEEP (e.g. "IRON_ORE,COPPER_ORE").
+    """
+    from behaviors import get_engine
+    ore_list = [s.strip() for s in ore_types.split(",") if s.strip()] if ore_types else []
+    ore_str = " ".join(ore_list) if ore_list else ""
+    mine_part = f"mine {asteroid_wp} {ore_str}".strip()
+    # Simple mine loop: mine until full, then alert for LLM to handle selling
+    steps_str = f"{mine_part}, alert cargo full, repeat"
+    return get_engine().assign(ship_symbol, steps_str)
+
+
+@tool
+def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str:
+    """[STATE: behavior] Convenience: assign scouting to satellites. Builds step sequences internally.
+
+    All satellites share the same step sequence but start at evenly-spaced offsets so
+    they spread across the market list instead of converging on the first waypoint.
 
     Args:
         ship_symbols: Comma-separated satellite ship symbols (e.g. "WHATER-2,WHATER-3").
-        market_waypoints: Optional comma-separated waypoints to scout
-                          (e.g. "X1-AB12-A1,X1-AB12-B2"). If omitted, the satellite
-                          will automatically use all known markets from the cache,
-                          picking up newly discovered markets over time.
+        market_waypoints: Comma-separated waypoints to scout. If omitted, uses all known markets.
     """
     from behaviors import get_engine
     ships = [s.strip() for s in ship_symbols.split(",") if s.strip()]
-    markets = [m.strip() for m in market_waypoints.split(",") if m.strip()]
 
     if not ships:
         return "Error: no ship symbols provided."
 
     engine = get_engine()
-    n = len(ships)
 
-    if markets:
-        m = len(markets)
-        for i, ship in enumerate(ships):
-            start_index = (i * m) // n
-            engine.assign(ship, "SATELLITE_SCOUT", {
-                "market_list": markets,
-                "current_index": start_index,
-            })
-        offsets = [str((i * m) // n) for i in range(n)]
-        return (
-            f"Assigned SATELLITE_SCOUT to {n} satellite(s) across {m} markets. "
-            f"Starting indices: {', '.join(f'{s}@{o}' for s, o in zip(ships, offsets))}."
-        )
+    # Get market list
+    if market_waypoints:
+        markets = [m.strip() for m in market_waypoints.split(",") if m.strip()]
     else:
-        # No explicit list — each satellite will use the full market cache dynamically.
-        # Distribute starting offsets based on current cache size as a hint.
         cache = load_market_cache()
-        cache_size = max(len(cache), 1)
-        for i, ship in enumerate(ships):
-            start_index = (i * cache_size) // n
-            engine.assign(ship, "SATELLITE_SCOUT", {
-                "market_list": [],  # empty = use full cache each tick
-                "current_index": start_index,
-            })
-        return (
-            f"Assigned SATELLITE_SCOUT to {n} satellite(s) using all known markets "
-            f"({cache_size} currently in cache, list updates automatically)."
-        )
+        markets = sorted(cache.keys())
+
+    if not markets:
+        return "Error: no markets known. Run scan_system first."
+
+    # Build one shared sequence: goto M1, scout, goto M2, scout, ..., repeat
+    parts = []
+    for mkt in markets:
+        parts.append(f"goto {mkt}")
+        parts.append("scout")
+    parts.append("repeat")
+    steps_str = ", ".join(parts)
+
+    m = len(markets)
+
+    # Count ships already running this exact sequence (from previous calls).
+    # This makes sequential single-ship calls spread out just like a batch call.
+    already_placed = sum(
+        1 for cfg in engine.behaviors.values()
+        if cfg.steps_str == steps_str and cfg.ship_symbol not in ships
+    )
+    total = already_placed + len(ships)
+
+    results = []
+    for j, ship in enumerate(ships):
+        slot = already_placed + j        # absolute position in the full fleet
+        market_offset = (slot * m) // total
+        start_step = market_offset * 2  # 2 steps per market (goto + scout)
+        result = engine.assign(ship, steps_str, start_step=start_step)
+        results.append(result)
+
+    return "\n".join(results)
 
 
 # ──────────────────────────────────────────────
@@ -1562,18 +1747,17 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
 TIER_1_TOOLS = [
     # Navigation & planning
     navigate_ship, refuel_ship, plan_route,
-    # Mining
-    extract_ore,
     # Trading & cargo
     sell_cargo, transfer_cargo, jettison_cargo,
     # Contracts
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Info (view_market includes shipyard data)
-    scan_system, view_market, view_ships, find_waypoints, view_contracts,
+    scan_system, view_market, view_ships, find_waypoints, view_contracts, find_trades,
     # Planning
     update_plan,
-    # Behavior control
-    assign_mining_loop, assign_satellite_scout, cancel_behavior,
+    # Behavior control (step-sequence engine)
+    create_behavior, resume_behavior, skip_step, cancel_behavior,
+    assign_mining_loop, assign_satellite_scout,
 ]
 
 # All tools (tier 2) — includes advanced/exploration tools
@@ -1598,9 +1782,10 @@ ALL_TOOLS = [
     # Planning
     update_plan,
     # Find stuff
-    find_nearest,
-    # Behavior control
-    assign_mining_loop, assign_satellite_scout, cancel_behavior,
+    find_nearest, find_trades,
+    # Behavior control (step-sequence engine)
+    create_behavior, resume_behavior, skip_step, cancel_behavior,
+    assign_mining_loop, assign_satellite_scout,
 ]
 
 # Tools that are "significant" actions worth narrating

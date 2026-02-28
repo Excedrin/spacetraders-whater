@@ -60,6 +60,47 @@ TICK_INTERVAL = 10  # Seconds between tactical ticks (rate limit safety)
 MAX_RECENT_TURNS = 6  # Keep last N full turns (AIMessage + ToolMessages)
 MAX_TOKENS_ESTIMATE = 8000  # Target max tokens (rough estimate)
 
+# Action queue
+MAX_QUEUED_ACTIONS = 3  # Max queued actions per ship
+
+# State-changing tools (tools that modify ship state — not read-only)
+STATE_CHANGING_TOOLS = {
+    "navigate_ship", "extract_ore", "sell_cargo", "jettison_cargo",
+    "transfer_cargo", "refuel_ship", "deliver_contract", "dock_ship",
+    "orbit_ship", "survey_asteroid", "scan_waypoints", "scan_ships",
+    "jump_ship", "warp_ship",
+}
+
+
+class ActionQueue:
+    """Ephemeral per-ship action queue for serializing operations on busy ships."""
+
+    def __init__(self):
+        self.queues: dict[str, list[tuple[str, dict]]] = {}  # ship -> [(tool_name, args)]
+
+    def enqueue(self, ship_symbol: str, tool_name: str, args: dict) -> str:
+        if ship_symbol not in self.queues:
+            self.queues[ship_symbol] = []
+        q = self.queues[ship_symbol]
+        if len(q) >= MAX_QUEUED_ACTIONS:
+            return f"Error: Queue full for {ship_symbol} ({MAX_QUEUED_ACTIONS} pending). Wait for current actions to complete."
+        q.append((tool_name, args))
+        return f"Queued: {tool_name} for {ship_symbol} (will execute after ship is available, {len(q)} in queue)"
+
+    def get_ready(self, ship_symbol: str) -> tuple[str, dict] | None:
+        """Pop and return the next queued action if any."""
+        q = self.queues.get(ship_symbol, [])
+        if q:
+            return q.pop(0)
+        return None
+
+    def has_queued(self, ship_symbol: str) -> bool:
+        return bool(self.queues.get(ship_symbol))
+
+    def clear(self, ship_symbol: str):
+        self.queues.pop(ship_symbol, None)
+
+
 # Tools whose successful results are already captured in game state and can be compressed
 REDUNDANT_RESULT_TOOLS = {
     "update_plan",      # plan is in [Current Plan]
@@ -73,69 +114,45 @@ ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each
 
 SYSTEM_PROMPT = """\
 You are WHATER, Fleet Admiral of an autonomous SpaceTraders fleet.
+Ships run automated step sequences. You are called ONLY when a ship
+finishes its behavior (IDLE) or a behavior fires an ALERT.
 
-=== YOUR ROLE ===
-You command through behavior loops, not micromanagement. Automated behaviors handle
-navigation, extraction, and scouting without your involvement. You are called only when
-a ship is IDLE (no behavior assigned) or an [ALERT] fires. Your job is:
-1. Keep every ship assigned to a behavior.
-2. Handle alerts and return ships to their loops as fast as possible.
-3. Make strategic decisions (contracts, ship purchases, new routes).
+=== EVERY CYCLE ===
 
-=== STEP ONE: CHECK BEHAVIOR STATUS ===
-[Behavior Status] is the most important section. Read it first, every time.
+STEP 1 — CHECK PLAN
+If [Current Plan] is empty or stale: call update_plan FIRST.
+A plan says ONLY: the goal, which ship runs which behavior, what to do next.
+Do NOT put ship positions, cargo, fuel, or prices in the plan.
+If [Known Markets] is NONE: call scan_system before planning.
 
-If any ship is IDLE (missing from [Behavior Status]), assign it before doing anything else:
-- EXCAVATOR / COMMAND ship → `assign_mining_loop` (needs an asteroid waypoint)
-- SATELLITE              → `assign_satellite_scout` (no market list needed)
+STEP 2 — ASSIGN IDLE SHIPS
+Read [Behavior Status]. Any ship NOT listed is IDLE. Create a behavior:
 
-To find an asteroid: `find_waypoints(system, "ASTEROID")`
-To assign a miner:   `assign_mining_loop("WHATER-1", "X1-AB12-CB5E")`
-To assign a scout:   `assign_satellite_scout("WHATER-2")` — uses all known markets automatically
+  Mining ship (full loop with auto-sell):
+    create_behavior(ship, "mine ASTEROID ORE, goto MARKET, sell ORE, goto ASTEROID, repeat")
+  Contract delivery:
+    create_behavior(ship, "mine ASTEROID ORE, goto DEST, deliver CONTRACT ORE, goto ASTEROID, repeat")
+  Simple mining (alerts when full):
+    assign_mining_loop(ship, ASTEROID, "ORE1,ORE2")
+  Satellite:
+    assign_satellite_scout(ship) or
+    create_behavior(ship, "goto MKT1, scout, goto MKT2, scout, repeat")
 
-Multiple ships can be assigned in a single turn — behavior assignments don't conflict.
+STEP 3 — HANDLE ALERTS
+Read [ALERTS]. Options:
+  - resume_behavior(ship) if the issue resolved itself
+  - skip_step(ship) to skip a stuck step
+  - cancel_behavior(ship) for manual intervention, then create_behavior to restart
 
-=== HANDLING ALERTS ===
-[ALERTS] appear when a behavior cannot proceed without you. Standard response:
+=== SHIP TYPES ===
+EXCAVATOR/COMMAND: Burns fuel. Can mine. navigate_ship auto-refuels if fuel is available.
+SATELLITE: Solar powered, free movement. Cannot mine or trade.
 
-CARGO_FULL (miner):
-  1. `cancel_behavior(ship)` — take manual control
-  2. Navigate to the best market for the ore (check [Known Markets])
-  3. `dock_ship` → `sell_cargo` → `assign_mining_loop` to send it back
-
-ERROR (any behavior):
-  1. `cancel_behavior(ship)` — take manual control
-  2. Read the error, fix the root cause
-  3. Reassign the behavior
-
-Goal: resolve alerts and get every ship back on a behavior as quickly as possible.
-
-=== SHIP CAPABILITIES ===
-- EXCAVATOR / COMMAND: Burns fuel. Can mine. Assign MINING_LOOP.
-  - Always `plan_route` before navigating to check fuel cost.
-  - Verify the destination sells fuel before moving if the tank is low.
-- SATELLITE: Solar powered — free movement, no fuel ever. Cannot mine or trade.
-  - Assign SATELLITE_SCOUT. Never use a fuel-burning ship to scout.
-
-=== MANUAL OPERATIONS (between cancel and reassign) ===
-When handling an alert you will briefly operate a ship manually:
-- ONE state-changing action per turn per ship.
-- ✓ `navigate_ship(WHATER-1, X)` + `navigate_ship(WHATER-3, Y)` — different ships, fine
-- ✗ `navigate_ship(WHATER-1, X)` + `navigate_ship(WHATER-1, Y)` — same ship, FAILS
-- `transfer_cargo`: both ships must be at the same waypoint and in orbit.
-
-=== STRATEGIC TOOLS ===
-- `find_waypoints(system, "ASTEROID")` — locate mining sites
-- `find_waypoints(system, "MARKETPLACE")` — locate markets
-- `scan_system` — reveal all waypoints in a new system (run once on arrival)
-- `view_market` — get prices; requires a ship in orbit for live price data
-- `accept_contract` / `deliver_contract` / `fulfill_contract` — contract management
-
-=== CRITICAL ERRORS TO AVOID ===
-- VERY IMPORTANT: Do not sell or jettison contract goods. You must use deliver_contract to deliver contract materials.
-- Do not sell at a market that doesn't list the item as "Imports" or "Exchange".
-- Do not manually navigate, mine, or extract on a ship with an active behavior.
-- Do not use a fuel-burning ship for scouting when a satellite is available.
+=== RULES ===
+- One action per ship per turn. Different ships CAN act in the same turn.
+- Contract goods MUST be delivered with deliver_contract. NEVER sell them.
+- Only sell where item is under Imports or Exchange.
+- cancel_behavior(ship) before manually operating a ship with a behavior.
 """
 
 # ──────────────────────────────────────────────
@@ -793,6 +810,7 @@ def _run_llm_cycle(
     alert_text: str,
     iteration: int,
     debug: bool,
+    action_queue: ActionQueue = None,
 ) -> Optional[list]:
     """
     Run one LLM decision-execute-narrate cycle.
@@ -910,15 +928,29 @@ def _run_llm_cycle(
 
         display_tool_call(tool_name, tool_args)
 
-        ship_symbol = tool_args.get("ship_symbol", "")
+        ship_symbol = tool_args.get("ship_symbol") or tool_args.get("from_ship", "")
         ship_blocked = False
-        if ship_symbol and tool_name in WAITING_TOOLS:
+        if ship_symbol and tool_name in (WAITING_TOOLS | STATE_CHANGING_TOOLS):
             ship_status = fleet.get_ship(ship_symbol)
             if ship_status and not ship_status.is_available():
-                secs = ship_status.seconds_until_available()
-                result = f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining). Try another ship or use wait({int(secs)}) if nothing else to do."
-                is_error = True
-                ship_blocked = True
+                # Ship is busy — check if it has a behavior
+                has_behavior = ship_symbol in behavior_engine.behaviors
+                if has_behavior:
+                    secs = ship_status.seconds_until_available()
+                    result = (f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining) "
+                              f"and has an active behavior. cancel_behavior first to operate manually.")
+                    is_error = True
+                    ship_blocked = True
+                elif action_queue and tool_name in STATE_CHANGING_TOOLS:
+                    # Queue the action instead of erroring
+                    result = action_queue.enqueue(ship_symbol, tool_name, tool_args)
+                    is_error = False
+                    ship_blocked = True
+                else:
+                    secs = ship_status.seconds_until_available()
+                    result = f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining). Try another ship."
+                    is_error = True
+                    ship_blocked = True
 
         if not ship_blocked:
             tool_func = get_tool_by_name(tool_name)
@@ -1106,8 +1138,34 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
 
     iteration = start_iteration
     alert_queue: list[str] = []
+    action_queue = ActionQueue()
 
     while True:
+        # ── QUEUED ACTIONS ────────────────────────────────────────────────
+        # Execute queued actions for ships that just became available.
+        for ship_symbol in list(fleet.ships):
+            ship_status = fleet.get_ship(ship_symbol)
+            if ship_status and ship_status.is_available() and action_queue.has_queued(ship_symbol):
+                action = action_queue.get_ready(ship_symbol)
+                if action:
+                    tool_name, tool_args = action
+                    console.print(f"  [dim green]Executing queued {tool_name} for {ship_symbol}[/dim green]")
+                    tool_func = get_tool_by_name(tool_name)
+                    if tool_func:
+                        try:
+                            result = tool_func.invoke(tool_args)
+                            display_tool_result(tool_name, result, "Error:" in result)
+                            # Track wait times for navigation/extraction
+                            if tool_name in WAITING_TOOLS and "Error:" not in result:
+                                wait_time = get_last_wait(tool_name)
+                                if wait_time > 0 and ship_symbol:
+                                    if tool_name == "navigate_ship":
+                                        fleet.set_transit(ship_symbol, wait_time)
+                                    elif tool_name == "extract_ore":
+                                        fleet.set_extraction_cooldown(ship_symbol, wait_time)
+                        except Exception as e:
+                            console.print(f"    [red]Queued {tool_name} failed: {e}[/red]")
+
         # ── TACTICAL LAYER ────────────────────────────────────────────────
         # Tick all ship behaviors. Fast — no LLM involved.
         for ship_symbol in list(fleet.ships):
@@ -1139,6 +1197,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 alert_text=alert_text,
                 iteration=iteration,
                 debug=debug,
+                action_queue=action_queue,
             )
 
             if result is None:

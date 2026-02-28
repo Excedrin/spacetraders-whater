@@ -1,6 +1,10 @@
+behaviors.json
 .env
 events.jsonl
 fleet_state.json
+market_cache.json
 narrative_state.json
 session_state.json
 story.jsonl
+plan.txt
+__pycache__
