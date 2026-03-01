@@ -35,10 +35,10 @@ from tools import (
     get_last_wait,
     load_market_cache,
     client,
+    get_engine as get_behavior_engine,
 )
 from narrative import NarrativeContext, generate_narrative, generate_strategic_reflection, NarrativeSegment
 from ship_status import FleetTracker
-from behaviors import get_engine as get_behavior_engine
 from events import write_event
 
 load_dotenv()

@@ -1,25 +1,27 @@
 import json
 import os
 import math
+import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 from langchain_core.tools import tool
-
 from api_client import SpaceTradersClient
 
+# ──────────────────────────────────────────────
+#  Global Config & Init
+# ──────────────────────────────────────────────
 load_dotenv()
 client = SpaceTradersClient(os.environ["TOKEN"])
-
-
 MARKET_CACHE_FILE = Path("market_cache.json")
-
+BEHAVIORS_FILE = Path("behaviors.json")
+log = logging.getLogger(__name__)
 
 def load_market_cache() -> dict:
-    """Load cached market data."""
     if MARKET_CACHE_FILE.exists():
         try:
             return json.loads(MARKET_CACHE_FILE.read_text(encoding="utf-8"))
@@ -27,94 +29,77 @@ def load_market_cache() -> dict:
             pass
     return {}
 
-
 def _save_market_to_cache(waypoint_symbol: str, data: dict):
-    """Save market data to cache after a view_market call.
-
-    Structural data (imports/exports/exchange) is stable and saved even without ship in orbit.
-    Price data (tradeGoods) requires ship in orbit and is marked with timestamp.
-    """
+    """Save market data to cache."""
     import time
     cache = load_market_cache()
-
-    # Get existing entry or create new one
     entry = cache.get(waypoint_symbol, {})
-
-    # Structural data (stable - what market can buy/sell)
-    # Always update this if available
+    
+    # Structural data
     for section in ("exports", "imports", "exchange"):
         items = data.get(section, [])
         if items:
             entry[section] = [i["symbol"] for i in items]
-
-    # Price data (dynamic - requires ship in orbit)
+            
+    # Price data
     trade_goods = data.get("tradeGoods", [])
     if trade_goods:
         entry["trade_goods"] = [
             {
                 "symbol": g["symbol"],
-                "purchasePrice": g.get("purchasePrice"),  # What market PAYS for items
-                "sellPrice": g.get("sellPrice"),          # What market SELLS items for
+                "purchasePrice": g.get("purchasePrice"),
+                "sellPrice": g.get("sellPrice"),
                 "tradeVolume": g.get("tradeVolume")
             }
             for g in trade_goods
         ]
-        # Mark when we got price data
         entry["last_updated"] = int(time.time())
-
-    # Save even if we only got structural data (no prices)
+        
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
+# ──────────────────────────────────────────────
+#  Core Logic Helpers (Shared)
+# ──────────────────────────────────────────────
+# These are pure logic functions used by both Tools and Behaviors.
+# They return structured data (Exceptions or Tuples) rather than user-facing strings.
 
-def _ensure_orbit(ship_symbol: str) -> str | None:
-    """Ensure ship is in orbit. Auto-transitions from DOCKED. Returns error string or None."""
+def _ensure_orbit_logic(ship_symbol: str) -> None:
+    """Raises Exception if fails."""
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
-        return f"Ship {ship_symbol} not found: {ship['error']}"
+        raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
+    
     status = ship.get("nav", {}).get("status", "")
     if status == "IN_ORBIT":
-        return None
+        return
     if status == "DOCKED":
         result = client.orbit(ship_symbol)
         if isinstance(result, dict) and "error" in result:
-            return f"Could not orbit {ship_symbol}: {result['error']}"
-        return None
+            raise Exception(f"Could not orbit {ship_symbol}: {result['error']}")
+        return
     if status == "IN_TRANSIT":
-        return f"{ship_symbol} is currently in transit and cannot change state"
-    return None
+        raise Exception(f"{ship_symbol} is currently in transit")
 
-
-def _ensure_dock(ship_symbol: str) -> str | None:
-    """Ensure ship is docked. Auto-transitions from IN_ORBIT. Returns error string or None."""
+def _ensure_dock_logic(ship_symbol: str) -> None:
+    """Raises Exception if fails."""
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
-        return f"Ship {ship_symbol} not found: {ship['error']}"
+        raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
+    
     status = ship.get("nav", {}).get("status", "")
     if status == "DOCKED":
-        return None
+        return
     if status == "IN_ORBIT":
         result = client.dock(ship_symbol)
         if isinstance(result, dict) and "error" in result:
-            return f"Could not dock {ship_symbol}: {result['error']}"
-        return None
+             raise Exception(f"Could not dock {ship_symbol}: {result['error']}")
+        return
     if status == "IN_TRANSIT":
-        return f"{ship_symbol} is currently in transit and cannot change state"
-    return None
-
-
-@dataclass
-class ToolResult:
-    """Result from a tool execution, with optional wait time for async narrative."""
-    message: str
-    wait_seconds: float = 0.0
-    tool_name: str = ""
-    is_significant: bool = False  # True for action tools worth narrating
-
+        raise Exception(f"{ship_symbol} is currently in transit")
 
 def _parse_arrival(nav: dict) -> float:
-    """Return seconds until arrival, or 0 if not in transit."""
     route = nav.get("route", {})
     arrival_str = route.get("arrival")
     if not arrival_str or nav.get("status") != "IN_TRANSIT":
@@ -123,13 +108,22 @@ def _parse_arrival(nav: dict) -> float:
     remaining = (arrival - datetime.now(timezone.utc)).total_seconds()
     return max(remaining, 0.0)
 
+def _get_contract_goods() -> set[str]:
+    contracts = client.list_contracts()
+    if not isinstance(contracts, list):
+        return set()
+    goods = set()
+    for c in contracts:
+        if c.get("accepted") and not c.get("fulfilled"):
+            for d in c.get("terms", {}).get("deliver", []):
+                goods.add(d["tradeSymbol"])
+    return goods
+
 def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE") -> tuple[int, int, int]:
     """
     Helper to calculate distance, fuel cost, and estimated time.
     Returns: (distance, fuel_cost, flight_seconds)
     """
-    import math
-
     # 1. Calculate Distance
     dx = dest_wp['x'] - origin_wp['x']
     dy = dest_wp['y'] - origin_wp['y']
@@ -144,9 +138,6 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
     # DRIFT:  1 fuel total, 0.1x speed (relative to current engine?) - actually Drift is usually fixed low speed
     # BURN:   2x fuel, 2x speed
     # STEALTH: 1x fuel, 1x speed
-
-    fuel_multiplier = 1.0
-    speed_multiplier = 1.0
 
     # Round distance for fuel calc
     base_fuel_cost = max(1, round(distance))
@@ -190,9 +181,6 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
     else:
         flight_mode_mult = 1.0 # Cruise/Stealth
 
-    # Improve calculation:
-    flight_time = round((max(1, distance) * (flight_mode_mult / max(1, engine_speed/100) )) + 15)
-
     # Simpler heuristic that matches your log (36 distance / speed 10 satellite ≈ 113s?)
     # 36 distance. 113s total. 15s is constant.
     # Travel part = 98s.
@@ -211,6 +199,553 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
 
     return round(distance), int(fuel_cost), int(total_time)
 
+def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: list, mode="CRUISE") -> list[str] | None:
+    """
+    Perform BFS to find a path from origin to target using Marketplaces as refuel stops.
+    Returns a list of waypoint symbols: [Origin, Stop1, Stop2, Target].
+    """
+    fuel_capacity = ship.get("fuel", {}).get("capacity", 0)
+    current_fuel = ship.get("fuel", {}).get("current", 0)
+
+    # 1. If solar (0 capacity), path is always direct.
+    if fuel_capacity == 0:
+        return [origin_wp['symbol'], target_wp['symbol']]
+
+    # 2. Identify potential stops (Marketplaces)
+    # Assumption: All marketplaces sell fuel.
+    potential_stops = [w for w in waypoints if "MARKETPLACE" in [t['symbol'] for t in w.get('traits', [])]]
+
+    # 3. BFS State: (current_wp_obj, path_list_of_symbols, fuel_at_current_node)
+    queue = deque([(origin_wp, [origin_wp['symbol']], current_fuel)])
+    visited = {origin_wp['symbol']}
+
+    while queue:
+        curr_node, path, fuel_available = queue.popleft()
+
+        # A. Can we reach the Final Target from here?
+        _, cost_to_target, _ = _calculate_travel_cost(ship, target_wp, curr_node, mode)
+        if cost_to_target <= fuel_available:
+            return path + [target_wp['symbol']]
+
+        # B. If not, find reachable Marketplaces to hop to
+        for stop in potential_stops:
+            if stop['symbol'] in visited:
+                continue
+
+            _, cost_to_stop, _ = _calculate_travel_cost(ship, stop, curr_node, mode)
+
+            if cost_to_stop <= fuel_available:
+                visited.add(stop['symbol'])
+                # We assume we refuel to FULL CAPACITY at the stop
+                queue.append((stop, path + [stop['symbol']], fuel_capacity))
+
+    return None
+
+# ──────────────────────────────────────────────
+#  CORE ACTION LOGIC (The "Smart" Layer)
+# ──────────────────────────────────────────────
+
+def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE", execute: bool = True) -> Tuple[str, float]:
+    """
+    Returns (result_message, wait_seconds).
+    Handles smart routing, auto-refueling, and inter-system logic.
+    """
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        raise Exception(ship['error'])
+        
+    nav = ship.get("nav", {})
+    fuel = ship.get("fuel", {})
+    current_sys = nav.get("systemSymbol", "")
+    current_wp = nav.get("waypointSymbol", "")
+    
+    if current_wp == destination_symbol:
+        return f"{ship_symbol} is already at {destination_symbol}.", 0.0
+
+    # Inter-System Check
+    dest_sys = "-".join(destination_symbol.split("-")[:2])
+    target_wp_symbol = destination_symbol
+    is_inter_system = False
+    
+    if current_sys != dest_sys:
+        is_inter_system = True
+        waypoints = client.list_waypoints(current_sys, traits="JUMP_GATE")
+        if not waypoints:
+             raise Exception(f"Destination is in {dest_sys}, but no Jump Gate found in {current_sys}.")
+        target_wp_symbol = waypoints[0]['symbol']
+        if current_wp == target_wp_symbol:
+            return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
+
+    # Fetch Waypoints
+    waypoints = client.list_waypoints(current_sys)
+    if isinstance(waypoints, dict) and "error" in waypoints:
+        raise Exception(waypoints['error'])
+        
+    origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
+    target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
+    if not origin_obj or not target_obj:
+        raise Exception("Could not resolve waypoint coordinates.")
+
+    # Execute Logic
+    if execute:
+        _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
+        fuel_available = fuel.get("current", 0)
+        next_hop = target_wp_symbol
+        is_multi_hop = False
+
+        if fuel.get("capacity", 0) > 0 and direct_cost > fuel_available:
+            # Try Refuel Here
+            market_cache = load_market_cache()
+            curr_market = market_cache.get(current_wp, {})
+            has_fuel_here = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+            
+            if has_fuel_here:
+                _ensure_dock_logic(ship_symbol)
+                client.refuel(ship_symbol)
+                ship = client.get_ship(ship_symbol) # update fuel state
+                fuel_available = ship.get("fuel", {}).get("current", 0)
+
+            # Route Plan if still needed
+            if direct_cost > fuel_available:
+                path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+                if not path:
+                    raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
+                
+                if len(path) > 1:
+                    next_hop = path[1]
+                    is_multi_hop = True
+                    next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
+                    _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
+
+        # Action
+        _ensure_orbit_logic(ship_symbol)
+        if nav.get("flightMode") != mode:
+            client.set_flight_mode(ship_symbol, mode)
+            
+        data = client.navigate(ship_symbol, next_hop)
+        if isinstance(data, dict) and "error" in data:
+            raise Exception(f"Error navigating: {data['error']}")
+            
+        wait_secs = _parse_arrival(data.get("nav", {}))
+        result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
+        
+        if is_multi_hop:
+            result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+        elif is_inter_system:
+            result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
+            
+        return result, wait_secs
+    
+    else:
+        # Planning Mode (Read Only)
+        # ... (simplified from previous tools.py for brevity) ...
+        dist, _, _ = _calculate_travel_cost(ship, target_obj, origin_obj, "CRUISE")
+        return f"Plan: {current_wp} -> {target_wp_symbol} (Dist: {dist})", 0.0
+
+def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
+    """Returns (log_string, cooldown_seconds)."""
+    # Check cooldown first
+    cooldown = client.get_cooldown(ship_symbol)
+    if isinstance(cooldown, dict) and not cooldown.get("error"):
+        remaining = cooldown.get("remainingSeconds", 0)
+        if remaining > 0:
+             # We return this as a valid state, handled by caller
+             return f"Cooldown remaining: {remaining}s", float(remaining)
+
+    _ensure_orbit_logic(ship_symbol)
+    
+    data = client.extract(ship_symbol)
+    if isinstance(data, dict) and "error" in data:
+        # Handle API error 4000 (Cooldown) specifically if API returns it as error
+        if "cooldown" in str(data['error']).lower():
+             # Fallback guess 
+             return "Hit cooldown", 70.0 
+        raise Exception(data['error'])
+
+    extraction = data.get("extraction", {})
+    cd = data.get("cooldown", {})
+    cargo = data.get("cargo", {})
+    yielded = extraction.get("yield", {})
+    
+    result = f"Extracted {yielded.get('units', '?')} {yielded.get('symbol', '?')}."
+    result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
+    
+    return result, float(cd.get("remainingSeconds", 0))
+
+def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+    # 1. Check Contract Safety
+    if not force:
+        contract_goods = _get_contract_goods()
+        if trade_symbol in contract_goods:
+            raise Exception(f"{trade_symbol} is required by an active contract. Use force=True to override.")
+
+    # 2. Check Availability
+    cargo_data = client.get_cargo(ship_symbol)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        raise Exception(f"Error checking cargo: {cargo_data['error']}")
+        
+    inventory = cargo_data.get("inventory", [])
+    available = 0
+    for item in inventory:
+        if item.get("symbol") == trade_symbol:
+            available = item.get("units", 0)
+            break
+            
+    if available == 0:
+        raise Exception(f"Ship {ship_symbol} has no {trade_symbol}.")
+        
+    final_units = available if units is None else min(units, available)
+
+    # 3. Action
+    _ensure_dock_logic(ship_symbol)
+    data = client.sell_cargo(ship_symbol, trade_symbol, final_units)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data['error'])
+        
+    tx = data.get("transaction", {})
+    cargo = data.get("cargo", {})
+    return f"Sold {tx.get('units', final_units)} {trade_symbol} for {tx.get('totalPrice', '?')} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
+
+def _refuel_ship_logic(ship_symbol: str) -> str:
+    _ensure_dock_logic(ship_symbol)
+    data = client.refuel(ship_symbol)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data['error'])
+    
+    fuel = data.get("fuel", {})
+    tx = data.get("transaction", {})
+    return f"Refueled {ship_symbol}. Fuel: {fuel.get('current')}/{fuel.get('capacity')}. Cost: {tx.get('totalPrice', '?')} cr."
+
+# ──────────────────────────────────────────────
+#  BEHAVIOR ENGINE
+# ──────────────────────────────────────────────
+
+class StepType(Enum):
+    MINE = "mine"
+    GOTO = "goto"
+    SELL = "sell"
+    DELIVER = "deliver"
+    REFUEL = "refuel"
+    SCOUT = "scout"
+    ALERT = "alert"
+    REPEAT = "repeat"
+    NEGOTIATE = "negotiate"
+    BUY_SHIP = "buy_ship"
+
+@dataclass
+class Step:
+    step_type: StepType
+    args: list[str] = field(default_factory=list)
+    def __str__(self):
+        if self.args: return f"{self.step_type.value} {' '.join(self.args)}"
+        return self.step_type.value
+
+def parse_steps(steps_str: str) -> list[Step]:
+    steps = []
+    for part in steps_str.split(","):
+        part = part.strip()
+        if not part: continue
+        tokens = part.split()
+        verb = tokens[0].lower()
+        args = tokens[1:]
+        try:
+            steps.append(Step(step_type=StepType(verb), args=args))
+        except ValueError:
+            raise ValueError(f"Unknown step type: '{verb}'")
+    return steps
+
+@dataclass
+class BehaviorConfig:
+    ship_symbol: str
+    steps: list[Step]
+    steps_str: str
+    current_step_index: int = 0
+    step_phase: str = "INIT"
+    paused: bool = False
+    error_message: str = ""
+    alert_sent: bool = False
+
+_engine_instance: Optional["BehaviorEngine"] = None
+
+def get_engine() -> "BehaviorEngine":
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = BehaviorEngine()
+    return _engine_instance
+
+class BehaviorEngine:
+    """
+    Manages autonomous ship behaviors.
+    Crucially, it uses the CORE LOGIC functions above, ensuring behavior ships
+    are just as 'smart' (auto-refuel, etc) as LLM-controlled ships.
+    """
+    def __init__(self):
+        self.behaviors: dict[str, BehaviorConfig] = {}
+        self._last_mtime = 0.0
+        self._load()
+
+    def _load(self):
+        if not BEHAVIORS_FILE.exists(): return
+        try:
+            self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
+            entries = json.loads(BEHAVIORS_FILE.read_text())
+            for e in entries:
+                if "steps_str" in e:
+                    try:
+                        cfg = BehaviorConfig(
+                            ship_symbol=e["ship_symbol"],
+                            steps=parse_steps(e["steps_str"]),
+                            steps_str=e["steps_str"],
+                            current_step_index=e.get("current_step_index", 0),
+                            step_phase=e.get("step_phase", "INIT"),
+                            paused=e.get("paused", False),
+                            error_message=e.get("error_message", ""),
+                            alert_sent=e.get("alert_sent", False),
+                        )
+                        self.behaviors[cfg.ship_symbol] = cfg
+                    except ValueError: continue
+        except Exception as exc:
+            log.warning("Failed to load behaviors.json: %s", exc)
+
+    def _save(self):
+        data = [
+            {
+                "ship_symbol": c.ship_symbol,
+                "steps_str": c.steps_str,
+                "current_step_index": c.current_step_index,
+                "step_phase": c.step_phase,
+                "paused": c.paused,
+                "error_message": c.error_message,
+                "alert_sent": c.alert_sent,
+            }
+            for c in self.behaviors.values()
+        ]
+        BEHAVIORS_FILE.write_text(json.dumps(data, indent=2))
+        try: self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
+        except OSError: pass
+
+    def sync_state(self):
+        if not BEHAVIORS_FILE.exists(): return
+        try:
+            if BEHAVIORS_FILE.stat().st_mtime > self._last_mtime:
+                self.behaviors.clear()
+                self._load()
+        except OSError: pass
+
+    def assign(self, ship_symbol: str, steps_str: str, start_step: int = 0) -> str:
+        try:
+            steps = parse_steps(steps_str)
+        except ValueError as e: return f"Error: {e}"
+        if not steps: return "Error: no steps provided"
+        
+        clamped = max(0, min(start_step, len(steps) - 1))
+        self.behaviors[ship_symbol] = BehaviorConfig(
+            ship_symbol=ship_symbol,
+            steps=steps,
+            steps_str=steps_str,
+            current_step_index=clamped,
+        )
+        self._save()
+        return f"Assigned to {ship_symbol}: {steps_str}"
+
+    def cancel(self, ship_symbol: str) -> None:
+        self.behaviors.pop(ship_symbol, None)
+        self._save()
+
+    def get_idle_ships(self, fleet) -> list[str]:
+        return [s for s in fleet.ships if s not in self.behaviors]
+
+    def summary(self) -> str:
+        if not self.behaviors: return "(no behaviors assigned -- all ships idle)"
+        lines = []
+        for cfg in self.behaviors.values():
+            step_idx = cfg.current_step_index
+            current_step = cfg.steps[step_idx] if step_idx < len(cfg.steps) else "?"
+            status = "PAUSED" if cfg.paused else cfg.step_phase
+            if cfg.error_message: status = f"ERROR: {cfg.error_message}"
+            lines.append(f"  {cfg.ship_symbol}: step {step_idx + 1}/{len(cfg.steps)} [{current_step}] ({status})")
+        return "\n".join(lines)
+
+    def resume(self, ship_symbol: str) -> str:
+        cfg = self.behaviors.get(ship_symbol)
+        if not cfg or not cfg.paused: return "Nothing to resume."
+        cfg.paused = False
+        cfg.alert_sent = False
+        cfg.current_step_index += 1
+        cfg.step_phase = "INIT"
+        self._save()
+        return f"Resumed {ship_symbol}."
+
+    def skip_step(self, ship_symbol: str) -> str:
+        cfg = self.behaviors.get(ship_symbol)
+        if not cfg: return "No behavior."
+        cfg.current_step_index += 1
+        cfg.step_phase = "INIT"
+        cfg.paused = False
+        self._save()
+        return f"Skipped step for {ship_symbol}."
+
+    def tick(self, ship_symbol: str, fleet, client) -> Optional[str]:
+        """Returns alert string if needed."""
+        cfg = self.behaviors.get(ship_symbol)
+        if not cfg or cfg.paused: return None
+        
+        ship = fleet.get_ship(ship_symbol)
+        if not ship or not ship.is_available(): return None
+
+        if cfg.current_step_index >= len(cfg.steps):
+            cfg.current_step_index = 0
+            cfg.step_phase = "INIT"
+            
+        step = cfg.steps[cfg.current_step_index]
+        
+        try:
+            if step.step_type == StepType.MINE: return self._step_mine(cfg, step, ship, fleet)
+            elif step.step_type == StepType.GOTO: return self._step_goto(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SELL: return self._step_sell(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REFUEL: return self._step_refuel(cfg, step, ship, fleet)
+            elif step.step_type == StepType.DELIVER: return self._step_deliver(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SCOUT: return self._step_scout(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REPEAT: return self._step_repeat(cfg)
+            elif step.step_type == StepType.ALERT: return self._step_alert(cfg, step)
+            # Add others as needed
+        except Exception as e:
+            cfg.error_message = str(e)
+            cfg.paused = True
+            self._save()
+            return f"{ship_symbol} ERROR: {e}"
+        return None
+
+    # ── Step Handlers using CORE LOGIC ───────────────────────────────────
+
+    def _step_goto(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Smart navigation using _navigate_ship_logic."""
+        dest_wp = step.args[0]
+        
+        if cfg.step_phase == "INIT":
+            if ship.location == dest_wp and ship.nav_status != "IN_TRANSIT":
+                self._advance(cfg)
+                return None
+            
+            try:
+                # Calls the SMART logic (auto-refuel, etc)
+                msg, wait = _navigate_ship_logic(cfg.ship_symbol, dest_wp)
+                if wait > 0:
+                    fleet.set_transit(cfg.ship_symbol, wait)
+                    ship.location = dest_wp # Optimistic update
+                cfg.step_phase = "WAITING"
+                self._save()
+            except Exception as e:
+                raise e # Caught by tick
+            return None
+            
+        if cfg.step_phase == "WAITING":
+            if ship.location == dest_wp or ship.nav_status != "IN_TRANSIT":
+                self._advance(cfg)
+            return None
+
+    def _step_mine(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Smart mining using _extract_ore_logic."""
+        asteroid_wp = step.args[0] if step.args else None
+        ore_types = step.args[1:] if len(step.args) > 1 else []
+
+        if cfg.step_phase == "INIT":
+            if asteroid_wp and ship.location != asteroid_wp:
+                # Reuse navigate logic logic dynamically
+                msg, wait = _navigate_ship_logic(cfg.ship_symbol, asteroid_wp)
+                if wait > 0:
+                    fleet.set_transit(cfg.ship_symbol, wait)
+                # We don't change phase to WAITING here because we want to loop back to INIT
+                # until we are actually at the location. 
+                # Better: Use a sub-state or just let the next tick handle transit cooldown.
+                return None
+            
+            cfg.step_phase = "EXTRACTING"
+            self._save()
+            return None
+
+        if cfg.step_phase == "EXTRACTING":
+            if ship.cargo_capacity > 0 and ship.cargo_units >= ship.cargo_capacity:
+                self._advance(cfg)
+                return None
+            
+            msg, wait = _extract_ore_logic(cfg.ship_symbol)
+            if wait > 0:
+                fleet.set_extraction_cooldown(cfg.ship_symbol, wait)
+            
+            # Auto-Jettison Logic (simplified)
+            if ore_types:
+                # We need fresh cargo data to know what to trash
+                c = client.get_cargo(cfg.ship_symbol)
+                for item in c.get("inventory", []):
+                    if item["symbol"] not in ore_types:
+                        client.jettison(cfg.ship_symbol, item["symbol"], item["units"])
+            return None
+
+    def _step_sell(self, cfg, step, ship, fleet) -> Optional[str]:
+        target = step.args[0] if step.args else "*"
+        # Get inventory
+        c = client.get_cargo(cfg.ship_symbol)
+        inventory = c.get("inventory", [])
+        
+        sold_something = False
+        for item in inventory:
+            sym = item["symbol"]
+            if target == "*" or sym == target:
+                try:
+                    # Logic function handles contract checks
+                    _sell_cargo_logic(cfg.ship_symbol, sym)
+                    sold_something = True
+                except Exception as e:
+                    # If target is *, ignore failures (e.g. contract goods)
+                    if target != "*": raise e
+        
+        self._advance(cfg)
+        return None
+
+    def _step_refuel(self, cfg, step, ship, fleet) -> Optional[str]:
+        if ship.fuel_capacity > 0:
+            _refuel_ship_logic(cfg.ship_symbol)
+        self._advance(cfg)
+        return None
+        
+    def _step_deliver(self, cfg, step, ship, fleet) -> Optional[str]:
+        contract_id = step.args[0]
+        trade_symbol = step.args[1]
+        _ensure_dock_logic(cfg.ship_symbol)
+        client.deliver_contract(contract_id, cfg.ship_symbol, trade_symbol, 999999)
+        self._advance(cfg)
+        return None
+
+    def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
+        if not ship.location: raise Exception("No location")
+        sys = "-".join(ship.location.split("-")[:2])
+        m = client.get_market(sys, ship.location)
+        if m and "error" not in m:
+            _save_market_to_cache(ship.location, m)
+        self._advance(cfg)
+        return None
+
+    def _step_alert(self, cfg, step) -> Optional[str]:
+        if not cfg.alert_sent:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: {' '.join(step.args)}"
+        return None
+
+    def _step_repeat(self, cfg) -> Optional[str]:
+        cfg.current_step_index = 0
+        cfg.step_phase = "INIT"
+        self._save()
+        return None
+
+    def _advance(self, cfg):
+        cfg.current_step_index += 1
+        cfg.step_phase = "INIT"
+        cfg.error_message = ""
+        cfg.alert_sent = False
+        self._save()
 
 
 # ──────────────────────────────────────────────
@@ -345,8 +880,6 @@ def find_nearest(ship_symbol: str, target: str) -> str:
     - A Trait (e.g. "SHIPYARD", "MARKETPLACE") -> Finds waypoints with this trait.
     - A Type (e.g. "ASTEROID", "ENGINEERED_ASTEROID") -> Finds waypoints of this type.
     """
-    import math
-
     # Get Ship Location
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
@@ -498,7 +1031,6 @@ def find_waypoints(system_symbol: str, trait_or_type: str, reference_ship: str =
     To find mineable asteroids, search for type='ASTEROID' or 'ENGINEERED_ASTEROID', then extract to see what resources they produce.
 
     The system_symbol looks like 'X1-AB12'."""
-    import math
 
     # Try as trait first, then as type
     data = client.list_waypoints(system_symbol, traits=trait_or_type)
@@ -583,7 +1115,6 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
         within_cruise_range: If True and reference_ship provided, filter to only waypoints within ship's CRUISE fuel range
 
     The system_symbol looks like 'X1-AB12'. If you pass a waypoint like 'X1-AB12-C3', the system will be extracted."""
-    import math
 
     # Extract system from waypoint if needed (e.g., 'X1-KD26-A1' -> 'X1-KD26')
     # System format: SECTOR-SYSTEM (e.g., X1-KD26)
@@ -917,182 +1448,6 @@ def orbit_ship(ship_symbol: str) -> str:
 #  Navigation & Action tools
 # ──────────────────────────────────────────────
 
-def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: list, mode="CRUISE") -> list[str] | None:
-    """
-    Perform BFS to find a path from origin to target using Marketplaces as refuel stops.
-    Returns a list of waypoint symbols: [Origin, Stop1, Stop2, Target].
-    """
-    fuel_capacity = ship.get("fuel", {}).get("capacity", 0)
-    current_fuel = ship.get("fuel", {}).get("current", 0)
-
-    # 1. If solar (0 capacity), path is always direct.
-    if fuel_capacity == 0:
-        return [origin_wp['symbol'], target_wp['symbol']]
-
-    # 2. Identify potential stops (Marketplaces)
-    # Assumption: All marketplaces sell fuel.
-    potential_stops = [w for w in waypoints if "MARKETPLACE" in [t['symbol'] for t in w.get('traits', [])]]
-
-    # 3. BFS State: (current_wp_obj, path_list_of_symbols, fuel_at_current_node)
-    queue = deque([(origin_wp, [origin_wp['symbol']], current_fuel)])
-    visited = {origin_wp['symbol']}
-
-    while queue:
-        curr_node, path, fuel_available = queue.popleft()
-
-        # A. Can we reach the Final Target from here?
-        _, cost_to_target, _ = _calculate_travel_cost(ship, target_wp, curr_node, mode)
-        if cost_to_target <= fuel_available:
-            return path + [target_wp['symbol']]
-
-        # B. If not, find reachable Marketplaces to hop to
-        for stop in potential_stops:
-            if stop['symbol'] in visited:
-                continue
-
-            _, cost_to_stop, _ = _calculate_travel_cost(ship, stop, curr_node, mode)
-
-            if cost_to_stop <= fuel_available:
-                visited.add(stop['symbol'])
-                # We assume we refuel to FULL CAPACITY at the stop
-                queue.append((stop, path + [stop['symbol']], fuel_capacity))
-
-    return None
-
-def _navigate_logic(ship_symbol: str, destination_symbol: str, mode: str, execute: bool) -> tuple[str, float]:
-    """
-    Internal logic for smart navigation.
-    Returns: (Result String, Wait Seconds)
-    """
-    # 1. Fetch Ship & Config
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        return f"Error: {ship['error']}", 0.0
-
-    nav = ship.get("nav", {})
-    fuel = ship.get("fuel", {})
-    current_sys = nav.get("systemSymbol", "")
-    current_wp = nav.get("waypointSymbol", "")
-
-    if current_wp == destination_symbol:
-        return f"{ship_symbol} is already at {destination_symbol}.", 0.0
-
-    # 2. Check Inter-System Travel
-    dest_sys = "-".join(destination_symbol.split("-")[:2])
-    target_wp_symbol = destination_symbol
-    is_inter_system = False
-
-    if current_sys != dest_sys:
-        is_inter_system = True
-        waypoints = client.list_waypoints(current_sys, traits="JUMP_GATE")
-        if not waypoints:
-             return f"Error: Destination is in {dest_sys}, but no Jump Gate found in {current_sys}.", 0.0
-        target_wp_symbol = waypoints[0]['symbol']
-        if current_wp == target_wp_symbol:
-            return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
-
-    # 3. Fetch Waypoints for Pathfinding
-    waypoints = client.list_waypoints(current_sys)
-    if isinstance(waypoints, dict) and "error" in waypoints:
-        return f"Error: {waypoints['error']}", 0.0
-
-    origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
-    target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
-    if not origin_obj or not target_obj:
-        return "Error: Could not resolve waypoint coordinates.", 0.0
-
-    # 4. Planning Mode (Comparison Table)
-    if not execute:
-        lines = [f"Route Plan: {current_wp} -> {target_wp_symbol}"]
-        if is_inter_system:
-             lines.append(f"Note: {target_wp_symbol} is the Jump Gate to reach {dest_sys}.")
-
-        # Check Direct
-        dist, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, "CRUISE")
-        lines.append(f"Direct Distance: {dist}")
-
-        fuel_cap = fuel.get("capacity", 0)
-        fuel_curr = fuel.get("current", 0)
-
-        lines.append("\nFlight Modes:")
-        for m in ["CRUISE", "DRIFT", "BURN"]:
-            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode=m)
-
-            _, cost, time = _calculate_travel_cost(ship, target_obj, origin_obj, m)
-
-            status = ""
-            if fuel_cap > 0:
-                if cost <= fuel_curr:
-                    status = "✅ Direct"
-                elif path:
-                    stops = len(path) - 2 # Exclude start/end
-                    status = f"✅ Multi-hop ({stops} stops: {'->'.join(path)})"
-                else:
-                    status = f"❌ Impossible (Max range exceeded)"
-            else:
-                status = "✅ (Solar)"
-
-            lines.append(f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}")
-
-        return "\n".join(lines), 0.0
-
-    # 5. Pathfinding (Fuel Check) for Execution
-    # Calculate direct cost just to see if we need pathfinding
-    _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
-    fuel_available = fuel.get("current", 0)
-
-    next_hop = target_wp_symbol
-    is_multi_hop = False
-
-    if fuel.get("capacity", 0) > 0 and direct_cost > fuel_available:
-        # A. Try Refueling HERE first
-        market_cache = load_market_cache()
-        curr_market = market_cache.get(current_wp, {})
-        has_fuel_here = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
-
-        if has_fuel_here:
-            _ensure_dock(ship_symbol)
-            client.refuel(ship_symbol)
-            ship = client.get_ship(ship_symbol) # update fuel
-            fuel_available = ship.get("fuel", {}).get("current", 0)
-
-        # B. If still not enough, find path
-        if direct_cost > fuel_available:
-            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
-
-            if not path:
-                return f"Error: Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.", 0.0
-
-            # path is [Current, Stop1, Stop2, Target]
-            # We only execute the move to Stop1
-            if len(path) > 1:
-                next_hop = path[1]
-                is_multi_hop = True
-                # Recalculate time for just this leg
-                next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
-                _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
-
-    # 6. Execute Navigation
-    err = _ensure_orbit(ship_symbol)
-    if err: return err, 0.0
-
-    if nav.get("flightMode") != mode:
-        client.set_flight_mode(ship_symbol, mode)
-
-    data = client.navigate(ship_symbol, next_hop)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error navigating: {data['error']}", 0.0
-
-    wait_secs = _parse_arrival(data.get("nav", {}))
-
-    result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
-    if is_multi_hop:
-        result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
-    elif is_inter_system:
-        result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
-
-    return result, wait_secs
-
 @tool
 def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE") -> str:
     """
@@ -1100,10 +1455,12 @@ def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE
     - If destination is in another system: Routes to the Jump Gate.
     - If destination is too far for one tank: Finds intermediate stops to refuel.
     """
-    result, wait = _navigate_logic(ship_symbol, destination_symbol, mode, execute=True)
-    # Set the attribute on the tool object itself so get_last_wait() can find it
-    navigate_ship._last_wait = wait
-    return result
+    try:
+        msg, wait = _navigate_ship_logic(ship_symbol, destination_symbol, mode, execute=True)
+        navigate_ship._last_wait = wait
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
 
 # Initialize attribute
 navigate_ship._last_wait = 0.0
@@ -1114,8 +1471,11 @@ def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
     [READ-ONLY] Calculate distance and fuel cost for a route.
     Shows comparison table for CRUISE/DRIFT/BURN.
     """
-    result, _ = _navigate_logic(ship_symbol, destination, mode, execute=False)
-    return result
+    try:
+        result, _ = _navigate_ship_logic(ship_symbol, destination, mode, execute=False)
+        return result
+    except Exception as e:
+        return f"Error: {e}"
 
 @tool
 def dock_ship(ship_symbol: str) -> str:
@@ -1130,130 +1490,33 @@ def dock_ship(ship_symbol: str) -> str:
 @tool
 def refuel_ship(ship_symbol: str) -> str:
     """[STATE: fuel, credits] Refuel a ship at current waypoint. Auto-docks. Waypoint must sell fuel."""
-    err = _ensure_dock(ship_symbol)
-    if err:
-        return f"Error: {err}"
-    data = client.refuel(ship_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    fuel = data.get("fuel", {})
-    tx = data.get("transaction", {})
-    return (
-        f"{ship_symbol} refueled! Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}\n"
-        f"Cost: {tx.get('totalPrice', '?')} credits"
-    )
+    try:
+        return _refuel_ship_logic(ship_symbol)
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @tool
 def extract_ore(ship_symbol: str) -> str:
     """[STATE: cargo, cooldown] Extract ores from an asteroid. Auto-orbits. Cooldown applies between extractions."""
-    # Check cooldown first
-    cooldown = client.get_cooldown(ship_symbol)
-    if isinstance(cooldown, dict) and not cooldown.get("error"):
-        remaining = cooldown.get("remainingSeconds", 0)
-        if remaining > 0:
-            return f"Error: {ship_symbol} is on cooldown. {remaining}s remaining before next extraction."
-    err = _ensure_orbit(ship_symbol)
-    if err:
-        return f"Error: {err}"
-    data = client.extract(ship_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    extraction = data.get("extraction", {})
-    cooldown = data.get("cooldown", {})
-    cargo = data.get("cargo", {})
-    yielded = extraction.get("yield", {})
-    result = f"Extracted {yielded.get('units', '?')} units of {yielded.get('symbol', '?')}."
-    result += f"\nCargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')} units"
-    cool_remaining = cooldown.get("remainingSeconds", 0)
-    if cool_remaining > 0:
-        result += f"\nCooldown: {cool_remaining}s before next extraction."
-    # Store wait time in a way the agent loop can access
-    extract_ore._last_wait = float(cool_remaining)
-    return result
+    try:
+        msg, wait = _extract_ore_logic(ship_symbol)
+        extract_ore._last_wait = wait
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
 
 # Initialize the wait tracking attribute
 extract_ore._last_wait = 0.0
 
 
-def _get_available_units(ship_symbol: str, trade_symbol: str, requested_units: int = None) -> tuple[int, str]:
-    """
-    Helper to determine safe unit counts for cargo operations.
-    Returns: (safe_units, error_message)
-    """
-    # 1. Fetch live cargo data
-    cargo_data = client.get_cargo(ship_symbol)
-    if isinstance(cargo_data, dict) and "error" in cargo_data:
-        return 0, f"Error checking cargo for {ship_symbol}: {cargo_data['error']}"
-
-    # 2. Find the specific item in inventory
-    inventory = cargo_data.get("inventory", [])
-    available = 0
-    for item in inventory:
-        if item.get("symbol") == trade_symbol:
-            available = item.get("units", 0)
-            break
-
-    # 3. Handle 0 availability immediately
-    if available == 0:
-        return 0, f"Error: Ship {ship_symbol} has no {trade_symbol} available."
-
-    # 4. Determine final unit count (Magic Clamping)
-    if requested_units is None:
-        # Default to all
-        final_units = available
-    else:
-        # Clamp requested amount to what is actually available
-        final_units = min(requested_units, available)
-
-    return final_units, None
-
-
-def _get_contract_goods() -> set[str]:
-    """Return the set of trade symbols required by any active, unfulfilled contract."""
-    contracts = client.list_contracts()
-    if not isinstance(contracts, list):
-        return set()
-    goods = set()
-    for c in contracts:
-        if c.get("accepted") and not c.get("fulfilled"):
-            for d in c.get("terms", {}).get("deliver", []):
-                goods.add(d["tradeSymbol"])
-    return goods
-
-
 @tool
 def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
     """[STATE: cargo, credits] Sell cargo at current market. Auto-docks. Refuses to sell contract goods."""
-    # Guard: warn if this is a contract good
-    # disable force
-    if True:
-        contract_goods = _get_contract_goods()
-        if trade_symbol in contract_goods:
-            return (
-                f"Error: {trade_symbol} is required by an active contract. "
-                f"Use deliver_contract to deliver it instead. "
-                f"Call sell_cargo with force=True to sell anyway."
-            )
-
-    safe_units, error = _get_available_units(ship_symbol, trade_symbol, units)
-    if error:
-        return error
-
-    err = _ensure_dock(ship_symbol)
-    if err:
-        return f"Error: {err}"
-
-    data = client.sell_cargo(ship_symbol, trade_symbol, safe_units)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-
-    tx = data.get("transaction", {})
-    cargo = data.get("cargo", {})
-    return (
-        f"Sold {tx.get('units', safe_units)} {trade_symbol} for {tx.get('totalPrice', '?')} credits.\n"
-        f"Cargo now: {cargo.get('units', 0)}/{cargo.get('capacity', '?')} units"
-    )
+    try:
+        return _sell_cargo_logic(ship_symbol, trade_symbol, units, force)
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @tool
@@ -1268,9 +1531,25 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force
                 f"Call jettison_cargo with force=True to jettison anyway."
             )
 
-    safe_units, error = _get_available_units(ship_symbol, trade_symbol, units)
-    if error:
-        return error
+    safe_units = None
+    cargo_data = client.get_cargo(ship_symbol)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        return f"Error checking cargo for {ship_symbol}: {cargo_data['error']}"
+
+    inventory = cargo_data.get("inventory", [])
+    available = 0
+    for item in inventory:
+        if item.get("symbol") == trade_symbol:
+            available = item.get("units", 0)
+            break
+
+    if available == 0:
+        return f"Error: Ship {ship_symbol} has no {trade_symbol} available."
+
+    if units is None:
+        safe_units = available
+    else:
+        safe_units = min(units, available)
 
     data = client.jettison(ship_symbol, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
@@ -1288,13 +1567,28 @@ def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int =
     """[STATE: cargo] Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint."""
 
     # Check source ship inventory
-    safe_units, error = _get_available_units(from_ship, trade_symbol, units)
-    if error:
-        return error
+    cargo_data = client.get_cargo(from_ship)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        return f"Error checking cargo for {from_ship}: {cargo_data['error']}"
+
+    inventory = cargo_data.get("inventory", [])
+    available = 0
+    for item in inventory:
+        if item.get("symbol") == trade_symbol:
+            available = item.get("units", 0)
+            break
+
+    if available == 0:
+        return f"Error: Ship {from_ship} has no {trade_symbol} available."
+
+    safe_units = available if units is None else min(units, available)
 
     # Ensure orbit states
-    if err := _ensure_orbit(from_ship): return f"Error: {err}"
-    if err := _ensure_orbit(to_ship): return f"Error: {err}"
+    try:
+        _ensure_orbit_logic(from_ship)
+        _ensure_orbit_logic(to_ship)
+    except Exception as e:
+        return f"Error: {e}"
 
     data = client.transfer_cargo(from_ship, to_ship, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
@@ -1454,9 +1748,10 @@ def set_flight_mode(ship_symbol: str, mode: str) -> str:
 @tool
 def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> str:
     """[STATE: cargo, contract] Deliver goods for a contract. Auto-docks. Ship must be at delivery waypoint."""
-    err = _ensure_dock(ship_symbol)
-    if err:
-        return f"Error: {err}"
+    try:
+        _ensure_dock_logic(ship_symbol)
+    except Exception as e:
+        return f"Error: {e}"
     data = client.deliver_contract(contract_id, ship_symbol, trade_symbol, units)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -1498,7 +1793,6 @@ def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) 
         good: Optional. Filter to a specific trade good (e.g. "IRON_ORE").
         min_profit: Minimum profit per unit to include (default: 1).
     """
-    import math
     import time
 
     cache = load_market_cache()
@@ -1674,7 +1968,6 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
 
     Example: "mine X1-AST IRON_ORE, goto X1-MKT, sell IRON_ORE, goto X1-AST, repeat"
     """
-    from behaviors import get_engine
     result = get_engine().assign(ship_symbol, steps, start_step=start_step)
     return result
 
@@ -1682,14 +1975,12 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
 @tool
 def resume_behavior(ship_symbol: str) -> str:
     """[STATE: behavior] Resume a paused behavior after handling an alert. Advances past the alert step."""
-    from behaviors import get_engine
     return get_engine().resume(ship_symbol)
 
 
 @tool
 def skip_step(ship_symbol: str) -> str:
     """[STATE: behavior] Skip the current step of a behavior and advance to the next one."""
-    from behaviors import get_engine
     return get_engine().skip_step(ship_symbol)
 
 
@@ -1699,7 +1990,6 @@ def cancel_behavior(ship_symbol: str) -> str:
 
     Cancel before manually operating a ship that has an active behavior.
     """
-    from behaviors import get_engine
     engine = get_engine()
     if ship_symbol not in engine.behaviors:
         return f"{ship_symbol} has no assigned behavior."
@@ -1716,7 +2006,6 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") 
         asteroid_wp: Asteroid waypoint to mine at.
         ore_types: Comma-separated ore symbols to KEEP (e.g. "IRON_ORE,COPPER_ORE").
     """
-    from behaviors import get_engine
     ore_list = [s.strip() for s in ore_types.split(",") if s.strip()] if ore_types else []
     ore_str = " ".join(ore_list) if ore_list else ""
     mine_part = f"mine {asteroid_wp} {ore_str}".strip()
@@ -1736,7 +2025,6 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
         ship_symbols: Comma-separated satellite ship symbols (e.g. "WHATER-2,WHATER-3").
         market_waypoints: Comma-separated waypoints to scout. If omitted, uses all known markets.
     """
-    from behaviors import get_engine
     ships = [s.strip() for s in ship_symbols.split(",") if s.strip()]
 
     if not ships:
