@@ -1549,6 +1549,195 @@ def view_market(waypoint_symbol: str) -> str:
     return "\n".join(lines)
 
 
+@tool
+def query_markets(
+    trade_symbol: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    near_waypoint: Optional[str] = None,
+    near_ship: Optional[str] = None,
+    max_distance: int = 10
+) -> str:
+    """[READ-ONLY] Query cached market data with flexible filters.
+
+    By default, returns all cached markets. Can filter by:
+    - trade_symbol: Find markets that buy/sell/exchange a specific good (e.g., "IRON_ORE", "FUEL")
+    - transaction_type: "buys", "sells", or "exchanges" (filters to markets doing this action)
+    - near_waypoint: Find markets within max_distance of a waypoint (e.g., "X1-KD26-A1")
+    - near_ship: Find markets within max_distance of a ship's current location
+
+    Args:
+        trade_symbol: Trade good to search for (e.g., "FUEL", "IRON_ORE")
+        transaction_type: Filter by action type: "buys", "sells", or "exchanges"
+        near_waypoint: Waypoint symbol to search near
+        near_ship: Ship symbol to search near
+        max_distance: Maximum distance for "near" filters (default 10)
+
+    Returns: Formatted list of matching markets with their trade goods and prices
+    """
+    cache = load_market_cache()
+
+    if not cache:
+        return "Market cache is empty. Use view_market to populate it."
+
+    results = []
+
+    # Get reference point if doing a distance filter
+    ref_x, ref_y = None, None
+    if near_waypoint:
+        # Query waypoint to get coordinates
+        system_symbol = '-'.join(near_waypoint.split('-')[:2])
+        all_waypoints = client.list_waypoints(system_symbol)
+        if isinstance(all_waypoints, list):
+            for wp in all_waypoints:
+                if wp.get('symbol') == near_waypoint:
+                    ref_x = wp.get('x')
+                    ref_y = wp.get('y')
+                    break
+    elif near_ship:
+        # Get ship location
+        ship = client.get_ship(near_ship)
+        if isinstance(ship, dict) and "error" not in ship:
+            nav = ship.get('nav', {})
+            route = nav.get('route', {})
+            destination = route.get('destination', {})
+            ref_x = destination.get('x')
+            ref_y = destination.get('y')
+
+    # Helper to calculate distance
+    def distance(x1, y1, x2, y2):
+        return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+    # Process each cached market
+    for waypoint_symbol, market_data in cache.items():
+        # Skip if doesn't have trade goods (structure-only entries)
+        trade_goods = market_data.get('trade_goods', [])
+        if not trade_goods and trade_symbol:
+            continue
+
+        # Filter by trade_symbol if specified
+        if trade_symbol:
+            matching_goods = [g for g in trade_goods if g.get('symbol') == trade_symbol]
+            if not matching_goods:
+                continue
+
+            # Filter by transaction_type if specified
+            if transaction_type:
+                filtered_goods = []
+                for g in matching_goods:
+                    if transaction_type == "buys" and g.get('purchasePrice'):
+                        filtered_goods.append(g)
+                    elif transaction_type == "sells" and g.get('sellPrice'):
+                        filtered_goods.append(g)
+                    elif transaction_type == "exchanges" and (g.get('purchasePrice') and g.get('sellPrice')):
+                        filtered_goods.append(g)
+
+                if not filtered_goods:
+                    continue
+                matching_goods = filtered_goods
+        else:
+            matching_goods = trade_goods
+
+        # Filter by distance if reference point is available
+        if ref_x is not None and ref_y is not None:
+            # Get waypoint coordinates
+            system_symbol = '-'.join(waypoint_symbol.split('-')[:2])
+            all_waypoints = client.list_waypoints(system_symbol)
+            if isinstance(all_waypoints, list):
+                wp_x, wp_y = None, None
+                for wp in all_waypoints:
+                    if wp.get('symbol') == waypoint_symbol:
+                        wp_x = wp.get('x')
+                        wp_y = wp.get('y')
+                        break
+
+                if wp_x is not None and wp_y is not None:
+                    dist = distance(ref_x, ref_y, wp_x, wp_y)
+                    if dist > max_distance:
+                        continue
+                else:
+                    continue  # Couldn't find coordinates
+            else:
+                continue  # Couldn't get waypoints
+
+        # Add to results
+        if matching_goods or (not trade_symbol and (market_data.get('exports') or market_data.get('imports') or market_data.get('exchange'))):
+            results.append((waypoint_symbol, market_data, matching_goods))
+
+    if not results:
+        filters = []
+        if trade_symbol:
+            filters.append(f"trade_symbol={trade_symbol}")
+        if transaction_type:
+            filters.append(f"transaction_type={transaction_type}")
+        if near_waypoint:
+            filters.append(f"near_waypoint={near_waypoint}")
+        if near_ship:
+            filters.append(f"near_ship={near_ship}")
+        filter_str = " with filters: " + ", ".join(filters) if filters else ""
+        return f"No markets found{filter_str}."
+
+    # Helper to format staleness
+    import time
+    def format_staleness(timestamp: int) -> str:
+        """Format how old the data is."""
+        now = int(time.time())
+        age_seconds = now - timestamp
+        if age_seconds < 60:
+            return f"{age_seconds}s old"
+        elif age_seconds < 3600:
+            return f"{age_seconds // 60}m old"
+        elif age_seconds < 86400:
+            return f"{age_seconds // 3600}h old"
+        else:
+            return f"{age_seconds // 86400}d old"
+
+    # Format results
+    lines = []
+    for waypoint_symbol, market_data, goods in results:
+        # Check if we have prices to display
+        has_prices = any(g.get('purchasePrice') or g.get('sellPrice') for g in goods)
+
+        # Add staleness info if prices are present
+        staleness_info = ""
+        if has_prices and market_data.get('last_updated'):
+            staleness_info = f" [{format_staleness(market_data.get('last_updated'))}]"
+
+        lines.append(f"\n{waypoint_symbol}:{staleness_info}")
+
+        # Show structure if available and filtering broadly
+        if not trade_symbol:
+            exports = market_data.get('exports', [])
+            imports = market_data.get('imports', [])
+            exchange = market_data.get('exchange', [])
+            if exports:
+                lines.append(f"  Exports: {', '.join(exports)}")
+            if imports:
+                lines.append(f"  Imports: {', '.join(imports)}")
+            if exchange:
+                lines.append(f"  Exchange: {', '.join(exchange)}")
+
+        # Show trade goods with prices
+        if goods:
+            for g in goods:
+                symbol = g.get('symbol', '?')
+                buy_price = g.get('purchasePrice')
+                sell_price = g.get('sellPrice')
+                volume = g.get('tradeVolume', '?')
+
+                price_str = ""
+                if buy_price and sell_price:
+                    price_str = f"buy {buy_price} / sell {sell_price}"
+                elif buy_price:
+                    price_str = f"buy {buy_price}"
+                elif sell_price:
+                    price_str = f"sell {sell_price}"
+
+                volume_str = f" (vol: {volume})" if volume != '?' else ""
+                lines.append(f"    {symbol}: {price_str}{volume_str}")
+
+    return "".join(lines) if lines else "No market data available"
+
+
 # ──────────────────────────────────────────────
 #  Action tools
 # ──────────────────────────────────────────────
@@ -2253,7 +2442,7 @@ TIER_1_TOOLS = [
 ALL_TOOLS = [
     # Observation
     view_agent, view_contracts, view_ships, view_ship_details, view_cargo,
-    scan_system, find_waypoints, view_market, view_jump_gate,
+    scan_system, find_waypoints, view_market, query_markets, view_jump_gate,
     # Ship operations (dock/orbit still available for edge cases)
     orbit_ship, dock_ship, navigate_ship, refuel_ship, plan_route,
     # Mining & resources
