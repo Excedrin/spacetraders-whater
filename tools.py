@@ -408,12 +408,18 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
         if trade_symbol in contract_goods:
             raise Exception(f"{trade_symbol} is required by an active contract. Use force=True to override.")
 
-    # 2. Check Availability
+    # 2. Get ship location and cargo state
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        raise Exception(f"Error fetching ship: {ship['error']}")
+    waypoint = ship.get("nav", {}).get("waypointSymbol")
+
     cargo_data = client.get_cargo(ship_symbol)
     if isinstance(cargo_data, dict) and "error" in cargo_data:
         raise Exception(f"Error checking cargo: {cargo_data['error']}")
 
     inventory = cargo_data.get("inventory", [])
+    capacity = cargo_data.get("capacity", 0)
     available = 0
     for item in inventory:
         if item.get("symbol") == trade_symbol:
@@ -423,21 +429,61 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
     if available == 0:
         raise Exception(f"Ship {ship_symbol} has no {trade_symbol}.")
 
-    final_units = available if units is None else min(units, available)
+    target_units = available if units is None else min(units, available)
 
-    # 3. Action
+    # 3. Look up max transaction volume from market cache
+    max_per_transaction = target_units
+    if waypoint:
+        market_cache = load_market_cache()
+        if waypoint in market_cache:
+            for good in market_cache[waypoint].get("trade_goods", []):
+                if good.get("symbol") == trade_symbol:
+                    vol = good.get("tradeVolume")
+                    if vol and vol > 0:
+                        max_per_transaction = vol
+                    break
+
+    # 4. Sell in chunks if needed
     _ensure_dock_logic(ship_symbol)
-    data = client.sell_cargo(ship_symbol, trade_symbol, final_units)
-    if isinstance(data, dict) and "error" in data:
-        raise Exception(data['error'])
+    total_sold = 0
+    total_revenue = 0
+    sell_count = 0
 
-    tx = data.get("transaction", {})
+    while total_sold < target_units:
+        units_to_sell = min(max_per_transaction, target_units - total_sold)
+
+        data = client.sell_cargo(ship_symbol, trade_symbol, units_to_sell)
+        if isinstance(data, dict) and "error" in data:
+            if sell_count == 0:
+                raise Exception(data['error'])
+            break  # Partial success — stop and report what we sold
+
+        tx = data.get("transaction", {})
+        total_sold += tx.get("units", units_to_sell)
+        total_revenue += tx.get("totalPrice", 0)
+        sell_count += 1
+
     cargo = data.get("cargo", {})
-    return f"Sold {tx.get('units', final_units)} {trade_symbol} for {tx.get('totalPrice', '?')} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
+    if sell_count > 1:
+        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr ({sell_count} transactions). Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
+    else:
+        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
 
 def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
-    """Buy cargo from the current market. Returns (message, total_cost)."""
-    # 1. Check available cargo space
+    """Buy cargo from the current market. Intelligently splits purchases across multiple transactions if needed.
+
+    Checks market cache for max trade volume per transaction, then makes multiple purchases if necessary.
+    Respects cargo capacity and market transaction limits.
+    """
+    # Get ship location and initial cargo state
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        raise Exception(f"Error fetching ship: {ship['error']}")
+
+    waypoint = ship.get("nav", {}).get("waypointSymbol")
+    if not waypoint:
+        raise Exception(f"Cannot determine ship location")
+
     cargo_data = client.get_cargo(ship_symbol)
     if isinstance(cargo_data, dict) and "error" in cargo_data:
         raise Exception(f"Error checking cargo: {cargo_data['error']}")
@@ -449,18 +495,69 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> 
     if available_space <= 0:
         raise Exception(f"Ship {ship_symbol} cargo is full ({current_units}/{capacity}). No space for purchase.")
 
-    # 2. Determine units to purchase (default to fill remaining space)
-    final_units = available_space if units is None else min(units, available_space)
+    # Determine target amount
+    target_units = available_space if units is None else min(units, available_space)
 
-    # 3. Action
+    # Look up max transaction volume from market cache
+    market_cache = load_market_cache()
+    max_per_transaction = target_units  # Default: try to buy full amount
+    if waypoint in market_cache:
+        trade_goods = market_cache[waypoint].get("trade_goods", [])
+        for good in trade_goods:
+            if good.get("symbol") == trade_symbol:
+                vol = good.get("tradeVolume")
+                if vol and vol > 0:
+                    max_per_transaction = vol
+                break
+
+    # Ensure dock
     _ensure_dock_logic(ship_symbol)
-    data = client.buy_cargo(ship_symbol, trade_symbol, final_units)
-    if isinstance(data, dict) and "error" in data:
-        raise Exception(data['error'])
 
-    tx = data.get("transaction", {})
-    cargo = data.get("cargo", {})
-    return f"Purchased {tx.get('units', final_units)} {trade_symbol} for {tx.get('totalPrice', '?')} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
+    # Make multiple purchases as needed
+    total_purchased = 0
+    total_cost = 0
+    purchase_count = 0
+
+    while total_purchased < target_units:
+        # Refresh cargo to check current space
+        cargo_data = client.get_cargo(ship_symbol)
+        if isinstance(cargo_data, dict) and "error" in cargo_data:
+            break
+        current_units = cargo_data.get("units", 0)
+        available_space = capacity - current_units
+
+        if available_space <= 0:
+            break  # Cargo full
+
+        # Buy up to the max per transaction
+        units_to_buy = min(max_per_transaction, available_space, target_units - total_purchased)
+
+        data = client.buy_cargo(ship_symbol, trade_symbol, units_to_buy)
+
+        if isinstance(data, dict) and "error" in data:
+            # If first attempt failed, stop
+            if purchase_count == 0:
+                raise Exception(data['error'])
+            # If we already got some cargo, return success with what we have
+            break
+
+        # Transaction succeeded
+        tx = data.get("transaction", {})
+        units_bought = tx.get("units", units_to_buy)
+        price = tx.get("totalPrice", 0)
+
+        total_purchased += units_bought
+        total_cost += price
+        purchase_count += 1
+
+    # Get final cargo state
+    cargo_data = client.get_cargo(ship_symbol)
+    final_cargo = cargo_data.get("units", 0) if isinstance(cargo_data, dict) and "error" not in cargo_data else "?"
+
+    if purchase_count > 1:
+        return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr ({purchase_count} transactions). Cargo: {final_cargo}/{capacity}."
+    else:
+        return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr. Cargo: {final_cargo}/{capacity}."
 
 
 def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None) -> str:
@@ -542,6 +639,78 @@ def _refuel_ship_logic(ship_symbol: str) -> str:
     tx = data.get("transaction", {})
     return f"Refueled {ship_symbol}. Fuel: {fuel.get('current')}/{fuel.get('capacity')}. Cost: {tx.get('totalPrice', '?')} cr."
 
+def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
+    """Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint.
+
+    If trade_symbol is '*', transfers all cargo items.
+    """
+    # Check source ship inventory
+    cargo_data = client.get_cargo(from_ship)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        raise Exception(f"Error checking cargo for {from_ship}: {cargo_data['error']}")
+
+    inventory = cargo_data.get("inventory", [])
+
+    # Handle '*' to transfer all cargo
+    if trade_symbol == "*":
+        if not inventory:
+            return f"No cargo to transfer from {from_ship}."
+
+        # Ensure orbit states once
+        _ensure_orbit_logic(from_ship)
+        _ensure_orbit_logic(to_ship)
+
+        results = []
+        total_units = 0
+        for item in inventory:
+            symbol = item.get("symbol")
+            available = item.get("units", 0)
+            if available == 0:
+                continue
+
+            transfer_units = available if units is None else min(units, available)
+            data = client.transfer_cargo(from_ship, to_ship, symbol, transfer_units)
+            if isinstance(data, dict) and "error" in data:
+                raise Exception(data['error'])
+
+            results.append(f"  {symbol}: {transfer_units} units")
+            total_units += transfer_units
+
+        if not results:
+            return f"No cargo available to transfer from {from_ship}."
+
+        return (
+            f"Transferred all cargo from {from_ship} to {to_ship}:\n" +
+            "\n".join(results) +
+            f"\nTotal: {total_units} units transferred"
+        )
+
+    # Handle single trade symbol
+    available = 0
+    for item in inventory:
+        if item.get("symbol") == trade_symbol:
+            available = item.get("units", 0)
+            break
+
+    if available == 0:
+        raise Exception(f"Ship {from_ship} has no {trade_symbol} available.")
+
+    safe_units = available if units is None else min(units, available)
+
+    # Ensure orbit states
+    _ensure_orbit_logic(from_ship)
+    _ensure_orbit_logic(to_ship)
+
+    data = client.transfer_cargo(from_ship, to_ship, trade_symbol, safe_units)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data['error'])
+
+    cargo = data.get("cargo", {})
+    return (
+        f"Transferred {safe_units} {trade_symbol} from {from_ship} to {to_ship}.\n"
+        f"{from_ship} cargo now: {cargo.get('units', 0)}/{cargo.get('capacity', '?')} units"
+    )
+
 # ──────────────────────────────────────────────
 #  BEHAVIOR ENGINE
 # ──────────────────────────────────────────────
@@ -554,6 +723,7 @@ class StepType(Enum):
     DELIVER = "deliver"
     REFUEL = "refuel"
     SCOUT = "scout"
+    TRANSFER = "transfer"
     ALERT = "alert"
     REPEAT = "repeat"
     STOP = "stop"
@@ -743,6 +913,7 @@ class BehaviorEngine:
             elif step.step_type == StepType.SELL: result = self._step_sell(cfg, step, ship, fleet)
             elif step.step_type == StepType.REFUEL: result = self._step_refuel(cfg, step, ship, fleet)
             elif step.step_type == StepType.DELIVER: result = self._step_deliver(cfg, step, ship, fleet)
+            elif step.step_type == StepType.TRANSFER: result = self._step_transfer(cfg, step, ship, fleet)
             elif step.step_type == StepType.SCOUT: result = self._step_scout(cfg, step, ship, fleet)
             elif step.step_type == StepType.REPEAT: result = self._step_repeat(cfg)
             elif step.step_type == StepType.STOP: result = self._step_stop(cfg)
@@ -881,6 +1052,27 @@ class BehaviorEngine:
 
         try:
             _deliver_contract_logic(contract_id, cfg.ship_symbol, trade_symbol, units)
+        except Exception as e:
+            raise e
+
+        self._advance(cfg)
+        return None
+
+    def _step_transfer(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Transfer cargo to another ship. Usage: transfer DESTINATION_SHIP TRADE_SYMBOL [UNITS]
+
+        TRADE_SYMBOL can be '*' to transfer all cargo. UNITS is optional (defaults to max available).
+        Examples: transfer SHIP-2 IRON_ORE, transfer SHIP-2 IRON_ORE 50, transfer SHIP-2 *
+        """
+        if len(step.args) < 2:
+            raise Exception("transfer step requires destination ship and trade symbol (e.g., 'transfer SHIP-2 IRON_ORE 50' or 'transfer SHIP-2 *')")
+
+        destination_ship = step.args[0]
+        trade_symbol = step.args[1]
+        units = int(step.args[2]) if len(step.args) > 2 else None
+
+        try:
+            _transfer_cargo_logic(cfg.ship_symbol, destination_ship, trade_symbol, units)
         except Exception as e:
             raise e
 
@@ -1894,40 +2086,10 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force
 @tool
 def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
     """[STATE: cargo] Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint."""
-
-    # Check source ship inventory
-    cargo_data = client.get_cargo(from_ship)
-    if isinstance(cargo_data, dict) and "error" in cargo_data:
-        return f"Error checking cargo for {from_ship}: {cargo_data['error']}"
-
-    inventory = cargo_data.get("inventory", [])
-    available = 0
-    for item in inventory:
-        if item.get("symbol") == trade_symbol:
-            available = item.get("units", 0)
-            break
-
-    if available == 0:
-        return f"Error: Ship {from_ship} has no {trade_symbol} available."
-
-    safe_units = available if units is None else min(units, available)
-
-    # Ensure orbit states
     try:
-        _ensure_orbit_logic(from_ship)
-        _ensure_orbit_logic(to_ship)
+        return _transfer_cargo_logic(from_ship, to_ship, trade_symbol, units)
     except Exception as e:
         return f"Error: {e}"
-
-    data = client.transfer_cargo(from_ship, to_ship, trade_symbol, safe_units)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-
-    cargo = data.get("cargo", {})
-    return (
-        f"Transferred {safe_units} {trade_symbol} from {from_ship} to {to_ship}.\n"
-        f"{from_ship} cargo now: {cargo.get('units', 0)}/{cargo.get('capacity', '?')} units"
-    )
 
 # ──────────────────────────────────────────────
 #  Advanced ship operations

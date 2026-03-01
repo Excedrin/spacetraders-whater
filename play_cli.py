@@ -86,14 +86,18 @@ def configure_readline(tools_map):
     readline.parse_and_bind("tab: complete")
 
 def print_hud(fleet_tracker=None):
-    """Prints the Gather Game State output."""
+    """Prints the Gather Game State output with behavior status."""
     fleet = FleetTracker()
-    # You might need to instantiate a dummy FleetTracker if your gather_game_state requires it
-    # Or modify gather_game_state to make fleet optional
     try:
-        # Assuming you modify gather_game_state in tools.py to handle None context/fleet gracefully
-        # or pass a dummy one.
-        print("\n" + gather_game_state(fleet) + "\n") 
+        output = gather_game_state(fleet)
+
+        # Add behavior status from the behavior engine
+        engine = get_engine()
+        behavior_status = engine.summary()
+        if behavior_status:
+            output += f"\n\n[Behavior Status]\n{behavior_status}"
+
+        print("\n" + output + "\n")
     except Exception as e:
         print(f"Error gathering state: {e}")
 

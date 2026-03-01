@@ -136,30 +136,28 @@ Use 'create_behavior' to automate ships. Syntax is a comma-separated string of s
 Tools handle dock/orbit automatically.
 
 PATTERN: HIGH-PROFIT TRADE LOOP
-  String: "goto BUY_WAYPOINT, buy ITEM, goto SELL_WAYPOINT, sell ITEM, repeat"
+  String: "goto BUY_WAYPOINT, refuel, buy ITEM, goto SELL_WAYPOINT, refuel, sell ITEM, repeat"
   Usage: When 'find_trades' identifies an arbitrage route (e.g., SHIP_PARTS).
   Note: Ensure you have credits to buy the cargo first!
+  !!! IMPORTANT: Ensure that you are not buying and selling at the same market, that will drain funds!!!
 
 PATTERN: MINING LOOP
-  String: "mine ASTEROID_WAYPOINT [ORE1 ORE2], goto MARKET_WAYPOINT, sell *, repeat"
+  String: "mine ASTEROID_WAYPOINT [ORE1 ORE2], transfer HAULER-1 *, repeat"
   Usage: For EXCAVATOR ships. Keeps revenue flowing 24/7.
   Note: 'sell *' automatically sells everything except contract goods.
-
-PATTERN: SATELLITE SCOUT
-  String: "goto MKT_1, scout, goto MKT_2, scout, goto MKT_3, scout, repeat"
-  Usage: Keep market prices fresh. Stale data = Lost profit.
 
 === SHIP ROLES ===
 1. COMMAND/HAULER:
    - Primary: High-volume Trading (create_behavior "buy/sell" loop).
    - Secondary: Contract Delivery.
-   - Rule: NEVER fly empty if a trade exists on your route.
+   - Try to avoid flying empty if a trade exists on your route.
 2. EXCAVATOR:
    - Primary: Mining Loops.
    - Rule: Never let these sit IDLE.
+   - Mining drones do not have large cargo or fuel capacity. They are best used to mine at a location.
 3. SATELLITE (Solar/Free):
    - Primary: Market Recon.
-   - Use: the `assign_satellite_scout` behavior.
+   - Use: the `assign_satellite_scout` behavior, this will scout all markets.
 
 === OPERATIONAL RULES ===
 - FUEL SAFETY: Smart tools handle refueling, but they cannot create fuel.
