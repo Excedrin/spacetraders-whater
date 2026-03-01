@@ -1,4 +1,6 @@
+import sys
 import time
+
 import requests
 
 BASE_URL = "https://api.spacetraders.io/v2"
@@ -20,10 +22,9 @@ class SpaceTradersClient:
         if method == "POST" and "json" not in kwargs:
             kwargs["json"] = {}
 
+        print(f"[API] {method} {path}", file=sys.stderr)
         # Debug: log the request (especially useful for POST with contract operations)
-        import sys
         if "json" in kwargs and kwargs["json"]:
-            print(f"[API] {method} {path}", file=sys.stderr)
             print(f"      Payload: {kwargs['json']}", file=sys.stderr)
 
         last_err = None
@@ -92,7 +93,9 @@ class SpaceTradersClient:
 
         while True:
             params_with_page = {**params, "page": page, "limit": limit}
+            #print(f"[API] list_waypoints {params_with_page}", file=sys.stderr)
             resp = self.session.request("GET", f"{BASE_URL}/systems/{system}/waypoints", params=params_with_page)
+            #print(f"[API] list_waypoints {resp.content}", file=sys.stderr)
 
             if resp.status_code == 204 or not resp.content:
                 break

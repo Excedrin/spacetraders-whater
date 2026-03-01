@@ -35,11 +35,19 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     cache = load_market_cache()
     entry = cache.get(waypoint_symbol, {})
 
-    # Structural data
+    # Structural data (imports/exports/exchange)
+    # Handle API variations where items might be dicts or strings
     for section in ("exports", "imports", "exchange"):
         items = data.get(section, [])
         if items:
-            entry[section] = [i["symbol"] for i in items]
+            entry[section] = [i.get("symbol") if isinstance(i, dict) else str(i) for i in items]
+
+    # Explicitly check for MARKETPLACE trait to ensure existence is cached
+    # This ensures discover_all_markets populates the cache keys even if goods data is missing
+    traits = data.get("traits", [])
+    trait_symbols = [t.get("symbol") if isinstance(t, dict) else str(t) for t in traits]
+    if "MARKETPLACE" in trait_symbols:
+        entry["is_market"] = True  # Marker flag
 
     # Price data
     trade_goods = data.get("tradeGoods", [])
@@ -55,6 +63,7 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
         ]
         entry["last_updated"] = int(time.time())
 
+    # Save if we have any relevant data
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -250,6 +259,12 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     Returns (result_message, wait_seconds).
     Handles smart routing, auto-refueling, and inter-system logic.
     """
+    # 1. Structural Validation (Fast Fail)
+    # A valid waypoint symbol MUST be SECTOR-SYSTEM-POINT (at least 2 hyphens).
+    # This catches "WHATER-1" (ship) or "X1-RV42" (system only).
+    if destination_symbol.count("-") < 2:
+        raise Exception(f"Invalid destination format '{destination_symbol}'. Expected Waypoint Symbol (SECTOR-SYSTEM-WAYPOINT).")
+
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         raise Exception(ship['error'])
@@ -263,60 +278,75 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         return f"{ship_symbol} is already at {destination_symbol}.", 0.0
 
     # Inter-System Check
+    # Extract system from destination: X1-RV42-A1 -> X1-RV42
     dest_sys = "-".join(destination_symbol.split("-")[:2])
     target_wp_symbol = destination_symbol
     is_inter_system = False
 
     if current_sys != dest_sys:
         is_inter_system = True
-        waypoints = client.list_waypoints(current_sys, traits="JUMP_GATE")
+        # FIX: Use type="JUMP_GATE" (not traits)
+        waypoints = client.list_waypoints(current_sys, type="JUMP_GATE")
+
+        if isinstance(waypoints, dict) and "error" in waypoints:
+            raise Exception(f"API Error finding jump gate: {waypoints['error']}")
+
         if not waypoints:
              raise Exception(f"Destination is in {dest_sys}, but no Jump Gate found in {current_sys}.")
+
         target_wp_symbol = waypoints[0]['symbol']
+
         if current_wp == target_wp_symbol:
             return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
 
-    # Fetch Waypoints
+    # Fetch Waypoints to validate target exists and calculate stats
     waypoints = client.list_waypoints(current_sys)
     if isinstance(waypoints, dict) and "error" in waypoints:
         raise Exception(waypoints['error'])
 
     origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
     target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
-    if not origin_obj or not target_obj:
-        raise Exception("Could not resolve waypoint coordinates.")
+
+    # Local Existence Check
+    if not origin_obj:
+        raise Exception(f"Current location {current_wp} not found in system listing.")
+    if not target_obj:
+        # If we are staying in-system, this means the destination is bogus
+        if not is_inter_system:
+             raise Exception(f"Destination {target_wp_symbol} does not exist in system {current_sys}.")
+        # If we are inter-system, target_obj is the Jump Gate, which must exist (checked above)
+        raise Exception("Could not resolve Jump Gate coordinates.")
 
     # Execute Logic
     if execute:
+        # 1. AUTO-REFUEL AT DEPARTURE
+        if fuel.get("capacity", 0) > 0:
+            try:
+                _ensure_dock_logic(ship_symbol)
+                client.refuel(ship_symbol)
+                ship = client.get_ship(ship_symbol)
+                fuel = ship.get("fuel", {})
+            except Exception:
+                pass
+
         _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
         fuel_available = fuel.get("current", 0)
         fuel_capacity = fuel.get("capacity", 0)
+
+        # 2. Route Check
         next_hop = target_wp_symbol
         is_multi_hop = False
 
-        # 1. SMART REFUEL: If we use fuel, try to top up BEFORE leaving if possible.
-        # This prevents running dry mid-route or arriving empty.
-        if fuel_capacity > 0:
-            market_cache = load_market_cache()
-            curr_market = market_cache.get(current_wp, {})
-            # Check if market sells fuel (Export or Exchange)
-            if "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", []):
-                _ensure_dock_logic(ship_symbol)
-                client.refuel(ship_symbol)
-                ship = client.get_ship(ship_symbol) # update fuel state
-                fuel_available = ship.get("fuel", {}).get("current", 0)
-
-        # 2. Route Check: If we still don't have enough fuel after trying to top up
         if fuel_capacity > 0 and direct_cost > fuel_available:
             path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
             if not path:
                 raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
 
-                if len(path) > 1:
-                    next_hop = path[1]
-                    is_multi_hop = True
-                    next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
-                    _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
+            if len(path) > 1:
+                next_hop = path[1]
+                is_multi_hop = True
+                next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
+                _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
 
         # Action
         _ensure_orbit_logic(ship_symbol)
@@ -383,14 +413,26 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
              return f"Cooldown remaining: {remaining}s", float(remaining)
 
     _ensure_orbit_logic(ship_symbol)
-
     data = client.extract(ship_symbol)
+    print(data)
+
     if isinstance(data, dict) and "error" in data:
+        err = data['error']
+        err_msg = str(err)
+
         # Handle API error 4000 (Cooldown) specifically if API returns it as error
-        if "cooldown" in str(data['error']).lower():
+        # Some versions of the API/Client might structure this differently
+        if "cooldown" in err_msg.lower() or (isinstance(err, dict) and err.get('code') == 4000):
              # Fallback guess
              return "Hit cooldown", 70.0
-        raise Exception(data['error'])
+
+        # Normalize error message to avoid "0" or "4000"
+        if isinstance(err, (int, float)):
+            err_msg = f"API Error Code {err}"
+        elif isinstance(err, dict) and "message" in err:
+            err_msg = err["message"]
+
+        raise Exception(err_msg)
 
     extraction = data.get("extraction", {})
     cd = data.get("cooldown", {})
@@ -399,7 +441,6 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
 
     result = f"Extracted {yielded.get('units', '?')} {yielded.get('symbol', '?')}."
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
-
     return result, float(cd.get("remainingSeconds", 0))
 
 def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
@@ -960,19 +1001,35 @@ class BehaviorEngine:
 
     def _step_mine(self, cfg, step, ship, fleet) -> Optional[str]:
         """Smart mining using _extract_ore_logic."""
-        asteroid_wp = step.args[0] if step.args else None
-        ore_types = step.args[1:] if len(step.args) > 1 else []
+        # Argument parsing with heuristic:
+        # If arg[0] doesn't look like a waypoint (no dash), assume it's an ore and we mine at current location.
+        asteroid_wp = None
+        ore_types = []
+
+        if step.args:
+            first_arg = step.args[0]
+            if "-" in first_arg:
+                asteroid_wp = first_arg
+                ore_types = step.args[1:]
+            else:
+                # First arg is likely an ore type (e.g. "COPPER_ORE")
+                # Assume mine at current location
+                asteroid_wp = ship.location
+                ore_types = step.args
 
         if cfg.step_phase == "INIT":
+            # If we need to go somewhere else to mine
             if asteroid_wp and ship.location != asteroid_wp:
-                # Reuse navigate logic logic dynamically
-                msg, wait = _navigate_ship_logic(cfg.ship_symbol, asteroid_wp)
-                if wait > 0:
-                    fleet.set_transit(cfg.ship_symbol, wait)
-                # We don't change phase to WAITING here because we want to loop back to INIT
-                # until we are actually at the location.
-                # Better: Use a sub-state or just let the next tick handle transit cooldown.
-                return None
+                # Reuse navigate logic dynamically
+                try:
+                    msg, wait = _navigate_ship_logic(cfg.ship_symbol, asteroid_wp)
+                    if wait > 0:
+                        fleet.set_transit(cfg.ship_symbol, wait)
+                    # We don't change phase to WAITING here because we want to loop back to INIT
+                    # until we are actually at the location.
+                    return None
+                except Exception as e:
+                    raise Exception(f"Nav error in mine step: {e}")
 
             cfg.step_phase = "EXTRACTING"
             self._save()
@@ -984,7 +1041,7 @@ class BehaviorEngine:
                 cfg.paused = True
                 cfg.alert_sent = True
                 self._save()
-                return f"{cfg.ship_symbol} ALERT: Cargo full at {ship.location}. Define a sell/deliver step or manually empty cargo."
+                return f"{cfg.ship_symbol} ALERT: Cargo full at {ship.location}. Define a sell/deliver/transfer step or manually empty cargo."
 
             msg, wait = _extract_ore_logic(cfg.ship_symbol)
             if wait > 0:
@@ -1385,85 +1442,137 @@ def view_ship_details(ship_symbol: str) -> str:
 
 
 @tool
-def find_waypoints(system_symbol: str, trait_or_type: str, reference_ship: str = None) -> str:
-    """Search for waypoints in a system by TRAIT (e.g. SHIPYARD, MARKETPLACE, COMMON_METAL_DEPOSITS) or TYPE (e.g. ASTEROID, ENGINEERED_ASTEROID, PLANET, GAS_GIANT).
+def find_waypoints(
+    waypoint_type: str = None,
+    trait: str = None,
+    trade_symbol: str = None,
+    system_symbol: str = None,
+    reference_ship: str = None
+) -> str:
+    """Find locations of interest. Merges functionality of finding waypoints, markets, and nearest resources.
 
-    IMPORTANT: Specify reference_ship when planning that ship's actions!
-    - With reference_ship: Results sorted by distance from THAT SPECIFIC SHIP (closest first)
-    - Without reference_ship: Results in arbitrary order (no distance shown)
-
-    Example: Planning where WHATER-3 should mine? Use find_waypoints('X1-AB12', 'ASTEROID', reference_ship='WHATER-3')
-    This prevents confusion when satellite is at location but cargo ship is far away.
-
-    IMPORTANT: This searches by waypoint TYPE/TRAIT, NOT by resource. You CANNOT search for 'ALUMINUM_ORE' or 'IRON_ORE' asteroids.
-    To find mineable asteroids, search for type='ASTEROID' or 'ENGINEERED_ASTEROID', then extract to see what resources they produce.
-
-    The system_symbol looks like 'X1-AB12'."""
-
-    # Try as trait first, then as type
-    data = client.list_waypoints(system_symbol, traits=trait_or_type)
-    if isinstance(data, dict) and "error" in data:
-        data = client.list_waypoints(system_symbol, type=trait_or_type)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-
-    # MAGIC: When searching for ASTEROID, also include ENGINEERED_ASTEROID (starter asteroids)
-    if trait_or_type.upper() == "ASTEROID" and isinstance(data, list):
-        engineered = client.list_waypoints(system_symbol, type="ENGINEERED_ASTEROID")
-        if isinstance(engineered, list):
-            data.extend(engineered)
-
-    if not data:
-        return f"No waypoints found for '{trait_or_type}' in {system_symbol}."
-
-    # Get reference ship position if specified
-    reference_position = None
-    reference_ship_name = None
-
+    Args:
+        waypoint_type: Filter by type (e.g., ASTEROID, PLANET, GAS_GIANT).
+        trait: Filter by trait (e.g., MARKETPLACE, SHIPYARD, COMMON_METAL_DEPOSITS).
+        trade_symbol: Find markets buying/selling this good (e.g., FUEL, IRON_ORE). Uses cached data.
+        system_symbol: System to search. Defaults to reference_ship's system or agent's HQ system.
+        reference_ship: Sort results by distance from this ship.
+    """
+    # 1. Determine System
+    ref_coords = None
     if reference_ship:
         ship = client.get_ship(reference_ship)
         if isinstance(ship, dict) and "error" not in ship:
-            nav = ship.get("nav", {})
-            current_wp = nav.get("waypointSymbol", "")
+            system_symbol = ship['nav']['systemSymbol']
+            ref_coords = (ship['nav']['route']['destination']['x'], ship['nav']['route']['destination']['y'])
 
-            # Find reference ship's coordinates
-            waypoints = client.list_waypoints(system_symbol)
-            if isinstance(waypoints, list):
-                for wp in waypoints:
-                    if wp.get("symbol") == current_wp:
-                        reference_position = (wp.get("x", 0), wp.get("y", 0))
-                        reference_ship_name = reference_ship
-                        break
-
-    # Calculate distance from reference point
-    def calculate_distance(waypoint):
-        if not reference_position:
-            return 0  # No reference for sorting
-        wx, wy = waypoint.get("x", 0), waypoint.get("y", 0)
-        rx, ry = reference_position
-        return math.sqrt((wx - rx) ** 2 + (wy - ry) ** 2)
-
-    # Sort waypoints by distance if we have a reference
-    if reference_position:
-        sorted_waypoints = sorted(data, key=calculate_distance)
-        header = f"Waypoints sorted by distance from {reference_ship_name}:\n"
-    else:
-        sorted_waypoints = data
-        header = "Waypoints (no reference ship specified - distances not shown):\n"
-
-    lines = [header]
-    for wp in sorted_waypoints:
-        traits = ", ".join(t["symbol"] for t in wp.get("traits", []))
-
-        # Show distance if we have a reference position
-        if reference_position:
-            dist = calculate_distance(wp)
-            lines.append(f"{wp['symbol']} (type: {wp['type']}, distance from {reference_ship_name}: {dist:.1f})")
+    if not system_symbol:
+        # Fallback to agent HQ system
+        agent = client.get_agent()
+        if "headquarters" in agent:
+            system_symbol = "-".join(agent["headquarters"].split("-")[:2])
         else:
-            lines.append(f"{wp['symbol']} (type: {wp['type']})")
+            return "Error: system_symbol or reference_ship must be provided."
 
-        if traits:
-            lines.append(f"  Traits: {traits}")
+    # 2. Logic Branch: Trade Symbol Search (formerly query_markets/find_nearest)
+    if trade_symbol:
+        cache = load_market_cache()
+        candidates = []
+
+        # We need waypoint coordinates for the whole system to calculate distance
+        all_wps = client.list_waypoints(system_symbol)
+        wp_lut = {w['symbol']: (w['x'], w['y']) for w in all_wps} if isinstance(all_wps, list) else {}
+
+        for wp_sym, mdata in cache.items():
+            # Check if this market is in the target system
+            if not wp_sym.startswith(system_symbol):
+                continue
+
+            # Check if good exists here
+            goods = mdata.get('trade_goods', [])
+            exports = mdata.get('exports', [])
+            imports = mdata.get('imports', [])
+            exchange = mdata.get('exchange', [])
+
+            # Check price data first
+            price_match = next((g for g in goods if g['symbol'] == trade_symbol), None)
+
+            # Check structural data
+            is_import = trade_symbol in imports
+            is_export = trade_symbol in exports
+            is_exchange = trade_symbol in exchange
+
+            if price_match or is_import or is_export or is_exchange:
+                dist = float('inf')
+                if ref_coords and wp_sym in wp_lut:
+                    wx, wy = wp_lut[wp_sym]
+                    dist = math.sqrt((wx - ref_coords[0])**2 + (wy - ref_coords[1])**2)
+
+                details = []
+                if price_match:
+                    if price_match.get('purchasePrice'):
+                        details.append(f"BUY: {price_match['purchasePrice']}")
+                    if price_match.get('sellPrice'):
+                        details.append(f"SELL: {price_match['sellPrice']}")
+                else:
+                    if is_import:
+                        details.append("Imports (Buy)")
+                    if is_export:
+                        details.append("Exports (Sell)")
+                    if is_exchange:
+                        details.append("Exchange")
+
+                candidates.append((dist, wp_sym, ", ".join(details)))
+
+        if not candidates:
+            return f"No known markets for {trade_symbol} in {system_symbol}. (Note: Only checks cached data. Use scan_system or view_market to update cache)."
+
+        # Sort
+        candidates.sort(key=lambda x: x[0])
+        lines = [f"Markets for {trade_symbol} in {system_symbol}:"]
+        for dist, sym, det in candidates:
+            d_str = f" ({dist:.1f} dist)" if dist != float('inf') else ""
+            lines.append(f"  {sym}{d_str}: {det}")
+        return "\n".join(lines)
+
+    # 3. Logic Branch: Waypoint/Trait Search
+    params = {}
+    if waypoint_type:
+        params['type'] = waypoint_type
+    if trait:
+        params['traits'] = trait
+
+    data = client.list_waypoints(system_symbol, **params)
+
+    # Special case: ASTEROID should also fetch ENGINEERED_ASTEROID
+    if waypoint_type == "ASTEROID" and isinstance(data, list):
+        eng = client.list_waypoints(system_symbol, type="ENGINEERED_ASTEROID")
+        if isinstance(eng, list):
+            data.extend(eng)
+
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    if not data:
+        return f"No waypoints found in {system_symbol} matching your criteria."
+
+    # Sort by distance
+    if ref_coords:
+        def get_dist(w):
+            return math.sqrt((w['x'] - ref_coords[0])**2 + (w['y'] - ref_coords[1])**2)
+        data.sort(key=get_dist)
+
+    lines = [f"Waypoints in {system_symbol}:"]
+    for wp in data[:20]:  # Limit output
+        d_str = ""
+        if ref_coords:
+            d = math.sqrt((wp['x'] - ref_coords[0])**2 + (wp['y'] - ref_coords[1])**2)
+            d_str = f" ({d:.1f} dist)"
+
+        t_list = [t['symbol'] for t in wp.get('traits', [])]
+        lines.append(f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}")
+
+    if len(data) > 20:
+        lines.append(f"  ... {len(data)-20} more ...")
 
     return "\n".join(lines)
 
@@ -2532,31 +2641,40 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
 
 @tool
 def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str:
-    """[STATE: behavior] Convenience: assign scouting to satellites. Builds step sequences internally.
-
-    All satellites share the same step sequence but start at evenly-spaced offsets so
-    they spread across the market list instead of converging on the first waypoint.
-
+    """[STATE: behavior] Convenience: assign scouting to satellites.
     Args:
-        ship_symbols: Comma-separated satellite ship symbols (e.g. "WHATER-2,WHATER-3").
-        market_waypoints: Comma-separated waypoints to scout. If omitted, uses all known markets.
+        ship_symbols: Comma-separated satellite ship symbols.
+        market_waypoints: Comma-separated waypoints to scout.
+                          IF OMITTED, uses ALL known marketplaces in the ship's system (from cache).
     """
     ships = [s.strip() for s in ship_symbols.split(",") if s.strip()]
-
     if not ships:
         return "Error: no ship symbols provided."
 
     engine = get_engine()
+    markets = []
 
-    # Get market list
+    # Case 1: User provided specific list
     if market_waypoints:
         markets = [m.strip() for m in market_waypoints.split(",") if m.strip()]
+
+    # Case 2: Use Cache (Filtered by System)
     else:
-        cache = load_market_cache()
-        markets = sorted(cache.keys())
+        # Determine system from first ship
+        first_ship = client.get_ship(ships[0])
+        if isinstance(first_ship, dict) and "error" not in first_ship:
+            system_symbol = first_ship['nav']['systemSymbol']
+            cache = load_market_cache()
+
+            # Filter cache keys for this system
+            markets = [wp for wp in cache.keys() if wp.startswith(system_symbol)]
+            markets.sort()
+
+            if not markets:
+                return f"Error: No markets found in cache for system {system_symbol}. Run scan_system first to populate cache."
 
     if not markets:
-        return "Error: no markets known. Run scan_system first."
+        return "Error: no markets found to scout."
 
     # Build one shared sequence: goto M1, scout, goto M2, scout, ..., repeat
     parts = []
@@ -2564,23 +2682,22 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
         parts.append(f"goto {mkt}")
         parts.append("scout")
     parts.append("repeat")
+
     steps_str = ", ".join(parts)
 
+    # Calculate offsets to spread ships out
     m = len(markets)
-
-    # Count ships already running this exact sequence (from previous calls).
-    # This makes sequential single-ship calls spread out just like a batch call.
     already_placed = sum(
         1 for cfg in engine.behaviors.values()
         if cfg.steps_str == steps_str and cfg.ship_symbol not in ships
     )
-    total = already_placed + len(ships)
 
+    total = already_placed + len(ships)
     results = []
     for j, ship in enumerate(ships):
-        slot = already_placed + j        # absolute position in the full fleet
+        slot = already_placed + j
         market_offset = (slot * m) // total
-        start_step = market_offset * 2  # 2 steps per market (goto + scout)
+        start_step = market_offset * 2
         result = engine.assign(ship, steps_str, start_step=start_step)
         results.append(result)
 
@@ -2591,10 +2708,9 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
 #  Tool registry
 # ──────────────────────────────────────────────
 
-# Tier 1: Essential tools for mining/selling/contracts gameplay
-# Tools auto-handle dock/orbit, so those are excluded
+# Tier 1: Essential tools
 TIER_1_TOOLS = [
-    # Navigation & planning (Refueling/Docking is auto-handled by navigate/buy/sell)
+    # Navigation & planning
     navigate_ship, plan_route,
     # Trading & cargo
     buy_cargo, sell_cargo, transfer_cargo, jettison_cargo,
@@ -2602,21 +2718,24 @@ TIER_1_TOOLS = [
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Info
     view_market, view_ships, view_contracts, find_trades,
+    # Locator
+    find_waypoints,
     # Planning
     update_plan,
-    # Behavior control (High level)
+    # Behavior control
     resume_behavior, skip_step, cancel_behavior,
     assign_mining_loop, assign_satellite_scout, assign_trade_route,
-    # Low level behavior (only if wrappers don't fit)
     create_behavior,
 ]
 
-# All tools (tier 2) — includes advanced/exploration tools
+# All tools (tier 2)
 ALL_TOOLS = [
     # Observation
     view_agent, view_contracts, view_ships, view_ship_details, view_cargo,
-    scan_system, find_waypoints, view_market, query_markets, view_jump_gate,
-    # Ship operations (dock/orbit still available for edge cases)
+    scan_system, view_market, view_jump_gate,
+    # Locator
+    find_waypoints,
+    # Ship operations
     orbit_ship, dock_ship, navigate_ship, refuel_ship, plan_route,
     # Mining & resources
     extract_ore, survey_asteroid,
@@ -2632,9 +2751,9 @@ ALL_TOOLS = [
     jump_ship, warp_ship, set_flight_mode,
     # Planning
     update_plan,
-    # Find stuff
-    find_nearest, find_trades,
-    # Behavior control (step-sequence engine)
+    # Analysis
+    find_trades,
+    # Behavior control
     create_behavior, resume_behavior, skip_step, cancel_behavior,
     assign_mining_loop, assign_satellite_scout, assign_trade_route,
 ]

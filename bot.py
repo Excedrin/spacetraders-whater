@@ -119,8 +119,12 @@ Your Goal: MAXIMIZE CREDITS PER HOUR to fund rapid fleet expansion.
 
 === COMMAND DOCTRINE ===
 You are a STRATEGIC PLANNER, not a pilot.
-1. Use 'create_behavior' to define automated loops for Mining, Trading, and Scouting.
+1. Use these:
+    assign_satellite_scout
+    assign_trade_route
+    assign_mining_loop
 2. Intervene manually to resolve ALERTS or seize high-value opportunities.
+3. Use 'create_behavior' to define custom behavior.
 
 === PROFIT FIRST ===
 Before accepting a contract or assigning a behavior, perform this calculation:
@@ -133,13 +137,6 @@ Before accepting a contract or assigning a behavior, perform this calculation:
 
 === BEHAVIOR CONSTRUCTION ===
 Use 'create_behavior' to automate ships. Syntax is a comma-separated string of steps.
-Tools handle dock/orbit automatically.
-
-PATTERN: HIGH-PROFIT TRADE LOOP
-  String: "goto BUY_WAYPOINT, refuel, buy ITEM, goto SELL_WAYPOINT, refuel, sell ITEM, repeat"
-  Usage: When 'find_trades' identifies an arbitrage route (e.g., SHIP_PARTS).
-  Note: Ensure you have credits to buy the cargo first!
-  !!! IMPORTANT: Ensure that you are not buying and selling at the same market, that will drain funds!!!
 
 PATTERN: MINING LOOP
   String: "mine ASTEROID_WAYPOINT [ORE1 ORE2], transfer HAULER-1 *, repeat"
@@ -153,11 +150,10 @@ PATTERN: MINING LOOP
    - Try to avoid flying empty if a trade exists on your route.
 2. EXCAVATOR:
    - Primary: Mining Loops.
-   - Rule: Never let these sit IDLE.
-   - Mining drones do not have large cargo or fuel capacity. They are best used to mine at a location.
+   - Mining drones do not have large cargo or fuel capacity. They are best used to mine at a location and then offloading to a HAULER.
 3. SATELLITE (Solar/Free):
    - Primary: Market Recon.
-   - Use: the `assign_satellite_scout` behavior, this will scout all markets.
+   - Use: the 'assign_satellite_scout' behavior, this will scout all markets.
 
 === OPERATIONAL RULES ===
 - FUEL SAFETY: Smart tools handle refueling, but they cannot create fuel.
@@ -166,15 +162,15 @@ PATTERN: MINING LOOP
   - Use DRIFT speed if there's no other option.
 - DATA HYGIENE:
   - Market data expires. If 'find_trades' says "STALE (2h+)", do not commit a Hauler yet.
-  - Send a Satellite or use 'create_behavior(sat, "goto X, scout, stop", 0)' to verify price first.
 - EXPANSION:
-  - If Credits > (Ship Price + 20k Buffer), go to a shipyard and purchase a new ship immediately.
+  - If Credits > (Ship Price + 100k Buffer), go to a shipyard and purchase a new ship immediately.
+-!!! IMPORTANT: Ensure that you are not buying and selling at the same market, that will drain funds!!!
 
 === INTERVENTION PROTOCOL ===
 If a ship triggers an [ALERT] (e.g., CARGO_FULL, NO_FUEL):
 1. 'cancel_behavior(ship)'
 2. Solve the problem manually (e.g., 'navigate_ship', 'sell_cargo').
-3. 'create_behavior' to put it back to work.
+3. 'assign_X' or 'create_behavior' to put it back to work.
 """
 
 # ──────────────────────────────────────────────
@@ -738,38 +734,60 @@ def auto_discover_markets() -> list[tuple[str, str, bool]]:
 
 def discover_all_markets(fleet: FleetTracker):
     """
-    Discover all marketplace waypoints in every known system by querying
-    find_waypoints(MARKETPLACE). Saves structural data (imports/exports/exchange)
-    to the market cache so SATELLITE_SCOUT and the LLM have a complete picture.
-
-    Called once at startup so the cache is comprehensive from the start.
+    Discover all marketplace waypoints in every known system.
+    Aggressively hydrates the cache: if a market is known but lacks trade data
+    (imports/exports), it calls the API to fetch it immediately.
     """
-    from tools import _save_market_to_cache
+    from tools import _save_market_to_cache, load_market_cache
 
     # Collect unique systems from the current fleet
     systems = {s.location.rsplit("-", 1)[0] for s in fleet.ships.values() if s.location}
     if not systems:
         return
 
-    existing_cache = load_market_cache()
-    newly_found = 0
-
     for system in systems:
-        console.print(f"  [dim]Scanning {system} for all marketplaces...[/dim]")
-        waypoints = client.list_waypoints(system, traits="MARKETPLACE")
-        if not isinstance(waypoints, list):
-            continue
-        for wp in waypoints:
-            symbol = wp.get("symbol", "")
-            if not symbol:
-                continue
-            # Save structural data (traits/type) even if we don't have prices yet
-            _save_market_to_cache(symbol, wp)
-            if symbol not in existing_cache:
-                newly_found += 1
+        console.print(f"  [dim]Scanning {system} for marketplaces & shipyards...[/dim]")
 
-    if newly_found:
-        console.print(f"  [dim green]Found {newly_found} new marketplace(s) in cache[/dim green]")
+        # 1. Fetch all relevant waypoints
+        # We fetch both traits to ensure we have a complete map
+        market_wps = client.list_waypoints(system, traits="MARKETPLACE")
+        if isinstance(market_wps, dict) and "error" in market_wps: market_wps = []
+
+        shipyard_wps = client.list_waypoints(system, traits="SHIPYARD")
+        if isinstance(shipyard_wps, dict) and "error" in shipyard_wps: shipyard_wps = []
+
+        # Merge by symbol to handle waypoints that might be both
+        all_wps = {w['symbol']: w for w in (market_wps + shipyard_wps)}
+
+        # 2. Update Cache & Hydrate Missing Data
+        cache = load_market_cache()
+        api_calls = 0
+
+        for wp_sym, wp_data in all_wps.items():
+            # First, save basic trait info (coordinates, etc)
+            _save_market_to_cache(wp_sym, wp_data)
+
+            # Check if this is a market
+            traits = [t['symbol'] for t in wp_data.get('traits', [])]
+            if "MARKETPLACE" in traits:
+                # Check if we already have structural data (imports/exports)
+                cached_entry = cache.get(wp_sym, {})
+                has_structure = (
+                    cached_entry.get("imports") or
+                    cached_entry.get("exports") or
+                    cached_entry.get("exchange")
+                )
+
+                # If cache is empty/incomplete, fetch full market details
+                if not has_structure:
+                    m_data = client.get_market(system, wp_sym)
+                    if isinstance(m_data, dict) and "error" not in m_data:
+                        _save_market_to_cache(wp_sym, m_data)
+                        api_calls += 1
+                        time.sleep(0.2)  # Rate limit kindness
+
+        if api_calls > 0:
+            console.print(f"  [dim green]Hydrated {api_calls} markets in {system}[/dim green]")
 
 
 def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeContext):
