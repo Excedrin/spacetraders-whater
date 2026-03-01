@@ -290,26 +290,27 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     if execute:
         _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
         fuel_available = fuel.get("current", 0)
+        fuel_capacity = fuel.get("capacity", 0)
         next_hop = target_wp_symbol
         is_multi_hop = False
 
-        if fuel.get("capacity", 0) > 0 and direct_cost > fuel_available:
-            # Try Refuel Here
+        # 1. SMART REFUEL: If we use fuel, try to top up BEFORE leaving if possible.
+        # This prevents running dry mid-route or arriving empty.
+        if fuel_capacity > 0:
             market_cache = load_market_cache()
             curr_market = market_cache.get(current_wp, {})
-            has_fuel_here = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
-
-            if has_fuel_here:
+            # Check if market sells fuel (Export or Exchange)
+            if "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", []):
                 _ensure_dock_logic(ship_symbol)
                 client.refuel(ship_symbol)
                 ship = client.get_ship(ship_symbol) # update fuel state
                 fuel_available = ship.get("fuel", {}).get("current", 0)
 
-            # Route Plan if still needed
-            if direct_cost > fuel_available:
-                path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
-                if not path:
-                    raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
+        # 2. Route Check: If we still don't have enough fuel after trying to top up
+        if fuel_capacity > 0 and direct_cost > fuel_available:
+            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+            if not path:
+                raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
 
                 if len(path) > 1:
                     next_hop = path[1]
@@ -2507,6 +2508,29 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") 
 
 
 @tool
+def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None) -> str:
+    """[STATE: behavior] Assign a permanent buying and selling loop.
+    The ship will:
+    1. Go to buy_waypoint
+    2. Buy the specified good (fills cargo)
+    3. Go to sell_waypoint
+    4. Sell the good
+    5. Repeat forever
+    Smart navigation handles refueling automatically.
+    Args:
+        ship_symbol: The hauler ship.
+        buy_waypoint: Where to buy (e.g., 'X1-KD26-D44').
+        buy_good: The symbol to trade (e.g., 'SHIP_PARTS').
+        sell_waypoint: Where to sell.
+        sell_good: Optional. Defaults to buy_good. Use if refining/transforming, otherwise leave empty.
+    """
+    s_good = sell_good if sell_good else buy_good
+    # Steps: goto BUY, buy ITEM, goto SELL, sell ITEM, repeat
+    steps_str = f"goto {buy_waypoint}, buy {buy_good}, goto {sell_waypoint}, sell {s_good}, repeat"
+    return get_engine().assign(ship_symbol, steps_str)
+
+
+@tool
 def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str:
     """[STATE: behavior] Convenience: assign scouting to satellites. Builds step sequences internally.
 
@@ -2570,19 +2594,21 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
 # Tier 1: Essential tools for mining/selling/contracts gameplay
 # Tools auto-handle dock/orbit, so those are excluded
 TIER_1_TOOLS = [
-    # Navigation & planning
-    navigate_ship, refuel_ship, plan_route,
+    # Navigation & planning (Refueling/Docking is auto-handled by navigate/buy/sell)
+    navigate_ship, plan_route,
     # Trading & cargo
     buy_cargo, sell_cargo, transfer_cargo, jettison_cargo,
     # Contracts
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
-    # Info (view_market includes shipyard data)
-    scan_system, view_market, view_ships, find_waypoints, view_contracts, find_trades,
+    # Info
+    view_market, view_ships, view_contracts, find_trades,
     # Planning
     update_plan,
-    # Behavior control (step-sequence engine)
-    create_behavior, resume_behavior, skip_step, cancel_behavior,
-    assign_mining_loop, assign_satellite_scout,
+    # Behavior control (High level)
+    resume_behavior, skip_step, cancel_behavior,
+    assign_mining_loop, assign_satellite_scout, assign_trade_route,
+    # Low level behavior (only if wrappers don't fit)
+    create_behavior,
 ]
 
 # All tools (tier 2) — includes advanced/exploration tools
@@ -2610,7 +2636,7 @@ ALL_TOOLS = [
     find_nearest, find_trades,
     # Behavior control (step-sequence engine)
     create_behavior, resume_behavior, skip_step, cancel_behavior,
-    assign_mining_loop, assign_satellite_scout,
+    assign_mining_loop, assign_satellite_scout, assign_trade_route,
 ]
 
 # Tools that are "significant" actions worth narrating
