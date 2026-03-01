@@ -1,5 +1,7 @@
 import json
 import os
+import math
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +123,95 @@ def _parse_arrival(nav: dict) -> float:
     remaining = (arrival - datetime.now(timezone.utc)).total_seconds()
     return max(remaining, 0.0)
 
+def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE") -> tuple[int, int, int]:
+    """
+    Helper to calculate distance, fuel cost, and estimated time.
+    Returns: (distance, fuel_cost, flight_seconds)
+    """
+    import math
+
+    # 1. Calculate Distance
+    dx = dest_wp['x'] - origin_wp['x']
+    dy = dest_wp['y'] - origin_wp['y']
+    distance = math.sqrt(dx**2 + dy**2)
+
+    # 2. Get Ship Engine Speed (Default to 30 for Command Ships if missing)
+    # Satellites usually have speed 10, Command ships 30, Interceptors >30
+    engine_speed = ship.get('engine', {}).get('speed', 30)
+
+    # 3. Determine Multipliers
+    # CRUISE: 1x fuel, 1x speed
+    # DRIFT:  1 fuel total, 0.1x speed (relative to current engine?) - actually Drift is usually fixed low speed
+    # BURN:   2x fuel, 2x speed
+    # STEALTH: 1x fuel, 1x speed
+
+    fuel_multiplier = 1.0
+    speed_multiplier = 1.0
+
+    # Round distance for fuel calc
+    base_fuel_cost = max(1, round(distance))
+
+    if mode == "DRIFT":
+        fuel_cost = 1
+        # Drift is universally slow, often ignoring engine speed, but let's assume a penalty
+        # In SpaceTraders, Drift is usually ~1/10th speed or fixed low speed.
+        speed_multiplier = 0.01 # Severe penalty
+    elif mode == "BURN":
+        fuel_cost = 2 * base_fuel_cost
+        speed_multiplier = 2.0
+    else: # CRUISE or STEALTH
+        fuel_cost = base_fuel_cost
+        speed_multiplier = 1.0
+
+    # 4. Handle Solar/Probe Ships (0 Fuel Capacity)
+    fuel_capacity = ship.get('fuel', {}).get('capacity', 0)
+    if fuel_capacity == 0:
+        fuel_cost = 0  # Solar ships don't consume fuel units
+
+    # 5. Calculate Time
+    # SpaceTraders formula approximation:
+    # time = round(max(1, distance) * (Multiplier / EngineSpeed)) + 15
+    # Note: Multiplier in API docs is often "Distance / Speed" logic.
+    # The accepted formula for CRUISE is roughly: (Distance * (1 / Speed)) + 15s (cooldown/warmup)
+
+    # Fixed formula based on observation:
+    # Travel Time = (Distance * (Multiplier / EngineSpeed) ) + 15
+    # Where Multiplier for CRUISE is usually just 1 (implied).
+
+    # However, for accurate estimates, we use the standard formula:
+    # time = round(round(max(1, distance)) * (multiplier_const / engine_speed) + 15)
+    # multiplier_const: CRUISE=1, DRIFT=100?, BURN=0.5?
+
+    # Let's use the empirical observation logic:
+    if mode == "BURN":
+        flight_mode_mult = 0.5 # Faster
+    elif mode == "DRIFT":
+        flight_mode_mult = 5.0 # Slower (The API might differ, but this is a safer estimate)
+    else:
+        flight_mode_mult = 1.0 # Cruise/Stealth
+
+    # Improve calculation:
+    flight_time = round((max(1, distance) * (flight_mode_mult / max(1, engine_speed/100) )) + 15)
+
+    # Simpler heuristic that matches your log (36 distance / speed 10 satellite ≈ 113s?)
+    # 36 distance. 113s total. 15s is constant.
+    # Travel part = 98s.
+    # 98 / 36 = 2.72 seconds per unit.
+    # Speed 10 = ~3s per unit. Speed 30 = ~1s per unit.
+    # Formula: (Distance * (30 / Speed)) + 15
+
+    travel_time = (distance * (30 / max(1, engine_speed)))
+
+    if mode == "BURN":
+        travel_time /= 2
+    elif mode == "DRIFT":
+        travel_time *= 5 # Drift is significantly slower
+
+    total_time = travel_time + 15
+
+    return round(distance), int(fuel_cost), int(total_time)
+
+
 
 # ──────────────────────────────────────────────
 #  Observation tools
@@ -194,14 +285,14 @@ def view_ships() -> str:
     data = client.list_ships()
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
-    
+
     lines = []
     for s in data:
         symbol = s['symbol']
         nav = s.get("nav", {})
         fuel = s.get("fuel", {})
         cargo = s.get("cargo", {})
-        
+
         # Check Cooldown
         cooldown = client.get_cooldown(symbol)
         cd_text = ""
@@ -222,7 +313,7 @@ def view_ships() -> str:
         lines.append(f"   Loc: {nav.get('waypointSymbol', '?')} ({status}){arrival_text}")
         lines.append(f"   Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} | Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}{cd_text}")
         lines.append("")
-        
+
     return "\n".join(lines)
 
 def _buys_or_sells(m_data: dict, target: str):
@@ -237,7 +328,7 @@ def _buys_or_sells(m_data: dict, target: str):
         actions = []
         if buys: actions.append("buys")
         if sells: actions.append("sells")
-        
+
         # Joins with "and/or" if both are true, otherwise just the single action
         action_str = " and ".join(actions)
         match_reason = f"market {action_str} {target}"
@@ -255,12 +346,12 @@ def find_nearest(ship_symbol: str, target: str) -> str:
     - A Type (e.g. "ASTEROID", "ENGINEERED_ASTEROID") -> Finds waypoints of this type.
     """
     import math
-    
+
     # Get Ship Location
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         return f"Error: {ship['error']}"
-    
+
     system_symbol = ship['nav']['systemSymbol']
     ship_x = ship['nav']['route']['destination']['x']
     ship_y = ship['nav']['route']['destination']['y']
@@ -272,14 +363,14 @@ def find_nearest(ship_symbol: str, target: str) -> str:
 
     candidates = []
     target = target.upper()
-    
+
     # 2. Search Logic
     market_cache = load_market_cache() # Use your existing cache loader
-    
+
     for wp in all_waypoints:
         wp_sym = wp['symbol']
         dist = math.sqrt((wp['x'] - ship_x)**2 + (wp['y'] - ship_y)**2)
-        
+
         hit = False
         match_reason = ""
 
@@ -287,7 +378,7 @@ def find_nearest(ship_symbol: str, target: str) -> str:
         if wp['type'] == target:
             hit = True
             match_reason = f"Type: {target}"
-            
+
         # Check Traits
         traits = [t['symbol'] for t in wp.get('traits', [])]
         if target in traits:
@@ -306,11 +397,11 @@ def find_nearest(ship_symbol: str, target: str) -> str:
         return f"No locations found for '{target}' in {system_symbol}."
 
     candidates.sort(key=lambda x: x[0]) # Sort by distance
-    
+
     lines = [f"Found {len(candidates)} locations for '{target}' near {ship_symbol}:"]
     for dist, sym, reason in candidates[:5]:
         lines.append(f"- {sym}: {dist:.1f} distance ({reason})")
-        
+
     return "\n".join(lines)
 
 
@@ -822,6 +913,209 @@ def orbit_ship(ship_symbol: str) -> str:
     nav = data.get("nav", {})
     return f"{ship_symbol} is now in orbit at {nav.get('waypointSymbol', '?')}."
 
+# ──────────────────────────────────────────────
+#  Navigation & Action tools
+# ──────────────────────────────────────────────
+
+def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: list, mode="CRUISE") -> list[str] | None:
+    """
+    Perform BFS to find a path from origin to target using Marketplaces as refuel stops.
+    Returns a list of waypoint symbols: [Origin, Stop1, Stop2, Target].
+    """
+    fuel_capacity = ship.get("fuel", {}).get("capacity", 0)
+    current_fuel = ship.get("fuel", {}).get("current", 0)
+
+    # 1. If solar (0 capacity), path is always direct.
+    if fuel_capacity == 0:
+        return [origin_wp['symbol'], target_wp['symbol']]
+
+    # 2. Identify potential stops (Marketplaces)
+    # Assumption: All marketplaces sell fuel.
+    potential_stops = [w for w in waypoints if "MARKETPLACE" in [t['symbol'] for t in w.get('traits', [])]]
+
+    # 3. BFS State: (current_wp_obj, path_list_of_symbols, fuel_at_current_node)
+    queue = deque([(origin_wp, [origin_wp['symbol']], current_fuel)])
+    visited = {origin_wp['symbol']}
+
+    while queue:
+        curr_node, path, fuel_available = queue.popleft()
+
+        # A. Can we reach the Final Target from here?
+        _, cost_to_target, _ = _calculate_travel_cost(ship, target_wp, curr_node, mode)
+        if cost_to_target <= fuel_available:
+            return path + [target_wp['symbol']]
+
+        # B. If not, find reachable Marketplaces to hop to
+        for stop in potential_stops:
+            if stop['symbol'] in visited:
+                continue
+
+            _, cost_to_stop, _ = _calculate_travel_cost(ship, stop, curr_node, mode)
+
+            if cost_to_stop <= fuel_available:
+                visited.add(stop['symbol'])
+                # We assume we refuel to FULL CAPACITY at the stop
+                queue.append((stop, path + [stop['symbol']], fuel_capacity))
+
+    return None
+
+def _navigate_logic(ship_symbol: str, destination_symbol: str, mode: str, execute: bool) -> tuple[str, float]:
+    """
+    Internal logic for smart navigation.
+    Returns: (Result String, Wait Seconds)
+    """
+    # 1. Fetch Ship & Config
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        return f"Error: {ship['error']}", 0.0
+
+    nav = ship.get("nav", {})
+    fuel = ship.get("fuel", {})
+    current_sys = nav.get("systemSymbol", "")
+    current_wp = nav.get("waypointSymbol", "")
+
+    if current_wp == destination_symbol:
+        return f"{ship_symbol} is already at {destination_symbol}.", 0.0
+
+    # 2. Check Inter-System Travel
+    dest_sys = "-".join(destination_symbol.split("-")[:2])
+    target_wp_symbol = destination_symbol
+    is_inter_system = False
+
+    if current_sys != dest_sys:
+        is_inter_system = True
+        waypoints = client.list_waypoints(current_sys, traits="JUMP_GATE")
+        if not waypoints:
+             return f"Error: Destination is in {dest_sys}, but no Jump Gate found in {current_sys}.", 0.0
+        target_wp_symbol = waypoints[0]['symbol']
+        if current_wp == target_wp_symbol:
+            return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
+
+    # 3. Fetch Waypoints for Pathfinding
+    waypoints = client.list_waypoints(current_sys)
+    if isinstance(waypoints, dict) and "error" in waypoints:
+        return f"Error: {waypoints['error']}", 0.0
+
+    origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
+    target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
+    if not origin_obj or not target_obj:
+        return "Error: Could not resolve waypoint coordinates.", 0.0
+
+    # 4. Planning Mode (Comparison Table)
+    if not execute:
+        lines = [f"Route Plan: {current_wp} -> {target_wp_symbol}"]
+        if is_inter_system:
+             lines.append(f"Note: {target_wp_symbol} is the Jump Gate to reach {dest_sys}.")
+
+        # Check Direct
+        dist, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, "CRUISE")
+        lines.append(f"Direct Distance: {dist}")
+
+        fuel_cap = fuel.get("capacity", 0)
+        fuel_curr = fuel.get("current", 0)
+
+        lines.append("\nFlight Modes:")
+        for m in ["CRUISE", "DRIFT", "BURN"]:
+            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode=m)
+
+            _, cost, time = _calculate_travel_cost(ship, target_obj, origin_obj, m)
+
+            status = ""
+            if fuel_cap > 0:
+                if cost <= fuel_curr:
+                    status = "✅ Direct"
+                elif path:
+                    stops = len(path) - 2 # Exclude start/end
+                    status = f"✅ Multi-hop ({stops} stops: {'->'.join(path)})"
+                else:
+                    status = f"❌ Impossible (Max range exceeded)"
+            else:
+                status = "✅ (Solar)"
+
+            lines.append(f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}")
+
+        return "\n".join(lines), 0.0
+
+    # 5. Pathfinding (Fuel Check) for Execution
+    # Calculate direct cost just to see if we need pathfinding
+    _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
+    fuel_available = fuel.get("current", 0)
+
+    next_hop = target_wp_symbol
+    is_multi_hop = False
+
+    if fuel.get("capacity", 0) > 0 and direct_cost > fuel_available:
+        # A. Try Refueling HERE first
+        market_cache = load_market_cache()
+        curr_market = market_cache.get(current_wp, {})
+        has_fuel_here = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+
+        if has_fuel_here:
+            _ensure_dock(ship_symbol)
+            client.refuel(ship_symbol)
+            ship = client.get_ship(ship_symbol) # update fuel
+            fuel_available = ship.get("fuel", {}).get("current", 0)
+
+        # B. If still not enough, find path
+        if direct_cost > fuel_available:
+            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+
+            if not path:
+                return f"Error: Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.", 0.0
+
+            # path is [Current, Stop1, Stop2, Target]
+            # We only execute the move to Stop1
+            if len(path) > 1:
+                next_hop = path[1]
+                is_multi_hop = True
+                # Recalculate time for just this leg
+                next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
+                _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
+
+    # 6. Execute Navigation
+    err = _ensure_orbit(ship_symbol)
+    if err: return err, 0.0
+
+    if nav.get("flightMode") != mode:
+        client.set_flight_mode(ship_symbol, mode)
+
+    data = client.navigate(ship_symbol, next_hop)
+    if isinstance(data, dict) and "error" in data:
+        return f"Error navigating: {data['error']}", 0.0
+
+    wait_secs = _parse_arrival(data.get("nav", {}))
+
+    result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
+    if is_multi_hop:
+        result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+    elif is_inter_system:
+        result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
+
+    return result, wait_secs
+
+@tool
+def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE") -> str:
+    """
+    [STATE: position, fuel] Smart Navigation.
+    - If destination is in another system: Routes to the Jump Gate.
+    - If destination is too far for one tank: Finds intermediate stops to refuel.
+    """
+    result, wait = _navigate_logic(ship_symbol, destination_symbol, mode, execute=True)
+    # Set the attribute on the tool object itself so get_last_wait() can find it
+    navigate_ship._last_wait = wait
+    return result
+
+# Initialize attribute
+navigate_ship._last_wait = 0.0
+
+@tool
+def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
+    """
+    [READ-ONLY] Calculate distance and fuel cost for a route.
+    Shows comparison table for CRUISE/DRIFT/BURN.
+    """
+    result, _ = _navigate_logic(ship_symbol, destination, mode, execute=False)
+    return result
 
 @tool
 def dock_ship(ship_symbol: str) -> str:
@@ -831,255 +1125,6 @@ def dock_ship(ship_symbol: str) -> str:
         return f"Error: {data['error']}"
     nav = data.get("nav", {})
     return f"{ship_symbol} is now docked at {nav.get('waypointSymbol', '?')}."
-
-
-def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE") -> tuple[int, int, int]:
-    """
-    Helper to calculate distance, fuel cost, and estimated time.
-    Returns: (distance, fuel_cost, flight_seconds)
-    """
-    import math
-    
-    # 1. Calculate Distance
-    dx = dest_wp['x'] - origin_wp['x']
-    dy = dest_wp['y'] - origin_wp['y']
-    distance = math.sqrt(dx**2 + dy**2)
-    
-    # 2. Get Ship Engine Speed (Default to 30 for Command Ships if missing)
-    # Satellites usually have speed 10, Command ships 30, Interceptors >30
-    engine_speed = ship.get('engine', {}).get('speed', 30)
-    
-    # 3. Determine Multipliers
-    # CRUISE: 1x fuel, 1x speed
-    # DRIFT:  1 fuel total, 0.1x speed (relative to current engine?) - actually Drift is usually fixed low speed
-    # BURN:   2x fuel, 2x speed 
-    # STEALTH: 1x fuel, 1x speed 
-    
-    fuel_multiplier = 1.0
-    speed_multiplier = 1.0
-    
-    # Round distance for fuel calc
-    base_fuel_cost = max(1, round(distance))
-
-    if mode == "DRIFT":
-        fuel_cost = 1 
-        # Drift is universally slow, often ignoring engine speed, but let's assume a penalty
-        # In SpaceTraders, Drift is usually ~1/10th speed or fixed low speed.
-        speed_multiplier = 0.01 # Severe penalty
-    elif mode == "BURN":
-        fuel_cost = 2 * base_fuel_cost
-        speed_multiplier = 2.0
-    else: # CRUISE or STEALTH
-        fuel_cost = base_fuel_cost
-        speed_multiplier = 1.0
-
-    # 4. Handle Solar/Probe Ships (0 Fuel Capacity)
-    fuel_capacity = ship.get('fuel', {}).get('capacity', 0)
-    if fuel_capacity == 0:
-        fuel_cost = 0  # Solar ships don't consume fuel units
-
-    # 5. Calculate Time
-    # SpaceTraders formula approximation:
-    # time = round(max(1, distance) * (Multiplier / EngineSpeed)) + 15
-    # Note: Multiplier in API docs is often "Distance / Speed" logic.
-    # The accepted formula for CRUISE is roughly: (Distance * (1 / Speed)) + 15s (cooldown/warmup)
-    
-    # Fixed formula based on observation:
-    # Travel Time = (Distance * (Multiplier / EngineSpeed) ) + 15
-    # Where Multiplier for CRUISE is usually just 1 (implied).
-    
-    # However, for accurate estimates, we use the standard formula:
-    # time = round(round(max(1, distance)) * (multiplier_const / engine_speed) + 15)
-    # multiplier_const: CRUISE=1, DRIFT=100?, BURN=0.5?
-    
-    # Let's use the empirical observation logic:
-    if mode == "BURN":
-        flight_mode_mult = 0.5 # Faster
-    elif mode == "DRIFT":
-        flight_mode_mult = 5.0 # Slower (The API might differ, but this is a safer estimate)
-    else:
-        flight_mode_mult = 1.0 # Cruise/Stealth
-
-    # Improve calculation:
-    flight_time = round((max(1, distance) * (flight_mode_mult / max(1, engine_speed/100) )) + 15)
-    
-    # Simpler heuristic that matches your log (36 distance / speed 10 satellite ≈ 113s?)
-    # 36 distance. 113s total. 15s is constant. 
-    # Travel part = 98s. 
-    # 98 / 36 = 2.72 seconds per unit.
-    # Speed 10 = ~3s per unit. Speed 30 = ~1s per unit.
-    # Formula: (Distance * (30 / Speed)) + 15
-    
-    travel_time = (distance * (30 / max(1, engine_speed)))
-    
-    if mode == "BURN":
-        travel_time /= 2
-    elif mode == "DRIFT":
-        travel_time *= 5 # Drift is significantly slower
-        
-    total_time = travel_time + 15
-    
-    return round(distance), int(fuel_cost), int(total_time)
-
-@tool
-def navigate_ship(ship_symbol: str, waypoint_symbol: str, mode: str = "CRUISE") -> str:
-    """[STATE: position, fuel] Navigate a ship to a waypoint. Auto-orbits, auto-refuels if possible.
-
-    Args:
-        ship_symbol: The ship to navigate
-        waypoint_symbol: The destination waypoint (e.g., X1-AB12-C3)
-        mode: Flight mode: CRUISE (1x fuel), DRIFT (1 fuel total), BURN (2x fuel), STEALTH (1x fuel)
-    """
-    import math
-
-    # 1. Basic Ship Checks
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        return f"Error: {ship['error']}"
-
-    mode = mode.upper()
-    valid_modes = ["CRUISE", "DRIFT", "BURN", "STEALTH"]
-    if mode not in valid_modes:
-        return f"Error: Invalid mode {mode}. Must be one of {valid_modes}"
-
-    nav = ship.get("nav", {})
-    fuel = ship.get("fuel", {})
-    current_wp_symbol = nav.get("waypointSymbol", "")
-    system_symbol = nav.get("systemSymbol", "")
-    fuel_current = fuel.get("current", 0)
-    fuel_capacity = fuel.get("capacity", 0)
-    
-    if current_wp_symbol == waypoint_symbol:
-         return f"{ship_symbol} is already at {waypoint_symbol}."
-
-    # 2. Pre-Flight Calculation & Checks
-    if fuel_capacity > 0: # Only check fuel for non-solar ships
-        waypoints = client.list_waypoints(system_symbol)
-        if isinstance(waypoints, dict) and "error" in waypoints:
-             return f"Error fetching waypoints: {waypoints['error']}"
-
-        origin = next((w for w in waypoints if w['symbol'] == current_wp_symbol), None)
-        dest = next((w for w in waypoints if w['symbol'] == waypoint_symbol), None)
-
-        if not origin or not dest:
-            return f"Error: Cannot find coordinates for route {current_wp_symbol} -> {waypoint_symbol}"
-
-        distance, fuel_cost, _ = _calculate_travel_cost(ship, dest, origin, mode)
-
-        if fuel_current < fuel_cost:
-            # Auto-refuel if current location has fuel
-            market_cache = load_market_cache()
-            current_market = market_cache.get(current_wp_symbol, {})
-            has_fuel = "FUEL" in current_market.get("exchange", []) or "FUEL" in current_market.get("exports", [])
-
-            if has_fuel:
-                # Auto-dock, refuel, re-orbit
-                dock_err = _ensure_dock(ship_symbol)
-                if dock_err:
-                    return f"Error: Auto-refuel failed (dock): {dock_err}"
-                refuel_data = client.refuel(ship_symbol)
-                if isinstance(refuel_data, dict) and "error" in refuel_data:
-                    return f"Error: Auto-refuel failed: {refuel_data['error']}"
-                orbit_err = _ensure_orbit(ship_symbol)
-                if orbit_err:
-                    return f"Error: Auto-refuel failed (re-orbit): {orbit_err}"
-                # Update fuel from refuel response
-                new_fuel = refuel_data.get("fuel", {})
-                fuel_current = new_fuel.get("current", fuel_current)
-                # Re-check if we have enough now
-                if fuel_current < fuel_cost:
-                    return (f"Error: Still not enough fuel after refueling! "
-                            f"{ship_symbol} has {fuel_current} but needs {fuel_cost} for {mode}.")
-            else:
-                err_msg = (f"Error: Not enough fuel! {ship_symbol} needs {fuel_cost} for {mode} but has {fuel_current}.\n")
-                if mode != "DRIFT":
-                    err_msg += f"Try using mode='DRIFT' (costs 1 fuel) if you are stranded, or find a fuel station."
-                return err_msg
-
-    # 3. Execution
-    err = _ensure_orbit(ship_symbol)
-    if err: return f"Error: {err}"
-
-    # Only change mode if necessary to save API calls
-    if nav.get("flightMode") != mode:
-        client.set_flight_mode(ship_symbol, mode)
-
-    data = client.navigate(ship_symbol, waypoint_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-
-    nav = data.get("nav", {})
-    fuel = data.get("fuel", {})
-    wait_secs = _parse_arrival(nav)
-
-    # Store wait time
-    navigate_ship._last_wait = wait_secs
-    
-    return (
-        f"🚀 {ship_symbol} navigating to {waypoint_symbol} ({mode}).\n"
-        f"Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} (consumed ~{fuel.get('consumed', {}).get('amount', '?')})\n"
-        f"Arrival in {int(wait_secs)}s."
-    )
-
-navigate_ship._last_wait = 0.0
-
-
-@tool
-def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
-    """[READ-ONLY] Calculate distance and fuel cost for a route. Check feasibility before flying."""
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        return f"Error: {ship['error']}"
-
-    mode = mode.upper()
-    nav = ship.get("nav", {})
-    fuel = ship.get("fuel", {})
-    current_wp_symbol = nav.get("waypointSymbol", "")
-    system_symbol = nav.get("systemSymbol", "")
-    
-    if current_wp_symbol == destination:
-        return f"Ship is already at {destination}."
-
-    waypoints = client.list_waypoints(system_symbol)
-    if isinstance(waypoints, dict) and "error" in waypoints:
-         return f"Error fetching waypoints: {waypoints['error']}"
-         
-    origin = next((w for w in waypoints if w['symbol'] == current_wp_symbol), None)
-    dest = next((w for w in waypoints if w['symbol'] == destination), None)
-
-    if not origin or not dest:
-        return f"Error finding waypoints."
-
-    # Use shared helper
-    dist, cost, time = _calculate_travel_cost(ship, dest, origin, mode)
-    
-    fuel_current = fuel.get("current", 0)
-    fuel_cap = fuel.get("capacity", 0)
-    
-    lines = [f"Route: {current_wp_symbol} → {destination} ({mode})"]
-    lines.append(f"  Distance: {dist} units")
-    lines.append(f"  Est Time: {time}s")
-    lines.append(f"  Fuel Cost: {cost}")
-    lines.append(f"  Current Fuel: {fuel_current}/{fuel_cap}")
-
-    if fuel_cap == 0:
-        lines.append(f"  Fuel Cost: 0 (Solar Powered)")
-        lines.append(f"  ✅ Feasible (Solar)")
-    else:
-        lines.append(f"  Fuel Cost: {cost}")
-        if fuel_current >= cost:
-            lines.append(f"  ✅ Feasible ({fuel_current - cost} remaining)")
-        else:
-            lines.append(f"  ❌ Insufficient Fuel (Short by {cost - fuel_current})")
-            if mode != "DRIFT":
-                lines.append(f"     Tip: Check plan_route with mode='DRIFT' (Cost: 1 fuel)")
-
-    # Show traits of destination
-    traits = [t['symbol'] for t in dest.get('traits', [])]
-    if traits:
-        lines.append(f"  Dest Traits: {', '.join(traits)}")
-
-    return "\n".join(lines)
 
 
 @tool
@@ -1241,7 +1286,7 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force
 @tool
 def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
     """[STATE: cargo] Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint."""
-    
+
     # Check source ship inventory
     safe_units, error = _get_available_units(from_ship, trade_symbol, units)
     if error:
@@ -1250,11 +1295,11 @@ def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int =
     # Ensure orbit states
     if err := _ensure_orbit(from_ship): return f"Error: {err}"
     if err := _ensure_orbit(to_ship): return f"Error: {err}"
-    
+
     data = client.transfer_cargo(from_ship, to_ship, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
-        
+
     cargo = data.get("cargo", {})
     return (
         f"Transferred {safe_units} {trade_symbol} from {from_ship} to {to_ship}.\n"

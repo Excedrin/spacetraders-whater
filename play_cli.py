@@ -102,10 +102,15 @@ def main_loop(tools_list):
     
     print("\n🚀 SPACETRADERS ENHANCED CLI")
     print("Type 'help', 'hud', or a command.")
+
+    from behaviors import get_engine
+    engine = get_engine()
     
     while True:
         try:
-            user_input = input("👉 ").strip()
+            engine.sync_state()
+
+            user_input = input("❯ ").strip()
             if not user_input: continue
             
             # Pre-processing

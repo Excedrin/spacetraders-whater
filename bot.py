@@ -55,6 +55,7 @@ MODEL = os.environ.get("MODEL", "glm-4.7-flash")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://192.168.1.171:11434")
 TOOL_TIER = int(os.environ.get("TOOL_TIER", "1"))  # 1=essential, 2=all tools
 TICK_INTERVAL = 10  # Seconds between tactical ticks (rate limit safety)
+STRATEGY_INTERVAL = 600  # 10 minutes — periodic strategic review
 
 # Context management
 MAX_RECENT_TURNS = 6  # Keep last N full turns (AIMessage + ToolMessages)
@@ -113,46 +114,44 @@ REDUNDANT_RESULT_TOOLS = {
 ENABLE_PER_ACTION_NARRATIVE = False  # Set True to generate log entry after each action
 
 SYSTEM_PROMPT = """\
-You are WHATER, Fleet Admiral of an autonomous SpaceTraders fleet.
-Ships run automated step sequences. You are called ONLY when a ship
-finishes its behavior (IDLE) or a behavior fires an ALERT.
+You are WHATER, the ambitious CEO of a SpaceTraders fleet.
+Your Goal: MAXIMIZE NET WORTH (Credits + Assets).
+Your Strategy: RAPID FLEET EXPANSION.
 
-=== EVERY CYCLE ===
+=== CORE PRIORITIES ===
+1. PROFIT IS KING: Always compare Contract payouts vs. Open Market Trading.
+   - If a contract pays poorly, ignore it and mine/trade instead.
+   - Use 'find_trades' frequently to identify high-profit routes.
+2. GROWTH: Your credits should not sit idle.
+   - 20,000 credits? Buy a mining drone or probe immediately.
+   - 100,000 credits? Buy a hauler.
+   - Keep only enough cash for fuel and trading capital.
+3. AUTOMATION: Ships should never be IDLE.
+   - Use behaviors (mining loops, trade routes) to keep ships working 24/7.
+   - Use 'mission_negotiate_contract' if you run out of contracts.
 
-STEP 1 — CHECK PLAN
-If [Current Plan] is empty or stale: call update_plan FIRST.
-A plan says ONLY: the goal, which ship runs which behavior, what to do next.
-Do NOT put ship positions, cargo, fuel, or prices in the plan.
-If [Known Markets] is NONE: call scan_system before planning.
+=== EXECUTION CYCLE ===
+STEP 1: CHECK FINANCES & FLEET
+   - Can we afford a new ship? If yes, find a shipyard and BUY ONE.
+   - Are any ships idle? Assign them work immediately.
 
-STEP 2 — ASSIGN IDLE SHIPS
-Read [Behavior Status]. Any ship NOT listed is IDLE. Create a behavior:
+STEP 2: OPTIMIZE
+   - Check [Market Intelligence]. Are there trades > 500 profit/unit?
+   - If yes, divert ships from low-paying contracts to these trades.
 
-  Mining ship (full loop with auto-sell):
-    create_behavior(ship, "mine ASTEROID ORE, goto MARKET, sell ORE, goto ASTEROID, repeat")
-  Contract delivery:
-    create_behavior(ship, "mine ASTEROID ORE, goto DEST, deliver CONTRACT ORE, goto ASTEROID, repeat")
-  Simple mining (alerts when full):
-    assign_mining_loop(ship, ASTEROID, "ORE1,ORE2")
-  Satellite:
-    assign_satellite_scout(ship) or
-    create_behavior(ship, "goto MKT1, scout, goto MKT2, scout, repeat")
+STEP 3: MAINTAIN MOMENTUM
+   - If [Contracts] is empty or full of garbage: Send a ship to HQ to negotiate new ones.
+   - If [Known Markets] is stale/empty: Send satellites to scout.
 
-STEP 3 — HANDLE ALERTS
-Read [ALERTS]. Options:
-  - resume_behavior(ship) if the issue resolved itself
-  - skip_step(ship) to skip a stuck step
-  - cancel_behavior(ship) for manual intervention, then create_behavior to restart
-
-=== SHIP TYPES ===
-EXCAVATOR/COMMAND: Burns fuel. Can mine. navigate_ship auto-refuels if fuel is available.
-SATELLITE: Solar powered, free movement. Cannot mine or trade.
+=== SHIP ROLES ===
+- COMMAND/HAULER: High cargo. Used for heavy trading and contract deliveries.
+- EXCAVATOR: Mining only. Keep in mining loops.
+- SATELLITE: Scout markets. Can also negotiate contracts if at HQ.
 
 === RULES ===
-- One action per ship per turn. Different ships CAN act in the same turn.
-- Contract goods MUST be delivered with deliver_contract. NEVER sell them.
-- Only sell where item is under Imports or Exchange.
-- cancel_behavior(ship) before manually operating a ship with a behavior.
+- NEVER manual navigate if a behavior can do it.
+- NEVER let a ship sit at 'IDLE' for more than 1 turn.
+- CONTRACT GOODS: Deliver them, do not sell them (unless the contract is bad).
 """
 
 # ──────────────────────────────────────────────
@@ -446,7 +445,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     agent info, fleet status, contracts, known markets, and strategic context.
     This is the ONLY game state injection — no separate fleet or narrative injection.
     """
-    from tools import client
+    from tools import client, find_trades
 
     sections = []
 
@@ -473,78 +472,53 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     except Exception:
         pass
 
-    # Contracts
+    # Contracts - show only active (filter out fulfilled)
     try:
         contracts = client.list_contracts()
-        if isinstance(contracts, list) and contracts:
-            lines = ["[Contracts]"]
-            for c in contracts:
-                status = "ACTIVE" if c.get('accepted') and not c.get('fulfilled') else (
-                    "FULFILLED" if c.get('fulfilled') else "AVAILABLE"
-                )
-                lines.append(f"\n{c['id']} ({c.get('type', '?')}) - {status}")
-                terms = c.get("terms", {})
-                payment = terms.get("payment", {})
-                lines.append(f"  Payment: {payment.get('onAccepted', 0)} on accept, {payment.get('onFulfilled', 0)} on fulfill")
-                for d in terms.get("deliver", []):
-                    lines.append(
-                        f"  Deliver: {d.get('unitsRequired', '?')} {d.get('tradeSymbol', '?')} "
-                        f"to {d.get('destinationSymbol', '?')} "
-                        f"({d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', '?')} done)"
-                    )
-            sections.append("\n".join(lines))
-        elif isinstance(contracts, list):
-            sections.append("[Contracts]\nNo contracts available.")
+        if isinstance(contracts, list):
+            # Filter out fulfilled contracts immediately
+            active_contracts = [c for c in contracts if not c.get('fulfilled')]
+
+            if active_contracts:
+                lines = ["[Contracts]"]
+                for c in active_contracts:
+                    status = "ACTIVE" if c.get('accepted') else "AVAILABLE"
+                    lines.append(f"\n{c['id']} ({c.get('type', '?')}) - {status}")
+                    terms = c.get("terms", {})
+                    payment = terms.get("payment", {})
+                    lines.append(f"  Payment: {payment.get('onAccepted', 0)} upfront, {payment.get('onFulfilled', 0)} on completion")
+                    for d in terms.get("deliver", []):
+                        lines.append(
+                            f"  Deliver: {d.get('unitsRequired', '?')} {d.get('tradeSymbol', '?')} "
+                            f"to {d.get('destinationSymbol', '?')} "
+                            f"({d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', '?')} done)"
+                        )
+                    # Add expiration if available to create urgency
+                    if c.get('deadlineToAccept'):
+                        lines.append(f"  Deadline to Accept: {c.get('deadlineToAccept')}")
+                sections.append("\n".join(lines))
+            else:
+                sections.append("[Contracts]\nNo active contracts. Consider negotiating a new one at HQ.")
     except Exception:
         pass
 
-    # Known markets (from cache)
-    market_cache = load_market_cache()
-    if market_cache:
-        import time
-        now = int(time.time())
-        lines = ["[Known Markets]"]
-        for wp_symbol, mdata in market_cache.items():
-            lines.append(f"\n{wp_symbol}:")
+    # Market Intelligence (Synthesized)
+    # We use find_trades to summarize opportunities instead of dumping raw data.
+    try:
+        # min_profit=10 ensures we see even low-margin routes if high ones aren't available
+        # This keeps the bot aware that markets exist and are connected.
+        trade_summary = find_trades.invoke({"min_profit": 10})
 
-            # Show structural data (stable)
-            if mdata.get("exports"):
-                lines.append(f"  Exports (sells): {', '.join(mdata['exports'])}")
-            if mdata.get("imports"):
-                lines.append(f"  Imports (buys): {', '.join(mdata['imports'])}")
-            if mdata.get("exchange"):
-                lines.append(f"  Exchange (buys and sells): {', '.join(mdata['exchange'])}")
+        # If no trades found, we still want a tiny hint that markets exist
+        if "No trade routes found" in trade_summary:
+            market_cache = load_market_cache()
+            market_count = len(market_cache)
+            sections.append(f"[Market Intelligence]\n{trade_summary}\n(Cached markets: {market_count}. Use 'view_market' or 'scan_system' to find details.)")
+        else:
+            sections.append(f"[Market Intelligence]\n{trade_summary}")
 
-            # Show price data with staleness indicator
-            if mdata.get("trade_goods"):
-                last_updated = mdata.get("last_updated")
-                if last_updated:
-                    age_seconds = now - last_updated
-                    age_minutes = age_seconds // 60
-                    if age_minutes < 5:
-                        freshness = "CURRENT"
-                    elif age_minutes < 30:
-                        freshness = f"updated {age_minutes}m ago"
-                    else:
-                        age_hours = age_minutes // 60
-                        freshness = f"STALE ({age_hours}h old)"
-                else:
-                    freshness = "unknown age"
-
-                lines.append(f"  Trade Goods ({freshness}):")
-                for g in mdata["trade_goods"]:
-                    buy_price = g.get('purchasePrice', '?')
-                    sell_price = g.get('sellPrice', '?')
-                    # Show what's important: buy price = what market PAYS you, sell price = what you PAY market
-                    lines.append(f"    {g['symbol']}: market pays {buy_price}, market sells at {sell_price}")
-            elif mdata.get("imports") or mdata.get("exports"):
-                # We know what it trades but no price data
-                lines.append(f"  Prices: UNKNOWN (send ship to orbit to get current prices)")
-
-        sections.append("\n".join(lines))
-    else:
-        # No markets known - this is CRITICAL information!
-        sections.append("[Known Markets]\nNONE - Use satellites to scout markets! You need to know what markets buy/sell before moving ships.")
+    except Exception as e:
+        sections.append(f"[Market Intelligence]\nError analyzing markets: {e}")
 
     # Current plan (from file)
     plan = load_plan()
@@ -1139,8 +1113,12 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
     iteration = start_iteration
     alert_queue: list[str] = []
     action_queue = ActionQueue()
+    last_strategy_time = time.time()
 
     while True:
+        # ── STATE SYNC ────────────────────────────────────────────────────
+        # Check if play_cli.py modified behaviors.json and reload if needed
+        behavior_engine.sync_state()
         # ── QUEUED ACTIONS ────────────────────────────────────────────────
         # Execute queued actions for ships that just became available.
         for ship_symbol in list(fleet.ships):
@@ -1176,9 +1154,28 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         # ── STRATEGIC LAYER ───────────────────────────────────────────────
         # Call the LLM only when something needs attention.
         idle_ships = behavior_engine.get_idle_ships(fleet)
+
+        # Check if it's time for a periodic strategic review
+        time_since_strategy = time.time() - last_strategy_time
+        strategic_review_needed = time_since_strategy > STRATEGY_INTERVAL
+
         has_alerts = bool(alert_queue)
 
-        if has_alerts or idle_ships:
+        # Wake up if: Alerts OR Idle Ships OR Strategic Timer
+        if has_alerts or idle_ships or strategic_review_needed:
+            # If waking up strictly for strategy, inject a prompt
+            if strategic_review_needed and not has_alerts and not idle_ships:
+                console.print(f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]")
+                # We add this to alert_queue so it gets passed to the LLM context
+                alert_queue.append(
+                    f"PERIODIC_STRATEGIC_REVIEW: It has been {int(time_since_strategy/60)} minutes since the last review. "
+                    "Analyze fleet efficiency. Are there better trade routes? Should you update the plan?"
+                )
+                # Reset timer
+                last_strategy_time = time.time()
+                # Update flag since we modified alert_queue
+                has_alerts = True
+
             if idle_ships:
                 console.print(f"  [dim]Idle ships (no behavior): {', '.join(idle_ships)}[/dim]")
 
@@ -1206,6 +1203,9 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             messages = result
             iteration += 1
             save_session(messages, iteration)
+
+            # Reset heartbeat timer if the LLM actually ran
+            last_strategy_time = time.time()
 
         time.sleep(TICK_INTERVAL)
 

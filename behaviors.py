@@ -23,12 +23,15 @@ BEHAVIORS_FILE = Path("behaviors.json")
 class StepType(Enum):
     MINE = "mine"        # mine WAYPOINT [ORE1 ORE2...] — extract until full
     GOTO = "goto"        # goto WAYPOINT — navigate, wait for arrival
+    BUY  = "buy"         # buy ITEM
     SELL = "sell"        # sell ITEM or sell * — auto-dock, sell
     DELIVER = "deliver"  # deliver CONTRACT ITEM [UNITS] — auto-dock
     REFUEL = "refuel"    # refuel — auto-dock, buy fuel
     SCOUT = "scout"      # scout — view market, save to cache
     ALERT = "alert"      # alert MESSAGE — pause, notify LLM
     REPEAT = "repeat"    # repeat — restart from step 1
+    NEGOTIATE = "negotiate" # negotiate — auto-dock, get contract
+    BUY_SHIP = "buy_ship"   #  SHIP_TYPE — auto-dock, buy ship
 
 
 @dataclass
@@ -98,6 +101,7 @@ class BehaviorEngine:
 
     def __init__(self):
         self.behaviors: dict[str, BehaviorConfig] = {}
+        self._last_mtime = 0.0  # Track file timestamp
         self._load()
 
     # ── Persistence ──────────────────────────────────────────────────────
@@ -105,6 +109,14 @@ class BehaviorEngine:
     def _load(self):
         if not BEHAVIORS_FILE.exists():
             return
+
+        # Update timestamp tracking
+        try:
+            current_mtime = BEHAVIORS_FILE.stat().st_mtime
+            self._last_mtime = current_mtime
+        except OSError:
+            pass
+
         try:
             entries = json.loads(BEHAVIORS_FILE.read_text())
             for e in entries:
@@ -188,6 +200,27 @@ class BehaviorEngine:
             ],
             indent=2,
         ))
+
+        # Update our local timestamp so we don't reload our own changes
+        try:
+            self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
+        except OSError:
+            pass
+
+    def sync_state(self):
+        """Check if file has changed on disk (e.g. by CLI) and reload if necessary."""
+        if not BEHAVIORS_FILE.exists():
+            return
+
+        try:
+            disk_mtime = BEHAVIORS_FILE.stat().st_mtime
+            # If disk file is newer than our last load/save, reload it
+            if disk_mtime > self._last_mtime:
+                log.info("Behaviors file changed on disk. Reloading...")
+                self.behaviors.clear()
+                self._load()
+        except OSError:
+            pass
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -316,6 +349,8 @@ class BehaviorEngine:
             StepType.SCOUT: self._step_scout,
             StepType.ALERT: self._step_alert,
             StepType.REPEAT: self._step_repeat,
+            StepType.NEGOTIATE: self._step_negotiate,
+            StepType.BUY_SHIP: self._step_buy_ship,
         }
 
         handler = handlers.get(step.step_type)
@@ -403,6 +438,65 @@ class BehaviorEngine:
         cfg.step_phase = "INIT"
         self._save()
         return None
+
+    def _step_buy(self, cfg, step, ship, fleet, client) -> Optional[str]:
+        """buy ITEM [UNITS] — auto-dock, purchase cargo."""
+        if not step.args:
+            return self._error(cfg, "buy requires ITEM argument")
+
+        ship_symbol = cfg.ship_symbol
+        trade_symbol = step.args[0]
+
+        # Calculate demand
+        # If arg provided (e.g. "buy FUEL 10"), use it. Otherwise fill cargo.
+        requested = int(step.args[1]) if len(step.args) > 1 else 999999
+
+        # 1. Ensure Docked
+        if ship.nav_status != "DOCKED":
+            result = client.dock(ship_symbol)
+            if isinstance(result, dict) and "error" in result:
+                return self._error(cfg, f"dock for buy failed: {result['error']}")
+            ship.nav_status = "DOCKED"
+            fleet.persist()
+
+        # 2. Check Capacity
+        # We need fresh cargo stats to be safe
+        cargo_data = client.get_cargo(ship_symbol)
+        if isinstance(cargo_data, dict) and "error" not in cargo_data:
+            ship.cargo_units = cargo_data.get("units", 0)
+            ship.cargo_capacity = cargo_data.get("capacity", 0)
+
+        available_space = ship.cargo_capacity - ship.cargo_units
+        if available_space <= 0:
+            # Cargo full? Advance. (Assumption: We already have what we need or can't buy more)
+            self._advance(cfg)
+            return None
+
+        units_to_buy = min(requested, available_space)
+        if units_to_buy <= 0:
+            self._advance(cfg)
+            return None
+
+        # 3. Execute Purchase
+        result = client.purchase_cargo(ship_symbol, trade_symbol, units_to_buy)
+
+        if isinstance(result, dict) and "error" in result:
+            err = result['error']
+            # If insufficient funds, this is a critical strategy failure -> ALERT
+            if "credits" in str(err).lower() or "funds" in str(err).lower():
+                 return self._error(cfg, f"Insufficient credits to buy {trade_symbol}: {err}")
+            return self._error(cfg, f"buy {trade_symbol} failed: {err}")
+
+        # 4. Success - Update State & Advance
+        tx = result.get("transaction", {})
+        cargo = result.get("cargo", {})
+        ship.cargo_units = cargo.get("units", ship.cargo_units)
+        fleet.persist()
+
+        self._advance(cfg)
+        # Optional: return a log string if you want specific narrative logs for trades
+        return None
+
 
     def _step_goto(self, cfg, step, ship, fleet, client) -> Optional[str]:
         """goto WAYPOINT — navigate, wait for arrival."""
@@ -582,6 +676,63 @@ class BehaviorEngine:
 
         self._advance(cfg)
         return None
+
+    def _step_negotiate(self, cfg, step, ship, fleet, client) -> Optional[str]:
+        """negotiate — auto-dock, negotiate new contract, alert."""
+        ship_symbol = cfg.ship_symbol
+
+        # 1. Ensure Docked
+        if ship.nav_status != "DOCKED":
+            result = client.dock(ship_symbol)
+            if isinstance(result, dict) and "error" in result:
+                return self._error(cfg, f"dock for negotiation failed: {result['error']}")
+            ship.nav_status = "DOCKED"
+            fleet.persist()
+
+        # 2. Negotiate
+        result = client.negotiate_contract(ship_symbol)
+        if isinstance(result, dict) and "error" in result:
+            return self._error(cfg, f"negotiation failed: {result['error']}")
+
+        # 3. Alert the Human/LLM
+        contract = result.get("contract", {})
+        c_id = contract.get("id", "?")
+        payment = contract.get("terms", {}).get("payment", {}).get("onAccepted", 0)
+
+        # We pause here so the LLM can review the contract terms in the next turn
+        cfg.paused = True
+        cfg.alert_sent = True
+        self._save()
+
+        return f"{ship_symbol} NEGOTIATED contract {c_id} (upfront: {payment}). Review terms in [Contracts] and accept if profitable."
+
+    def _step_buy_ship(self, cfg, step, ship, fleet, client) -> Optional[str]:
+        """buy_ship SHIP_TYPE — auto-dock, buy ship, alert."""
+        if not step.args:
+            return self._error(cfg, "buy_ship requires SHIP_TYPE argument")
+
+        ship_type = step.args[0]
+        ship_symbol = cfg.ship_symbol
+
+        # 1. Ensure Docked
+        if ship.nav_status != "DOCKED":
+            client.dock(ship_symbol)
+            ship.nav_status = "DOCKED"
+            fleet.persist()
+
+        # 2. buy_ship
+        # Note: buy_ship_ship endpoint requires the *current waypoint*, not the ship symbol
+        wp = ship.location
+        result = client.buy_ship_ship(ship_type, wp)
+
+        if isinstance(result, dict) and "error" in result:
+            return self._error(cfg, f"buy_ship {ship_type} failed: {result['error']}")
+
+        # 3. Advance (Success)
+        new_ship = result.get("ship", {})
+        self._advance(cfg)
+        return f"{ship_symbol} Bought new ship {new_ship.get('symbol')} ({ship_type})!"
+
 
     def _step_alert(self, cfg, step, ship, fleet, client) -> Optional[str]:
         """alert MESSAGE — pause and notify LLM."""
