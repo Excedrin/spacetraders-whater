@@ -1148,6 +1148,11 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         # Tick all ship behaviors. Fast — no LLM involved.
         for ship_symbol in list(fleet.ships):
             alert = behavior_engine.tick(ship_symbol, fleet, client)
+            # Log behavior step execution
+            cfg = behavior_engine.behaviors.get(ship_symbol)
+            if cfg and cfg.last_action:
+                status_color = "red" if "ERROR" in cfg.last_action else "dim green"
+                console.print(f"  [{status_color}]⚙ {ship_symbol}: {cfg.last_action}[/{status_color}]")
             if alert and alert not in alert_queue:
                 alert_queue.append(alert)
 

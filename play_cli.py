@@ -1,11 +1,12 @@
-import sys
-import shlex
 import inspect
 import readline
+import shlex
 import traceback
-from langchain_core.tools import BaseTool
+
 from bot import gather_game_state
 from ship_status import FleetTracker
+from tools import get_engine, ALL_TOOLS
+
 
 def get_arg_type_hints(func):
     """Extracts type hints from the underlying function of a Tool."""
@@ -103,7 +104,6 @@ def main_loop(tools_list):
     print("\n🚀 SPACETRADERS ENHANCED CLI")
     print("Type 'help', 'hud', or a command.")
 
-    from behaviors import get_engine
     engine = get_engine()
     
     while True:
@@ -173,9 +173,8 @@ def main_loop(tools_list):
                         continue
                     except ValueError:
                         pass
-                    
-                    # For string args, uppercase them
-                    final_args.append(arg.upper())
+
+                    final_args.append(arg)
 
                 # Convert to types via your existing parse logic
                 # (You can reuse the parse_and_run function from previous iterations)
@@ -207,6 +206,4 @@ def main_loop(tools_list):
             exit()
 
 if __name__ == "__main__":
-    # Import your tools here
-    from tools import ALL_TOOLS
     main_loop(ALL_TOOLS)

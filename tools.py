@@ -34,13 +34,13 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     import time
     cache = load_market_cache()
     entry = cache.get(waypoint_symbol, {})
-    
+
     # Structural data
     for section in ("exports", "imports", "exchange"):
         items = data.get(section, [])
         if items:
             entry[section] = [i["symbol"] for i in items]
-            
+
     # Price data
     trade_goods = data.get("tradeGoods", [])
     if trade_goods:
@@ -54,7 +54,7 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
             for g in trade_goods
         ]
         entry["last_updated"] = int(time.time())
-        
+
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -70,7 +70,7 @@ def _ensure_orbit_logic(ship_symbol: str) -> None:
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
-    
+
     status = ship.get("nav", {}).get("status", "")
     if status == "IN_ORBIT":
         return
@@ -87,7 +87,7 @@ def _ensure_dock_logic(ship_symbol: str) -> None:
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
-    
+
     status = ship.get("nav", {}).get("status", "")
     if status == "DOCKED":
         return
@@ -253,12 +253,12 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
         raise Exception(ship['error'])
-        
+
     nav = ship.get("nav", {})
     fuel = ship.get("fuel", {})
     current_sys = nav.get("systemSymbol", "")
     current_wp = nav.get("waypointSymbol", "")
-    
+
     if current_wp == destination_symbol:
         return f"{ship_symbol} is already at {destination_symbol}.", 0.0
 
@@ -266,7 +266,7 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     dest_sys = "-".join(destination_symbol.split("-")[:2])
     target_wp_symbol = destination_symbol
     is_inter_system = False
-    
+
     if current_sys != dest_sys:
         is_inter_system = True
         waypoints = client.list_waypoints(current_sys, traits="JUMP_GATE")
@@ -280,7 +280,7 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     waypoints = client.list_waypoints(current_sys)
     if isinstance(waypoints, dict) and "error" in waypoints:
         raise Exception(waypoints['error'])
-        
+
     origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
     target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
     if not origin_obj or not target_obj:
@@ -298,7 +298,7 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
             market_cache = load_market_cache()
             curr_market = market_cache.get(current_wp, {})
             has_fuel_here = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
-            
+
             if has_fuel_here:
                 _ensure_dock_logic(ship_symbol)
                 client.refuel(ship_symbol)
@@ -310,7 +310,7 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
                 path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
                 if not path:
                     raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
-                
+
                 if len(path) > 1:
                     next_hop = path[1]
                     is_multi_hop = True
@@ -321,21 +321,21 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         _ensure_orbit_logic(ship_symbol)
         if nav.get("flightMode") != mode:
             client.set_flight_mode(ship_symbol, mode)
-            
+
         data = client.navigate(ship_symbol, next_hop)
         if isinstance(data, dict) and "error" in data:
             raise Exception(f"Error navigating: {data['error']}")
-            
+
         wait_secs = _parse_arrival(data.get("nav", {}))
         result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
-        
+
         if is_multi_hop:
             result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
         elif is_inter_system:
             result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
-            
+
         return result, wait_secs
-    
+
     else:
         # Planning Mode (Read Only)
         # ... (simplified from previous tools.py for brevity) ...
@@ -353,23 +353,23 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
              return f"Cooldown remaining: {remaining}s", float(remaining)
 
     _ensure_orbit_logic(ship_symbol)
-    
+
     data = client.extract(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         # Handle API error 4000 (Cooldown) specifically if API returns it as error
         if "cooldown" in str(data['error']).lower():
-             # Fallback guess 
-             return "Hit cooldown", 70.0 
+             # Fallback guess
+             return "Hit cooldown", 70.0
         raise Exception(data['error'])
 
     extraction = data.get("extraction", {})
     cd = data.get("cooldown", {})
     cargo = data.get("cargo", {})
     yielded = extraction.get("yield", {})
-    
+
     result = f"Extracted {yielded.get('units', '?')} {yielded.get('symbol', '?')}."
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
-    
+
     return result, float(cd.get("remainingSeconds", 0))
 
 def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
@@ -383,17 +383,17 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
     cargo_data = client.get_cargo(ship_symbol)
     if isinstance(cargo_data, dict) and "error" in cargo_data:
         raise Exception(f"Error checking cargo: {cargo_data['error']}")
-        
+
     inventory = cargo_data.get("inventory", [])
     available = 0
     for item in inventory:
         if item.get("symbol") == trade_symbol:
             available = item.get("units", 0)
             break
-            
+
     if available == 0:
         raise Exception(f"Ship {ship_symbol} has no {trade_symbol}.")
-        
+
     final_units = available if units is None else min(units, available)
 
     # 3. Action
@@ -401,17 +401,114 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
     data = client.sell_cargo(ship_symbol, trade_symbol, final_units)
     if isinstance(data, dict) and "error" in data:
         raise Exception(data['error'])
-        
+
     tx = data.get("transaction", {})
     cargo = data.get("cargo", {})
     return f"Sold {tx.get('units', final_units)} {trade_symbol} for {tx.get('totalPrice', '?')} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
+
+def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+    """Buy cargo from the current market. Returns (message, total_cost)."""
+    # 1. Check available cargo space
+    cargo_data = client.get_cargo(ship_symbol)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        raise Exception(f"Error checking cargo: {cargo_data['error']}")
+
+    capacity = cargo_data.get("capacity", 0)
+    current_units = cargo_data.get("units", 0)
+    available_space = capacity - current_units
+
+    if available_space <= 0:
+        raise Exception(f"Ship {ship_symbol} cargo is full ({current_units}/{capacity}). No space for purchase.")
+
+    # 2. Determine units to purchase (default to fill remaining space)
+    final_units = available_space if units is None else min(units, available_space)
+
+    # 3. Action
+    _ensure_dock_logic(ship_symbol)
+    data = client.buy_cargo(ship_symbol, trade_symbol, final_units)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data['error'])
+
+    tx = data.get("transaction", {})
+    cargo = data.get("cargo", {})
+    return f"Purchased {tx.get('units', final_units)} {trade_symbol} for {tx.get('totalPrice', '?')} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
+
+
+def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+    """
+    Smart delivery: automatically calculates optimal units to deliver.
+    Respects: contract requirements, cargo available, and explicit unit request.
+    """
+    # 1. Fetch contract to see remaining units needed
+    contracts = client.list_contracts()
+    if not isinstance(contracts, list):
+        raise Exception("Could not fetch contracts")
+
+    contract = None
+    for c in contracts:
+        if c.get("id") == contract_id:
+            contract = c
+            break
+
+    if not contract:
+        raise Exception(f"Contract {contract_id} not found")
+
+    if contract.get("fulfilled"):
+        raise Exception(f"Contract {contract_id} is already fulfilled")
+
+    # Find the delivery requirement for this trade symbol
+    remaining_needed = 0
+    for d in contract.get("terms", {}).get("deliver", []):
+        if d.get("tradeSymbol") == trade_symbol:
+            remaining_needed = d.get("unitsRequired", 0) - d.get("unitsFulfilled", 0)
+            break
+
+    if remaining_needed <= 0:
+        raise Exception(f"Contract {contract_id} does not need any more {trade_symbol}")
+
+    # 2. Check how much cargo is available
+    cargo_data = client.get_cargo(ship_symbol)
+    if isinstance(cargo_data, dict) and "error" in cargo_data:
+        raise Exception(f"Error checking cargo: {cargo_data['error']}")
+
+    available = 0
+    for item in cargo_data.get("inventory", []):
+        if item.get("symbol") == trade_symbol:
+            available = item.get("units", 0)
+            break
+
+    if available <= 0:
+        raise Exception(f"Ship {ship_symbol} has no {trade_symbol} to deliver")
+
+    # 3. Calculate final delivery amount
+    # Priority: contract remaining < cargo available < explicit units request
+    if units is None:
+        final_units = min(available, remaining_needed)
+    else:
+        final_units = min(units, available, remaining_needed)
+
+    # 4. Deliver
+    _ensure_dock_logic(ship_symbol)
+    data = client.deliver_contract(contract_id, ship_symbol, trade_symbol, final_units)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data['error'])
+
+    # Return summary
+    contract = data.get("contract", {})
+    terms = contract.get("terms", {})
+    result = f"Delivered {final_units} {trade_symbol} to contract {contract_id}."
+    for d in terms.get("deliver", []):
+        if d.get("tradeSymbol") == trade_symbol:
+            result += f" Progress: {d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', 0)}"
+    return result
+
 
 def _refuel_ship_logic(ship_symbol: str) -> str:
     _ensure_dock_logic(ship_symbol)
     data = client.refuel(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         raise Exception(data['error'])
-    
+
     fuel = data.get("fuel", {})
     tx = data.get("transaction", {})
     return f"Refueled {ship_symbol}. Fuel: {fuel.get('current')}/{fuel.get('capacity')}. Cost: {tx.get('totalPrice', '?')} cr."
@@ -423,12 +520,14 @@ def _refuel_ship_logic(ship_symbol: str) -> str:
 class StepType(Enum):
     MINE = "mine"
     GOTO = "goto"
+    BUY = "buy"
     SELL = "sell"
     DELIVER = "deliver"
     REFUEL = "refuel"
     SCOUT = "scout"
     ALERT = "alert"
     REPEAT = "repeat"
+    STOP = "stop"
     NEGOTIATE = "negotiate"
     BUY_SHIP = "buy_ship"
 
@@ -464,6 +563,7 @@ class BehaviorConfig:
     paused: bool = False
     error_message: str = ""
     alert_sent: bool = False
+    last_action: str = ""  # Track most recent action for logging
 
 _engine_instance: Optional["BehaviorEngine"] = None
 
@@ -501,6 +601,7 @@ class BehaviorEngine:
                             paused=e.get("paused", False),
                             error_message=e.get("error_message", ""),
                             alert_sent=e.get("alert_sent", False),
+                            last_action=e.get("last_action", ""),
                         )
                         self.behaviors[cfg.ship_symbol] = cfg
                     except ValueError: continue
@@ -517,6 +618,7 @@ class BehaviorEngine:
                 "paused": c.paused,
                 "error_message": c.error_message,
                 "alert_sent": c.alert_sent,
+                "last_action": c.last_action,
             }
             for c in self.behaviors.values()
         ]
@@ -537,7 +639,7 @@ class BehaviorEngine:
             steps = parse_steps(steps_str)
         except ValueError as e: return f"Error: {e}"
         if not steps: return "Error: no steps provided"
-        
+
         clamped = max(0, min(start_step, len(steps) - 1))
         self.behaviors[ship_symbol] = BehaviorConfig(
             ship_symbol=ship_symbol,
@@ -586,47 +688,58 @@ class BehaviorEngine:
         return f"Skipped step for {ship_symbol}."
 
     def tick(self, ship_symbol: str, fleet, client) -> Optional[str]:
-        """Returns alert string if needed."""
+        """
+        Tick one behavior step for a ship.
+        Returns alert string if needed (alert/error/pause condition).
+        Returns None if step executed normally or ship unavailable.
+        """
         cfg = self.behaviors.get(ship_symbol)
         if not cfg or cfg.paused: return None
-        
+
         ship = fleet.get_ship(ship_symbol)
         if not ship or not ship.is_available(): return None
 
         if cfg.current_step_index >= len(cfg.steps):
             cfg.current_step_index = 0
             cfg.step_phase = "INIT"
-            
+
         step = cfg.steps[cfg.current_step_index]
-        
+        step_display = f"{step.step_type.value} {' '.join(step.args)}".strip()
+
         try:
-            if step.step_type == StepType.MINE: return self._step_mine(cfg, step, ship, fleet)
-            elif step.step_type == StepType.GOTO: return self._step_goto(cfg, step, ship, fleet)
-            elif step.step_type == StepType.SELL: return self._step_sell(cfg, step, ship, fleet)
-            elif step.step_type == StepType.REFUEL: return self._step_refuel(cfg, step, ship, fleet)
-            elif step.step_type == StepType.DELIVER: return self._step_deliver(cfg, step, ship, fleet)
-            elif step.step_type == StepType.SCOUT: return self._step_scout(cfg, step, ship, fleet)
-            elif step.step_type == StepType.REPEAT: return self._step_repeat(cfg)
-            elif step.step_type == StepType.ALERT: return self._step_alert(cfg, step)
-            # Add others as needed
+            result = None
+            if step.step_type == StepType.MINE: result = self._step_mine(cfg, step, ship, fleet)
+            elif step.step_type == StepType.GOTO: result = self._step_goto(cfg, step, ship, fleet)
+            elif step.step_type == StepType.BUY: result = self._step_buy(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SELL: result = self._step_sell(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REFUEL: result = self._step_refuel(cfg, step, ship, fleet)
+            elif step.step_type == StepType.DELIVER: result = self._step_deliver(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SCOUT: result = self._step_scout(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REPEAT: result = self._step_repeat(cfg)
+            elif step.step_type == StepType.STOP: result = self._step_stop(cfg)
+            elif step.step_type == StepType.ALERT: result = self._step_alert(cfg, step)
+            # Store last action for logging
+            cfg.last_action = f"step {cfg.current_step_index + 1}: {step_display}"
+            self._save()
+            return result
         except Exception as e:
             cfg.error_message = str(e)
             cfg.paused = True
+            cfg.last_action = f"step {cfg.current_step_index + 1}: {step_display} [ERROR: {str(e)}]"
             self._save()
             return f"{ship_symbol} ERROR: {e}"
-        return None
 
     # ── Step Handlers using CORE LOGIC ───────────────────────────────────
 
     def _step_goto(self, cfg, step, ship, fleet) -> Optional[str]:
         """Smart navigation using _navigate_ship_logic."""
         dest_wp = step.args[0]
-        
+
         if cfg.step_phase == "INIT":
             if ship.location == dest_wp and ship.nav_status != "IN_TRANSIT":
                 self._advance(cfg)
                 return None
-            
+
             try:
                 # Calls the SMART logic (auto-refuel, etc)
                 msg, wait = _navigate_ship_logic(cfg.ship_symbol, dest_wp)
@@ -638,7 +751,7 @@ class BehaviorEngine:
             except Exception as e:
                 raise e # Caught by tick
             return None
-            
+
         if cfg.step_phase == "WAITING":
             if ship.location == dest_wp or ship.nav_status != "IN_TRANSIT":
                 self._advance(cfg)
@@ -656,23 +769,26 @@ class BehaviorEngine:
                 if wait > 0:
                     fleet.set_transit(cfg.ship_symbol, wait)
                 # We don't change phase to WAITING here because we want to loop back to INIT
-                # until we are actually at the location. 
+                # until we are actually at the location.
                 # Better: Use a sub-state or just let the next tick handle transit cooldown.
                 return None
-            
+
             cfg.step_phase = "EXTRACTING"
             self._save()
             return None
 
         if cfg.step_phase == "EXTRACTING":
             if ship.cargo_capacity > 0 and ship.cargo_units >= ship.cargo_capacity:
-                self._advance(cfg)
-                return None
-            
+                # Alert operator when cargo is full — don't silently advance
+                cfg.paused = True
+                cfg.alert_sent = True
+                self._save()
+                return f"{cfg.ship_symbol} ALERT: Cargo full at {ship.location}. Define a sell/deliver step or manually empty cargo."
+
             msg, wait = _extract_ore_logic(cfg.ship_symbol)
             if wait > 0:
                 fleet.set_extraction_cooldown(cfg.ship_symbol, wait)
-            
+
             # Auto-Jettison Logic (simplified)
             if ore_types:
                 # We need fresh cargo data to know what to trash
@@ -687,7 +803,7 @@ class BehaviorEngine:
         # Get inventory
         c = client.get_cargo(cfg.ship_symbol)
         inventory = c.get("inventory", [])
-        
+
         sold_something = False
         for item in inventory:
             sym = item["symbol"]
@@ -699,7 +815,23 @@ class BehaviorEngine:
                 except Exception as e:
                     # If target is *, ignore failures (e.g. contract goods)
                     if target != "*": raise e
-        
+
+        self._advance(cfg)
+        return None
+
+    def _step_buy(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Buy cargo from current market. Usage: buy TRADE_SYMBOL [UNITS]"""
+        if not step.args:
+            raise Exception("buy step requires trade symbol (e.g., 'buy IRON_ORE 10')")
+
+        trade_symbol = step.args[0]
+        units = int(step.args[1]) if len(step.args) > 1 else None
+
+        try:
+            _buy_cargo_logic(cfg.ship_symbol, trade_symbol, units)
+        except Exception as e:
+            raise e
+
         self._advance(cfg)
         return None
 
@@ -708,12 +840,21 @@ class BehaviorEngine:
             _refuel_ship_logic(cfg.ship_symbol)
         self._advance(cfg)
         return None
-        
+
     def _step_deliver(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Deliver cargo for a contract. Usage: deliver CONTRACT_ID ITEM [UNITS]"""
+        if len(step.args) < 2:
+            raise Exception("deliver step requires contract_id and trade_symbol (e.g., 'deliver CONT001 DIAMONDS 5')")
+
         contract_id = step.args[0]
         trade_symbol = step.args[1]
-        _ensure_dock_logic(cfg.ship_symbol)
-        client.deliver_contract(contract_id, cfg.ship_symbol, trade_symbol, 999999)
+        units = int(step.args[2]) if len(step.args) > 2 else None
+
+        try:
+            _deliver_contract_logic(contract_id, cfg.ship_symbol, trade_symbol, units)
+        except Exception as e:
+            raise e
+
         self._advance(cfg)
         return None
 
@@ -738,6 +879,11 @@ class BehaviorEngine:
         cfg.current_step_index = 0
         cfg.step_phase = "INIT"
         self._save()
+        return None
+
+    def _step_stop(self, cfg) -> Optional[str]:
+        """End the behavior and return ship to IDLE (manual control)."""
+        self.cancel(cfg.ship_symbol)
         return None
 
     def _advance(self, cfg):
@@ -1520,6 +1666,15 @@ def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bo
 
 
 @tool
+def buy_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+    """[STATE: cargo, credits] Buy cargo from current market. Auto-docks. Fills remaining cargo space by default."""
+    try:
+        return _buy_cargo_logic(ship_symbol, trade_symbol, units)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@tool
 def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
     """[STATE: cargo] Jettison cargo into space. Refuses to jettison contract goods unless force=True."""
     if not force:
@@ -1746,21 +1901,20 @@ def set_flight_mode(ship_symbol: str, mode: str) -> str:
 
 
 @tool
-def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> str:
-    """[STATE: cargo, contract] Deliver goods for a contract. Auto-docks. Ship must be at delivery waypoint."""
+def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+    """[STATE: cargo, contract] Deliver goods for a contract. Auto-docks. Intelligently calculates optimal delivery amount.
+
+    If units is specified, delivers that amount (capped by contract requirements and available cargo).
+    If units is omitted, delivers as much as possible (limited by contract requirements and cargo available).
+
+    Example:
+      deliver_contract("cmm6x17d5jc5dui6zvdoudt2o", "WHATER-1", "DIAMONDS")  # Deliver all available DIAMONDS (up to contract limit)
+      deliver_contract("cmm6x17d5jc5dui6zvdoudt2o", "WHATER-1", "DIAMONDS", 5)  # Deliver 5 (or less if not enough)
+    """
     try:
-        _ensure_dock_logic(ship_symbol)
+        return _deliver_contract_logic(contract_id, ship_symbol, trade_symbol, units)
     except Exception as e:
         return f"Error: {e}"
-    data = client.deliver_contract(contract_id, ship_symbol, trade_symbol, units)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    contract = data.get("contract", {})
-    terms = contract.get("terms", {})
-    lines = [f"Delivered {units} {trade_symbol} for contract {contract_id}."]
-    for d in terms.get("deliver", []):
-        lines.append(f"  {d['tradeSymbol']}: {d['unitsFulfilled']}/{d['unitsRequired']} delivered")
-    return "\n".join(lines)
 
 
 @tool
@@ -1955,18 +2109,20 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
     Steps (comma-separated):
       mine WAYPOINT [ORE1 ORE2]  - Navigate to asteroid, mine until cargo full, jettison non-targets
       goto WAYPOINT              - Navigate to waypoint, wait for arrival
+      buy ITEM [UNITS]           - Buy cargo from current market (fills remaining space by default)
       sell ITEM or sell *         - Sell cargo at current market (skips contract goods)
-      deliver CONTRACT ITEM [N]  - Deliver cargo for contract
+      deliver CONTRACT ITEM [N]  - Deliver cargo for contract (smart: auto-caps at contract remaining + cargo available)
       refuel                     - Refuel at current market
       scout                      - View market prices at current location
       alert MESSAGE              - Pause and alert you
       repeat                     - Restart from step 1
+      stop                       - End behavior, return ship to IDLE (manual control)
 
     Args:
         start_step: Step index to begin at (0-based). Use to spread multiple ships
                     across the same sequence so they don't converge on the first step.
 
-    Example: "mine X1-AST IRON_ORE, goto X1-MKT, sell IRON_ORE, goto X1-AST, repeat"
+    Example: "goto X1-MKT, buy IRON_ORE, goto X1-HUB, sell IRON_ORE, stop"
     """
     result = get_engine().assign(ship_symbol, steps, start_step=start_step)
     return result
@@ -2081,7 +2237,7 @@ TIER_1_TOOLS = [
     # Navigation & planning
     navigate_ship, refuel_ship, plan_route,
     # Trading & cargo
-    sell_cargo, transfer_cargo, jettison_cargo,
+    buy_cargo, sell_cargo, transfer_cargo, jettison_cargo,
     # Contracts
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Info (view_market includes shipyard data)
@@ -2103,7 +2259,7 @@ ALL_TOOLS = [
     # Mining & resources
     extract_ore, survey_asteroid,
     # Trading & cargo
-    sell_cargo, jettison_cargo, transfer_cargo,
+    buy_cargo, sell_cargo, jettison_cargo, transfer_cargo,
     # Contracts
     accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
     # Ships & shipyard
@@ -2123,7 +2279,7 @@ ALL_TOOLS = [
 
 # Tools that are "significant" actions worth narrating
 SIGNIFICANT_TOOLS = {
-    "extract_ore", "survey_asteroid", "navigate_ship", "sell_cargo", "jettison_cargo",
+    "extract_ore", "survey_asteroid", "navigate_ship", "buy_cargo", "sell_cargo", "jettison_cargo",
     "transfer_cargo", "accept_contract", "fulfill_contract", "negotiate_contract",
     "purchase_ship", "refuel_ship", "dock_ship", "orbit_ship", "deliver_contract",
     "scan_waypoints", "scan_ships", "chart_waypoint", "jump_ship", "warp_ship",

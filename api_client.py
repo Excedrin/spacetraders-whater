@@ -20,6 +20,12 @@ class SpaceTradersClient:
         if method == "POST" and "json" not in kwargs:
             kwargs["json"] = {}
 
+        # Debug: log the request (especially useful for POST with contract operations)
+        import sys
+        if "json" in kwargs and kwargs["json"]:
+            print(f"[API] {method} {path}", file=sys.stderr)
+            print(f"      Payload: {kwargs['json']}", file=sys.stderr)
+
         last_err = None
         for attempt in range(retries):
             try:
@@ -153,6 +159,12 @@ class SpaceTradersClient:
 
     def sell_cargo(self, ship: str, symbol: str, units: int) -> dict:
         return self._request("POST", f"/my/ships/{ship}/sell", json={
+            "symbol": symbol,
+            "units": units,
+        })
+
+    def buy_cargo(self, ship: str, symbol: str, units: int) -> dict:
+        return self._request("POST", f"/my/ships/{ship}/purchase", json={
             "symbol": symbol,
             "units": units,
         })
