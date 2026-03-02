@@ -1055,29 +1055,75 @@ class BehaviorEngine:
     # ── Step Handlers using CORE LOGIC ───────────────────────────────────
 
     def _step_goto(self, cfg, step, ship, fleet) -> Optional[str]:
-        """Smart navigation using _navigate_ship_logic."""
+        """Smart navigation: Loops until ship reaches final destination. Auto-refuels."""
         dest_wp = step.args[0]
+        # Optional mode argument: goto WAYPOINT [MODE]
+        mode = step.args[1] if len(step.args) > 1 else "CRUISE"
 
-        if cfg.step_phase == "INIT":
-            if ship.location == dest_wp and ship.nav_status != "IN_TRANSIT":
-                self._advance(cfg)
-                return None
-
-            try:
-                # Calls the SMART logic (auto-refuel, etc)
-                msg, wait = _navigate_ship_logic(cfg.ship_symbol, dest_wp)
-                if wait > 0:
-                    fleet.set_transit(cfg.ship_symbol, wait)
-                    ship.location = dest_wp # Optimistic update
-                cfg.step_phase = "WAITING"
-                self._save()
-            except Exception as e:
-                raise e # Caught by tick
+        # 1. Check if we have arrived at the FINAL destination
+        # We assume ship.location is accurate if we just refreshed (handled in WAITING phase)
+        if ship.location == dest_wp and ship.nav_status != "IN_TRANSIT":
+            self._advance(cfg)
             return None
 
+        # 2. INIT Phase: Prepare to move
+        if cfg.step_phase == "INIT":
+            # A. Check Refuel Needs (Critical for multi-hop intermediate stops)
+            # If we are docked (likely from previous hop arrival) and need fuel
+            if ship.fuel_capacity > 0:
+                try:
+                    # Heuristic: only refuel if we can't make a generic jump or are low
+                    # But easiest is: if we are at a fuel market, just top up.
+                    market_cache = load_market_cache()
+                    curr_market = market_cache.get(ship.location, {})
+                    # Check imports/exchange for FUEL
+                    has_fuel = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+
+                    if has_fuel and ship.fuel_current < ship.fuel_capacity:
+                        _refuel_ship_logic(cfg.ship_symbol)
+                except Exception:
+                    pass # Ignore refuel errors (maybe no credits or no market), try to fly anyway
+
+            # B. Navigate to next hop
+            try:
+                # _navigate_ship_logic handles the pathfinding for the NEXT hop
+                # It returns the wait time for the IMMEDIATE hop, not total travel
+                msg, wait = _navigate_ship_logic(cfg.ship_symbol, dest_wp, mode=mode)
+
+                if wait > 0:
+                    fleet.set_transit(cfg.ship_symbol, wait)
+                    # IMPORTANT: Do NOT optimistically set location to dest_wp here.
+                    # We might only be going to an intermediate stop.
+                    # We will rely on API refresh in WAITING phase to update location.
+
+                cfg.step_phase = "WAITING"
+                self._save()
+                return None
+            except Exception as e:
+                # If we get an error (e.g. stranded), pause and alert
+                raise e
+
+        # 3. WAITING Phase: Ship is moving
         if cfg.step_phase == "WAITING":
-            if ship.is_available() and (ship.location == dest_wp or ship.nav_status != "IN_TRANSIT"):
-                self._advance(cfg)
+            if ship.is_available():
+                # Timer expired. REFRESH STATE FROM API to confirm where we are.
+                # This fixes the "hanging out at intermediate stop" bug.
+                real_ship = client.get_ship(cfg.ship_symbol)
+                if isinstance(real_ship, dict) and "error" not in real_ship:
+                    fleet.update_from_api([real_ship])
+                    # Update local ref since fleet updated the object in place or replaced it
+                    ship = fleet.get_ship(cfg.ship_symbol)
+
+                if ship.nav_status != "IN_TRANSIT":
+                    # We have finished the transit.
+                    if ship.location == dest_wp:
+                        # Arrived at final destination
+                        self._advance(cfg)
+                    else:
+                        # Arrived at intermediate stop (or drift finished).
+                        # Loop back to INIT to refuel and calculate next hop.
+                        cfg.step_phase = "INIT"
+                        self._save()
             return None
 
     def _step_mine(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -2197,10 +2243,47 @@ def orbit_ship(ship_symbol: str) -> str:
 def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE") -> str:
     """
     [STATE: position, fuel] Smart Navigation.
-    - If destination is in another system: Routes to the Jump Gate.
-    - If destination is too far for one tank: Finds intermediate stops to refuel.
+    - If destination is close: Navigates directly.
+    - If destination requires multi-hop: ENGAGES AUTOPILOT (assigns a temporary 'goto' behavior).
+    The ship will automatically refuel and hop until it reaches the destination.
     """
     try:
+        # 1. Check if this requires multi-hop
+        ship = client.get_ship(ship_symbol)
+        if isinstance(ship, dict) and "error" in ship:
+            return f"Error: {ship['error']}"
+
+        nav = ship.get("nav", {})
+        current_wp = nav.get("waypointSymbol", "")
+        if current_wp == destination_symbol:
+            return f"{ship_symbol} is already at {destination_symbol}."
+
+        # Fetch route details without executing to check distance/hops
+        # We assume standard CRUISE for calculation if mode not specified
+        waypoints = client.list_waypoints(nav.get("systemSymbol"))
+        origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
+        target_obj = next((w for w in waypoints if w['symbol'] == destination_symbol), None)
+
+        if origin_obj and target_obj:
+            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+
+            # 2. If multi-hop route found (length > 2 means Origin -> Stop -> Dest), assign behavior
+            if path and len(path) > 2:
+                engine = get_engine()
+                # Create a "One-Shot" behavior: Go to destination, then Stop (return to manual)
+                # We use the behavior engine's robustness to handle the hops/refueling
+                cmds = f"goto {destination_symbol} {mode}, stop"
+
+                # Check if ship already has a behavior we shouldn't overwrite?
+                # For now, we assume explicit tool call overrides existing behavior
+                engine.assign(ship_symbol, cmds)
+
+                stops = len(path) - 2
+                return (f"🚀 AUTOPILOT ENGAGED for {ship_symbol}. Multi-hop route detected ({stops} stops).\n"
+                        f"Assigned behavior: '{cmds}'\n"
+                        f"Ship will auto-refuel and travel to {destination_symbol}. check 'view_ships' for progress.")
+
+        # 3. If direct route or simple jump, just execute standard logic
         msg, wait = _navigate_ship_logic(ship_symbol, destination_symbol, mode, execute=True)
         navigate_ship._last_wait = wait
         return msg

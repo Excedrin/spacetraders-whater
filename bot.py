@@ -1209,7 +1209,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         has_alerts = bool(alert_queue)
 
         # Wake up if: Alerts OR Idle Ships OR Strategic Timer
-        if has_alerts or idle_ships or strategic_review_needed:
+        if False and (has_alerts or idle_ships or strategic_review_needed):
             # If waking up strictly for strategy, inject a prompt
             if strategic_review_needed and not has_alerts and not idle_ships:
                 console.print(f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]")
