@@ -17,15 +17,56 @@ class SpaceTradersClient:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
+        # Simple in-memory cache: {path: (timestamp, data)}
+        self._cache = {}
+        self._cache_ttl = 2.0  # Seconds to trust a cached GET response
 
     def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
+        # 1. READ CACHE (GET only)
+        if method == "GET":
+            cached = self._cache.get(path)
+            if cached:
+                ts, data = cached
+                if time.time() - ts < self._cache_ttl:
+                    # Debug: Uncomment to see cache hits
+                    # print(f"[CACHE] HIT {path}", file=sys.stderr)
+                    return data
+                else:
+                    # Expired
+                    del self._cache[path]
+
+        # 2. PERFORM REQUEST
         if method == "POST" and "json" not in kwargs:
             kwargs["json"] = {}
 
         print(f"[API] {method} {path}", file=sys.stderr)
-        # Debug: log the request (especially useful for POST with contract operations)
         if "json" in kwargs and kwargs["json"]:
             print(f"      Payload: {kwargs['json']}", file=sys.stderr)
+
+        # 3. INVALIDATION (Write operations)
+        # If we change state (POST/PATCH), we must assume related GETs are stale.
+        if method in ["POST", "PATCH", "DELETE"]:
+            # Logic: If I modify '/my/ships/WHATER-1/refuel',
+            # I must invalidate '/my/ships/WHATER-1' and '/my/ships' and '/my/agent'
+
+            # Always invalidate agent (credits change on almost everything)
+            self._cache.pop("/my/agent", None)
+
+            # If acting on a ship, invalidate that ship and the ship list
+            if "/my/ships" in path:
+                self._cache.pop("/my/ships", None) # Invalidate full list
+
+                # Try to extract ship ID to invalidate specific entry
+                # Path usually looks like: /my/ships/WHATER-1/navigate
+                parts = path.split("/")
+                # parts = ['', 'my', 'ships', 'WHATER-1', 'navigate']
+                if len(parts) >= 4:
+                    ship_path = f"/{parts[1]}/{parts[2]}/{parts[3]}" # /my/ships/WHATER-1
+                    self._cache.pop(ship_path, None)
+                    # Also invalidate cargo/cooldown specific sub-paths
+                    self._cache.pop(f"{ship_path}/cargo", None)
+                    self._cache.pop(f"{ship_path}/cooldown", None)
+                    self._cache.pop(f"{ship_path}/nav", None)
 
         last_err = None
         for attempt in range(retries):
@@ -56,7 +97,14 @@ class SpaceTradersClient:
             body = resp.json()
             if "error" in body:
                 return {"error": body["error"].get("message", str(body["error"]))}
-            return body.get("data", body)
+
+            data = body.get("data", body)
+
+            # 4. WRITE CACHE (GET only, Success only)
+            if method == "GET":
+                self._cache[path] = (time.time(), data)
+
+            return data
 
         return {"error": f"Connection failed after {retries} attempts: {last_err}"}
 

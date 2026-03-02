@@ -349,15 +349,21 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     # Execute Logic
     if execute:
         # 1. SMART REFUEL AT DEPARTURE
-        # Only refuel if the current market sells fuel — avoids extra API calls
-        # (and rate-limit pressure) when fuel is not available here.
+        # Only refuel if the current market sells fuel AND we are not full.
         if fuel.get("capacity", 0) > 0:
             market_cache = load_market_cache()
             curr_market = market_cache.get(current_wp, {})
-            if "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", []):
+            has_fuel = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+
+            # FIX: Added check (fuel_current < fuel_capacity) to prevent 0-unit refuel spam
+            current_fuel = fuel.get("current", 0)
+            capacity_fuel = fuel.get("capacity", 0)
+
+            if has_fuel and current_fuel < capacity_fuel:
                 try:
                     _ensure_dock_logic(ship_symbol)
                     client.refuel(ship_symbol)
+                    # Update local objects so pathfinding knows we are full
                     ship = client.get_ship(ship_symbol)
                     fuel = ship.get("fuel", {})
                 except Exception:
@@ -1068,39 +1074,20 @@ class BehaviorEngine:
 
         # 2. INIT Phase: Prepare to move
         if cfg.step_phase == "INIT":
-            # A. Check Refuel Needs (Critical for multi-hop intermediate stops)
-            # If we are docked (likely from previous hop arrival) and need fuel
-            if ship.fuel_capacity > 0:
-                try:
-                    # Heuristic: only refuel if we can't make a generic jump or are low
-                    # But easiest is: if we are at a fuel market, just top up.
-                    market_cache = load_market_cache()
-                    curr_market = market_cache.get(ship.location, {})
-                    # Check imports/exchange for FUEL
-                    has_fuel = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+            # REMOVED: Redundant "Check Refuel Needs" block.
+            # _navigate_ship_logic (called below) handles "Refuel at Departure" automatically.
 
-                    if has_fuel and ship.fuel_current < ship.fuel_capacity:
-                        _refuel_ship_logic(cfg.ship_symbol)
-                except Exception:
-                    pass # Ignore refuel errors (maybe no credits or no market), try to fly anyway
-
-            # B. Navigate to next hop
+            # Navigate to next hop
             try:
-                # _navigate_ship_logic handles the pathfinding for the NEXT hop
-                # It returns the wait time for the IMMEDIATE hop, not total travel
                 msg, wait = _navigate_ship_logic(cfg.ship_symbol, dest_wp, mode=mode)
 
                 if wait > 0:
                     fleet.set_transit(cfg.ship_symbol, wait)
-                    # IMPORTANT: Do NOT optimistically set location to dest_wp here.
-                    # We might only be going to an intermediate stop.
-                    # We will rely on API refresh in WAITING phase to update location.
 
                 cfg.step_phase = "WAITING"
                 self._save()
                 return None
             except Exception as e:
-                # If we get an error (e.g. stranded), pause and alert
                 raise e
 
         # 3. WAITING Phase: Ship is moving
@@ -2831,14 +2818,14 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", 
 
 
 @tool
-def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, start_step: int = 0) -> str:
-    """[STATE: behavior] Assign a permanent buying and selling loop.
+def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, one_shot: bool = False, start_step: int = 0) -> str:
+    """[STATE: behavior] Assign a buying and selling route.
     The ship will:
     1. Go to buy_waypoint
     2. Buy the specified good (attempt to fill cargo) (automatically sets max price)
     3. Go to sell_waypoint
     4. Sell the good (automatically sets min price)
-    5. Repeat until the market prices make the trade unprofitable.
+    5. Repeat (or stop if one_shot=True).
     Smart navigation handles refueling automatically.
     Args:
         ship_symbol: The hauler ship.
@@ -2846,6 +2833,7 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
         buy_good: The symbol to trade (e.g., 'SHIP_PARTS').
         sell_waypoint: Where to sell.
         sell_good: Optional. Defaults to buy_good. Use if refining/transforming, otherwise leave empty.
+        one_shot: If True, run once and stop (return to idle). If False, repeat indefinitely.
     """
     s_good = sell_good if sell_good else buy_good
     cache = load_market_cache()
@@ -2872,7 +2860,8 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
                 sell_step = f"sell {s_good} min:{min_sell}"
             break
 
-    steps_str = f"goto {buy_waypoint}, {buy_step}, goto {sell_waypoint}, {sell_step}, repeat"
+    end_step = "stop" if one_shot else "repeat"
+    steps_str = f"goto {buy_waypoint}, {buy_step}, goto {sell_waypoint}, {sell_step}, {end_step}"
     return get_engine().assign(ship_symbol, steps_str, start_step)
 
 
