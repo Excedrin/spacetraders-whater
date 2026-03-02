@@ -131,12 +131,13 @@ Before accepting a contract or assigning a behavior, perform this calculation:
 1. Call 'find_trades' to see current market opportunities.
 2. Compare [Trade Profit/Unit * Cargo Capacity] vs [Contract Fulfillment Bonus].
 3. DECISION:
-   - If Trade Profit is higher: IGNORE THE CONTRACT. Assign a trading loop.
+   - If Trade Profit is higher: IGNORE THE CONTRACT. Assign a trade route.
    - If Contract is higher: Focus on the contract.
    - *Example:* Do not mine Diamonds for 200/unit if 'find_trades' shows Ship Parts profit of 15,000/unit.
 
 === BEHAVIOR CONSTRUCTION ===
 Use 'create_behavior' to automate ships. Syntax is a comma-separated string of steps.
+assign_trade_route is preferable because it automatically sets max cost and min sale price.
 
 PATTERN: MINING LOOP
   String: "mine ASTEROID_WAYPOINT [ORE1 ORE2], transfer HAULER-1 *, repeat"

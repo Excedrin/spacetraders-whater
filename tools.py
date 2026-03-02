@@ -982,6 +982,14 @@ class BehaviorEngine:
             lines.append(f"  {cfg.ship_symbol}: step {step_idx + 1}/{len(cfg.steps)} [{current_step}] ({status})")
         return "\n".join(lines)
 
+    def pause(self, ship_symbol: str) -> str:
+        cfg = self.behaviors.get(ship_symbol)
+        if not cfg: return f"{ship_symbol} has no assigned behavior."
+        if cfg.paused: return f"{ship_symbol} is already paused."
+        cfg.paused = True
+        self._save()
+        return f"Paused {ship_symbol} at step {cfg.current_step_index + 1}/{len(cfg.steps)}."
+
     def resume(self, ship_symbol: str) -> str:
         cfg = self.behaviors.get(ship_symbol)
         if not cfg or not cfg.paused: return "Nothing to resume."
@@ -2692,6 +2700,12 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
 
 
 @tool
+def pause_behavior(ship_symbol: str) -> str:
+    """[STATE: behavior] Pause a ship's behavior without advancing. Resume with resume_behavior when ready."""
+    return get_engine().pause(ship_symbol)
+
+
+@tool
 def resume_behavior(ship_symbol: str) -> str:
     """[STATE: behavior] Resume a paused behavior after handling an alert. Advances past the alert step."""
     return get_engine().resume(ship_symbol)
@@ -2738,10 +2752,10 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
     """[STATE: behavior] Assign a permanent buying and selling loop.
     The ship will:
     1. Go to buy_waypoint
-    2. Buy the specified good (fills cargo)
+    2. Buy the specified good (attempt to fill cargo) (automatically sets max price)
     3. Go to sell_waypoint
-    4. Sell the good
-    5. Repeat forever
+    4. Sell the good (automatically sets min price)
+    5. Repeat until the market prices make the trade unprofitable.
     Smart navigation handles refueling automatically.
     Args:
         ship_symbol: The hauler ship.
@@ -2863,7 +2877,7 @@ TIER_1_TOOLS = [
     # Planning
     update_plan,
     # Behavior control
-    resume_behavior, skip_step, cancel_behavior,
+    resume_behavior, skip_step, cancel_behavior, pause_behavior,
     assign_mining_loop, assign_satellite_scout, assign_trade_route,
     create_behavior,
 ]
@@ -2894,7 +2908,7 @@ ALL_TOOLS = [
     # Analysis
     find_trades,
     # Behavior control
-    create_behavior, resume_behavior, skip_step, cancel_behavior,
+    create_behavior, resume_behavior, skip_step, cancel_behavior, pause_behavior,
     assign_mining_loop, assign_satellite_scout, assign_trade_route,
 ]
 
