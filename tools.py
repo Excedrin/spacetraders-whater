@@ -91,6 +91,35 @@ def _ensure_orbit_logic(ship_symbol: str) -> None:
     if status == "IN_TRANSIT":
         raise Exception(f"{ship_symbol} is currently in transit")
 
+class PriceFloorHit(Exception):
+    """Raised when market price drops below minimum acceptable price."""
+    def __init__(self, trade_symbol, current_price, min_price, sold, revenue):
+        self.trade_symbol = trade_symbol
+        self.current_price = current_price
+        self.min_price = min_price
+        self.sold = sold
+        self.revenue = revenue
+        super().__init__(f"{trade_symbol} price {current_price} dropped below floor {min_price}. Sold {sold} for {revenue} cr before stopping.")
+
+class PriceCeilingHit(Exception):
+    """Raised when market price exceeds maximum acceptable buy price."""
+    def __init__(self, trade_symbol, current_price, max_price, bought, spent):
+        self.trade_symbol = trade_symbol
+        self.current_price = current_price
+        self.max_price = max_price
+        self.bought = bought
+        self.spent = spent
+        super().__init__(f"{trade_symbol} price {current_price} exceeded ceiling {max_price}. Bought {bought} for {spent} cr before stopping.")
+
+class MinQtyNotMet(Exception):
+    """Raised when buy step could not acquire the minimum required quantity."""
+    def __init__(self, trade_symbol, bought, min_qty, reason=""):
+        self.trade_symbol = trade_symbol
+        self.bought = bought
+        self.min_qty = min_qty
+        self.reason = reason
+        super().__init__(f"{trade_symbol}: only bought {bought} (need at least {min_qty}). {reason}".strip())
+
 def _ensure_dock_logic(ship_symbol: str) -> None:
     """Raises Exception if fails."""
     ship = client.get_ship(ship_symbol)
@@ -319,15 +348,20 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
 
     # Execute Logic
     if execute:
-        # 1. AUTO-REFUEL AT DEPARTURE
+        # 1. SMART REFUEL AT DEPARTURE
+        # Only refuel if the current market sells fuel — avoids extra API calls
+        # (and rate-limit pressure) when fuel is not available here.
         if fuel.get("capacity", 0) > 0:
-            try:
-                _ensure_dock_logic(ship_symbol)
-                client.refuel(ship_symbol)
-                ship = client.get_ship(ship_symbol)
-                fuel = ship.get("fuel", {})
-            except Exception:
-                pass
+            market_cache = load_market_cache()
+            curr_market = market_cache.get(current_wp, {})
+            if "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", []):
+                try:
+                    _ensure_dock_logic(ship_symbol)
+                    client.refuel(ship_symbol)
+                    ship = client.get_ship(ship_symbol)
+                    fuel = ship.get("fuel", {})
+                except Exception:
+                    pass
 
         _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
         fuel_available = fuel.get("current", 0)
@@ -358,6 +392,11 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
             raise Exception(f"Error navigating: {data['error']}")
 
         wait_secs = _parse_arrival(data.get("nav", {}))
+        # Navigate was called — transit MUST be > 0. If _parse_arrival returned 0
+        # (e.g. arrival already past due to latency, or missing nav data),
+        # fall back to the calculated estimate so transit always registers.
+        if wait_secs <= 0:
+            wait_secs = max(float(direct_time), 1.0)
         result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
 
         if is_multi_hop:
@@ -443,7 +482,7 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
     return result, float(cd.get("remainingSeconds", 0))
 
-def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False, min_price: int = None) -> str:
     # 1. Check Contract Safety
     if not force:
         contract_goods = _get_contract_goods()
@@ -505,17 +544,21 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
         total_revenue += tx.get("totalPrice", 0)
         sell_count += 1
 
+        if min_price and sell_count > 0:
+            price_per_unit = tx.get("pricePerUnit", 0)
+            if price_per_unit < min_price:
+                raise PriceFloorHit(trade_symbol, price_per_unit, min_price, total_sold, total_revenue)
+
     cargo = data.get("cargo", {})
     if sell_count > 1:
         return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr ({sell_count} transactions). Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
     else:
         return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
 
-def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
-    """Buy cargo from the current market. Intelligently splits purchases across multiple transactions if needed.
+def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max_price: int = None, min_qty: int = None) -> str:
+    """Buy cargo from the current market. Splits purchases across multiple transactions if needed.
 
-    Checks market cache for max trade volume per transaction, then makes multiple purchases if necessary.
-    Respects cargo capacity and market transaction limits.
+    Respects cargo capacity, credits available, market transaction limits, and optional price/quantity guards.
     """
     # Get ship location and initial cargo state
     ship = client.get_ship(ship_symbol)
@@ -537,20 +580,33 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> 
     if available_space <= 0:
         raise Exception(f"Ship {ship_symbol} cargo is full ({current_units}/{capacity}). No space for purchase.")
 
-    # Determine target amount
+    # Determine target amount (cargo-limited)
     target_units = available_space if units is None else min(units, available_space)
 
-    # Look up max transaction volume from market cache
+    # Look up cached price + trade volume for this good
     market_cache = load_market_cache()
     max_per_transaction = target_units  # Default: try to buy full amount
+    cached_price = None
     if waypoint in market_cache:
-        trade_goods = market_cache[waypoint].get("trade_goods", [])
-        for good in trade_goods:
+        for good in market_cache[waypoint].get("trade_goods", []):
             if good.get("symbol") == trade_symbol:
                 vol = good.get("tradeVolume")
                 if vol and vol > 0:
                     max_per_transaction = vol
+                cached_price = good.get("purchasePrice")
                 break
+
+    # Cap by affordability using cached price + current credits
+    agent = client.get_agent()
+    credits = agent.get("credits") if isinstance(agent, dict) and "error" not in agent else None
+    if credits is not None and cached_price and cached_price > 0:
+        affordable = credits // cached_price
+        if affordable <= 0:
+            reason = f"Insufficient credits ({credits} cr, need {cached_price} cr/unit)."
+            if min_qty:
+                raise MinQtyNotMet(trade_symbol, 0, min_qty, reason)
+            raise Exception(f"Cannot afford {trade_symbol}: {reason}")
+        target_units = min(target_units, affordable)
 
     # Ensure dock
     _ensure_dock_logic(ship_symbol)
@@ -559,6 +615,7 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> 
     total_purchased = 0
     total_cost = 0
     purchase_count = 0
+    stop_reason = ""
 
     while total_purchased < target_units:
         # Refresh cargo to check current space
@@ -571,26 +628,30 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None) -> 
         if available_space <= 0:
             break  # Cargo full
 
-        # Buy up to the max per transaction
         units_to_buy = min(max_per_transaction, available_space, target_units - total_purchased)
 
         data = client.buy_cargo(ship_symbol, trade_symbol, units_to_buy)
 
         if isinstance(data, dict) and "error" in data:
-            # If first attempt failed, stop
             if purchase_count == 0:
                 raise Exception(data['error'])
-            # If we already got some cargo, return success with what we have
+            stop_reason = data['error']
             break
 
-        # Transaction succeeded
         tx = data.get("transaction", {})
         units_bought = tx.get("units", units_to_buy)
-        price = tx.get("totalPrice", 0)
-
+        price_per_unit = tx.get("pricePerUnit", 0)
         total_purchased += units_bought
-        total_cost += price
+        total_cost += tx.get("totalPrice", 0)
         purchase_count += 1
+
+        if max_price and price_per_unit > max_price:
+            raise PriceCeilingHit(trade_symbol, price_per_unit, max_price, total_purchased, total_cost)
+
+    # Check minimum quantity requirement
+    if min_qty and total_purchased < min_qty:
+        reason = stop_reason or f"cargo space or credits limited purchase to {total_purchased}"
+        raise MinQtyNotMet(trade_symbol, total_purchased, min_qty, reason)
 
     # Get final cargo state
     cargo_data = client.get_cargo(ship_symbol)
@@ -780,6 +841,16 @@ class Step:
         if self.args: return f"{self.step_type.value} {' '.join(self.args)}"
         return self.step_type.value
 
+def _refresh_market_cache(waypoint: str) -> None:
+    """Fetch live market data for a waypoint and update the cache. Silent on error."""
+    system = "-".join(waypoint.split("-")[:2])
+    try:
+        data = client.get_market(system, waypoint)
+        if data and isinstance(data, dict) and "error" not in data:
+            _save_market_to_cache(waypoint, data)
+    except Exception:
+        pass
+
 def parse_steps(steps_str: str) -> list[Step]:
     steps = []
     for part in steps_str.split(","):
@@ -899,13 +970,15 @@ class BehaviorEngine:
         return [s for s in fleet.ships if s not in self.behaviors]
 
     def summary(self) -> str:
-        if not self.behaviors: return "(no behaviors assigned -- all ships idle)"
+        if not self.behaviors:
+            return "(no behaviors assigned -- all ships idle)"
         lines = []
         for cfg in self.behaviors.values():
             step_idx = cfg.current_step_index
             current_step = cfg.steps[step_idx] if step_idx < len(cfg.steps) else "?"
             status = "PAUSED" if cfg.paused else cfg.step_phase
-            if cfg.error_message: status = f"ERROR: {cfg.error_message}"
+            if cfg.error_message:
+                status = f"ERROR: {cfg.error_message}"
             lines.append(f"  {cfg.ship_symbol}: step {step_idx + 1}/{len(cfg.steps)} [{current_step}] ({status})")
         return "\n".join(lines)
 
@@ -995,7 +1068,7 @@ class BehaviorEngine:
             return None
 
         if cfg.step_phase == "WAITING":
-            if ship.location == dest_wp or ship.nav_status != "IN_TRANSIT":
+            if ship.is_available() and (ship.location == dest_wp or ship.nav_status != "IN_TRANSIT"):
                 self._advance(cfg)
             return None
 
@@ -1058,6 +1131,15 @@ class BehaviorEngine:
 
     def _step_sell(self, cfg, step, ship, fleet) -> Optional[str]:
         target = step.args[0] if step.args else "*"
+        # Parse min:PRICE from args
+        min_price = None
+        for arg in step.args[1:]:
+            if arg.startswith("min:"):
+                min_price = int(arg[4:])
+                break
+        # Refresh market cache before selling so prices are current
+        if ship.location:
+            _refresh_market_cache(ship.location)
         # Get inventory
         c = client.get_cargo(cfg.ship_symbol)
         inventory = c.get("inventory", [])
@@ -1067,9 +1149,13 @@ class BehaviorEngine:
             sym = item["symbol"]
             if target == "*" or sym == target:
                 try:
-                    # Logic function handles contract checks
-                    _sell_cargo_logic(cfg.ship_symbol, sym)
+                    _sell_cargo_logic(cfg.ship_symbol, sym, min_price=min_price)
                     sold_something = True
+                except PriceFloorHit as e:
+                    cfg.paused = True
+                    cfg.alert_sent = True
+                    self._save()
+                    return f"{cfg.ship_symbol} ALERT: {e}"
                 except Exception as e:
                     # If target is *, ignore failures (e.g. contract goods)
                     if target != "*": raise e
@@ -1078,17 +1164,36 @@ class BehaviorEngine:
         return None
 
     def _step_buy(self, cfg, step, ship, fleet) -> Optional[str]:
-        """Buy cargo from current market. Usage: buy TRADE_SYMBOL [UNITS]"""
+        """Buy cargo from current market. Usage: buy TRADE_SYMBOL [UNITS] [max:PRICE] [min_qty:N]"""
         if not step.args:
             raise Exception("buy step requires trade symbol (e.g., 'buy IRON_ORE 10')")
 
+        # Refresh market cache before buying so affordability check uses current prices
+        if ship.location:
+            _refresh_market_cache(ship.location)
+
         trade_symbol = step.args[0]
-        units = int(step.args[1]) if len(step.args) > 1 else None
+        units = None
+        max_price = None
+        min_qty = None
+        for arg in step.args[1:]:
+            if arg.startswith("max:"):
+                max_price = int(arg[4:])
+            elif arg.startswith("min_qty:"):
+                min_qty = int(arg[8:])
+            else:
+                try:
+                    units = int(arg)
+                except ValueError:
+                    pass
 
         try:
-            _buy_cargo_logic(cfg.ship_symbol, trade_symbol, units)
-        except Exception as e:
-            raise e
+            _buy_cargo_logic(cfg.ship_symbol, trade_symbol, units, max_price=max_price, min_qty=min_qty)
+        except (PriceCeilingHit, MinQtyNotMet) as e:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: {e}"
 
         self._advance(cfg)
         return None
@@ -1139,10 +1244,7 @@ class BehaviorEngine:
 
     def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
         if not ship.location: raise Exception("No location")
-        sys = "-".join(ship.location.split("-")[:2])
-        m = client.get_market(sys, ship.location)
-        if m and "error" not in m:
-            _save_market_to_cache(ship.location, m)
+        _refresh_market_cache(ship.location)
         self._advance(cfg)
         return None
 
@@ -1805,57 +1907,73 @@ def view_shipyard(waypoint_symbol: str) -> str:
 
 @tool
 def view_market(waypoint_symbol: str) -> str:
-    """View market prices and shipyard info at a waypoint. Shows trade goods, imports/exports, and ships for sale if a shipyard is present. You need a ship present to see exact prices.
+    """View market prices and shipyard info at a waypoint. Always returns complete info:
+    live prices if a ship is present, otherwise cached prices with staleness indicator.
 
     Args:
         waypoint_symbol: Waypoint with market (e.g., 'X1-KD26-B7')
     """
-    # Extract system from waypoint (e.g., 'X1-KD26-B7' -> 'X1-KD26')
+    import time
     system_symbol = '-'.join(waypoint_symbol.split('-')[:2])
+    lines = [f"Market at {waypoint_symbol}:"]
 
-    lines = []
-
-    # Market data
+    # Try live API data (succeeds with full prices only when a ship is present)
+    api_data = None
+    api_error = None
     try:
-        data = client.get_market(system_symbol, waypoint_symbol)
+        result = client.get_market(system_symbol, waypoint_symbol)
+        if isinstance(result, dict) and "error" in result:
+            api_error = result["error"]
+        elif result:
+            api_data = result
+            _save_market_to_cache(waypoint_symbol, api_data)
     except Exception as e:
-        return f"Error calling get_market: {str(e)}"
+        api_error = str(e)
 
-    if data is None:
-        lines.append(f"API returned None for market at {waypoint_symbol}")
-    elif isinstance(data, dict) and "error" in data:
-        lines.append(f"Error getting market at {waypoint_symbol}: {data['error']}")
-    elif isinstance(data, dict):
-        # Check if data is completely empty
-        if not data:
-            lines.append(f"Market API returned empty dict for {waypoint_symbol}")
-        else:
-            try:
-                lines.append(f"Market at {waypoint_symbol}:")
-                has_data = False
-                for section, label in [("exports", "Exports"), ("imports", "Imports"), ("exchange", "Exchange")]:
-                    items = data.get(section, [])
-                    if items:
-                        has_data = True
-                        lines.append(f"  {label}: {', '.join(i['symbol'] for i in items)}")
-                trade_goods = data.get("tradeGoods", [])
-                if trade_goods:
-                    has_data = True
-                    lines.append("  Trade goods (with prices):")
-                    for g in trade_goods:
-                        lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} "
-                                      f"(volume: {g.get('tradeVolume', '?')})")
+    live_trade_goods = api_data.get("tradeGoods", []) if api_data else []
 
-                if not has_data:
-                    lines.append(f"  (No market data available - may need ship in orbit to see prices)")
+    # Load cache for structural info and fallback prices
+    cache = load_market_cache()
+    cached = cache.get(waypoint_symbol, {})
 
-                # Cache market data for future reference
-                _save_market_to_cache(waypoint_symbol, data)
-            except Exception as e:
-                lines.append(f"Error processing market data: {str(e)}")
-                lines.append(f"Raw data keys: {list(data.keys())}")
+    # Imports / Exports / Exchange — prefer live, fall back to cache
+    if api_data:
+        for section, label in [("exports", "Exports"), ("imports", "Imports"), ("exchange", "Exchange")]:
+            items = api_data.get(section, [])
+            if items:
+                lines.append(f"  {label}: {', '.join(i['symbol'] if isinstance(i, dict) else i for i in items)}")
+    elif cached:
+        for section, label in [("exports", "Exports"), ("imports", "Imports"), ("exchange", "Exchange")]:
+            items = cached.get(section, [])
+            if items:
+                lines.append(f"  {label}: {', '.join(items)}")
+
+    # Price data — live if available, else cached with age
+    if live_trade_goods:
+        lines.append("  Prices (live):")
+        for g in live_trade_goods:
+            lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
     else:
-        lines.append(f"Unexpected data type from API: {type(data)}")
+        cached_goods = cached.get("trade_goods", [])
+        if cached_goods:
+            last_updated = cached.get("last_updated")
+            if last_updated:
+                age_sec = int(time.time()) - last_updated
+                if age_sec < 3600:
+                    age_str = f"{age_sec // 60}m ago"
+                elif age_sec < 86400:
+                    age_str = f"{age_sec // 3600}h ago"
+                else:
+                    age_str = f"{age_sec // 86400}d ago"
+            else:
+                age_str = "age unknown"
+            lines.append(f"  Prices (cached, {age_str}):")
+            for g in cached_goods:
+                lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
+        else:
+            lines.append("  No price data (no ship present, nothing cached).")
+            if api_error:
+                lines.append(f"  API error: {api_error}")
 
     # Shipyard data (if present at same waypoint)
     try:
@@ -1872,10 +1990,7 @@ def view_market(waypoint_symbol: str) -> str:
             else:
                 lines.append("  No ship details available (need a ship present to see prices).")
     except Exception:
-        pass  # Shipyard not present, that's OK
-
-    if not lines:
-        return f"No data available for {waypoint_symbol} (API returned nothing)"
+        pass
 
     return "\n".join(lines)
 
@@ -2418,8 +2533,8 @@ def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) 
 
         for tg in trade_goods:
             sym = tg["symbol"]
-            buy_cost = tg.get("sellPrice")       # what you PAY the market
-            sell_revenue = tg.get("purchasePrice")  # what market PAYS you
+            buy_cost = tg.get("purchasePrice")       # what you PAY the market
+            sell_revenue = tg.get("sellPrice")  # what market PAYS you
 
             if sym in source_goods and buy_cost is not None:
                 sources.setdefault(sym, []).append((wp, buy_cost, tg.get("tradeVolume", 0)))
@@ -2555,8 +2670,10 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
     Steps (comma-separated):
       mine WAYPOINT [ORE1 ORE2]  - Navigate to asteroid, mine until cargo full, jettison non-targets
       goto WAYPOINT              - Navigate to waypoint, wait for arrival
-      buy ITEM [UNITS]           - Buy cargo from current market (fills remaining space by default)
-      sell ITEM or sell *         - Sell cargo at current market (skips contract goods)
+      buy ITEM [UNITS] [max:PRICE] [min_qty:N] - Buy cargo from current market (fills remaining space by default).
+                               max:PRICE stops and alerts if price per unit exceeds limit.
+                               min_qty:N alerts if fewer than N units could be purchased.
+      sell ITEM [min:PRICE]       - Sell cargo at current market (skips contract goods). min:PRICE sets a price floor — stops selling if price drops below
       deliver CONTRACT ITEM [N]  - Deliver cargo for contract (smart: auto-caps at contract remaining + cargo available)
       refuel                     - Refuel at current market
       scout                      - View market prices at current location
@@ -2600,7 +2717,7 @@ def cancel_behavior(ship_symbol: str) -> str:
 
 
 @tool
-def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") -> str:
+def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", start_step: int = 0) -> str:
     """[STATE: behavior] Convenience: assign a mine-sell loop. Builds a step sequence internally.
 
     Args:
@@ -2613,11 +2730,11 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "") 
     mine_part = f"mine {asteroid_wp} {ore_str}".strip()
     # Simple mine loop: mine until full, then alert for LLM to handle selling
     steps_str = f"{mine_part}, alert cargo full, repeat"
-    return get_engine().assign(ship_symbol, steps_str)
+    return get_engine().assign(ship_symbol, steps_str, start_step)
 
 
 @tool
-def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None) -> str:
+def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, start_step: int = 0) -> str:
     """[STATE: behavior] Assign a permanent buying and selling loop.
     The ship will:
     1. Go to buy_waypoint
@@ -2634,9 +2751,32 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
         sell_good: Optional. Defaults to buy_good. Use if refining/transforming, otherwise leave empty.
     """
     s_good = sell_good if sell_good else buy_good
-    # Steps: goto BUY, buy ITEM, goto SELL, sell ITEM, repeat
-    steps_str = f"goto {buy_waypoint}, buy {buy_good}, goto {sell_waypoint}, sell {s_good}, repeat"
-    return get_engine().assign(ship_symbol, steps_str)
+    cache = load_market_cache()
+
+    # Buy step: alert if price spikes more than 10% above the expected purchase price
+    buy_step = f"buy {buy_good}"
+    buy_market = cache.get(buy_waypoint, {})
+    for good in buy_market.get("trade_goods", []):
+        if good.get("symbol") == buy_good:
+            buy_cost = good.get("purchasePrice")
+            if buy_cost:
+                max_buy = int(buy_cost * 1.10)
+                buy_step = f"buy {buy_good} max:{max_buy}"
+            break
+
+    # Sell step: alert if price drops more than 10% below the expected sell price
+    sell_step = f"sell {s_good}"
+    sell_market = cache.get(sell_waypoint, {})
+    for good in sell_market.get("trade_goods", []):
+        if good.get("symbol") == s_good:
+            sell_price = good.get("sellPrice")
+            if sell_price:
+                min_sell = int(sell_price * 0.90)
+                sell_step = f"sell {s_good} min:{min_sell}"
+            break
+
+    steps_str = f"goto {buy_waypoint}, {buy_step}, goto {sell_waypoint}, {sell_step}, repeat"
+    return get_engine().assign(ship_symbol, steps_str, start_step)
 
 
 @tool

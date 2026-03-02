@@ -183,19 +183,45 @@ def main_loop(tools_list):
                 # Convert to types via your existing parse logic
                 # (You can reuse the parse_and_run function from previous iterations)
                 try:
-                    # Quick parsing logic
+                    # Split into positional args and key=value kwargs
+                    positional = []
+                    kwargs = {}
+                    for arg in final_args:
+                        if "=" in arg and not arg.startswith("="):
+                            k, _, v = arg.partition("=")
+                            kwargs[k] = v
+                        else:
+                            positional.append(arg)
+
+                    def _coerce(val, annotation):
+                        if annotation == int or annotation == "int":
+                            return int(val)
+                        elif annotation == bool:
+                            return str(val).lower() in ('true', '1', 'yes')
+                        elif annotation == float:
+                            return float(val)
+                        return val
+
+                    param_map = {p.name: p for p in params}
+
+                    # Map positional args to params (skip params already in kwargs)
                     converted_args = {}
-                    for i, param in enumerate(params):
-                        if i >= len(final_args): break
-                        val = final_args[i]
-                        
-                        if param.annotation == int or param.annotation == "int":
-                            val = int(val)
-                        elif param.annotation == bool:
-                            val = str(val).lower() == 'true'
-                        
-                        converted_args[param.name] = val
-                    
+                    pos_idx = 0
+                    for param in params:
+                        if param.name in kwargs:
+                            continue
+                        if pos_idx >= len(positional):
+                            break
+                        converted_args[param.name] = _coerce(positional[pos_idx], param.annotation)
+                        pos_idx += 1
+
+                    # Merge and coerce kwargs
+                    for k, v in kwargs.items():
+                        if k not in param_map:
+                            print(f"⚠️  Unknown parameter '{k}' — ignored")
+                            continue
+                        converted_args[k] = _coerce(v, param_map[k].annotation)
+
                     print(f"⏳ Executing {cmd}...")
                     result = tool.invoke(input=converted_args)
                     print(f"✅ Result:\n{result}")
