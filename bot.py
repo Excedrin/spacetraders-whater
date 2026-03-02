@@ -51,6 +51,7 @@ console = Console(highlight=False)
 #  Configuration
 # ──────────────────────────────────────────────
 
+ENABLE_LLM = True
 MODEL = os.environ.get("MODEL", "glm-4.7-flash")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://192.168.1.171:11434")
 TOOL_TIER = int(os.environ.get("TOOL_TIER", "1"))  # 1=essential, 2=all tools
@@ -130,23 +131,32 @@ You are a STRATEGIC PLANNER, not a pilot.
 Before accepting a contract or assigning a behavior, perform this calculation:
 1. Call 'find_trades' to see current market opportunities.
 2. Compare [Trade Profit/Unit * Cargo Capacity] vs [Contract Fulfillment Bonus].
-3. DECISION:
+3. Try to estimate, with plan_route, the approximate cost of fuel.
+4. DECISION:
    - If Trade Profit is higher: IGNORE THE CONTRACT. Assign a trade route.
    - If Contract is higher: Focus on the contract.
    - *Example:* Do not mine Diamonds for 200/unit if 'find_trades' shows Ship Parts profit of 15,000/unit.
 
 === BEHAVIOR CONSTRUCTION ===
 Use 'create_behavior' to automate ships. Syntax is a comma-separated string of steps.
-assign_trade_route is preferable because it automatically sets max cost and min sale price.
 
-PATTERN: MINING LOOP
-  String: "mine ASTEROID_WAYPOINT [ORE1 ORE2], transfer HAULER-1 *, repeat"
-  Usage: For EXCAVATOR ships. Keeps revenue flowing 24/7.
-  Note: 'sell *' automatically sells everything except contract goods.
+=== assign_trade_route: Your key tool ===
+
+assign_trade_route is preferable to a custom behavior because it
+automatically sets max cost and min sale price.
+
+assign_trade_route can be used to make a route where you trade one item
+from A to B then another from B to A by using one_shot=True.
+
+Market prices change when you buy or sell goods, so using one_shot=True
+is also a good idea. Then just 'find_trades' and assign a new one for the return trip.
+
+Keep a buffer of credits that's based on how much a typical load of
+goods costs and how many trading ships you're using.
 
 === SHIP ROLES ===
 1. COMMAND/HAULER:
-   - Primary: High-volume Trading (create_behavior "buy/sell" loop).
+   - Primary: High-volume Trading
    - Secondary: Contract Delivery.
    - Try to avoid flying empty if a trade exists on your route.
 2. EXCAVATOR:
@@ -164,8 +174,7 @@ PATTERN: MINING LOOP
 - DATA HYGIENE:
   - Market data expires. If 'find_trades' says "STALE (2h+)", do not commit a Hauler yet.
 - EXPANSION:
-  - If Credits > (Ship Price + 100k Buffer), go to a shipyard and purchase a new ship immediately.
--!!! IMPORTANT: Ensure that you are not buying and selling at the same market, that will drain funds!!!
+  - If Credits > (Ship Price + 200k Buffer), go to a shipyard and purchase a new ship.
 
 === INTERVENTION PROTOCOL ===
 If a ship triggers an [ALERT] (e.g., CARGO_FULL, NO_FUEL):
@@ -1209,7 +1218,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         has_alerts = bool(alert_queue)
 
         # Wake up if: Alerts OR Idle Ships OR Strategic Timer
-        if False and (has_alerts or idle_ships or strategic_review_needed):
+        if ENABLE_LLM and (has_alerts or idle_ships or strategic_review_needed):
             # If waking up strictly for strategy, inject a prompt
             if strategic_review_needed and not has_alerts and not idle_ships:
                 console.print(f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]")
