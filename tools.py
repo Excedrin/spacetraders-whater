@@ -1,22 +1,24 @@
 import json
-import os
-import math
 import logging
+import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
+
 from dotenv import load_dotenv
 from langchain_core.tools import tool
+
 from api_client import SpaceTradersClient
 
 # ──────────────────────────────────────────────
 #  Global Config & Init
 # ──────────────────────────────────────────────
 load_dotenv()
-client = SpaceTradersClient(os.environ["TOKEN"])
+client = SpaceTradersClient(os.environ["ST_TOKEN"])
 MARKET_CACHE_FILE = Path("market_cache.json")
 BEHAVIORS_FILE = Path("behaviors.json")
 log = logging.getLogger(__name__)
@@ -2716,8 +2718,8 @@ def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) 
 @tool
 def update_plan(plan: str) -> str:
     """[STATE: plan file] Write or update your plan. Shown in [Current Plan] every turn. Visible to the operator."""
-    from pathlib import Path
     import time
+    from pathlib import Path
 
     plan_file = Path("plan.txt")
 

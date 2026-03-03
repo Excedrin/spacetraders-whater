@@ -7,6 +7,7 @@ This bot uses a custom agent loop with two distinct LLM calls:
 
 Narrative generation happens in parallel during tool downtime (navigation, cooldowns).
 """
+import ast
 import json
 import os
 import sys
@@ -15,31 +16,20 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
+                                     ToolMessage, messages_from_dict,
+                                     messages_to_dict)
 from langchain_ollama import ChatOllama
-from langchain_core.messages import (
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-    messages_from_dict,
-    messages_to_dict,
-)
 from rich.console import Console
 
-from tools import (
-    ALL_TOOLS,
-    TIER_1_TOOLS,
-    SIGNIFICANT_TOOLS,
-    WAITING_TOOLS,
-    get_tool_by_name,
-    get_last_wait,
-    load_market_cache,
-    client,
-    get_engine as get_behavior_engine,
-)
-from narrative import NarrativeContext, generate_narrative, generate_strategic_reflection, NarrativeSegment
-from ship_status import FleetTracker
 from events import write_event
+from narrative import (NarrativeContext, NarrativeSegment, generate_narrative,
+                       generate_strategic_reflection)
+from ship_status import FleetTracker
+from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS,
+                   client)
+from tools import get_engine as get_behavior_engine
+from tools import get_last_wait, get_tool_by_name, load_market_cache
 
 load_dotenv()
 
@@ -51,10 +41,11 @@ console = Console(highlight=False)
 #  Configuration
 # ──────────────────────────────────────────────
 
-ENABLE_LLM = True
-MODEL = os.environ.get("MODEL", "glm-4.7-flash")
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://192.168.1.171:11434")
-TOOL_TIER = int(os.environ.get("TOOL_TIER", "1"))  # 1=essential, 2=all tools
+ENABLE_LLM = ast.literal_eval(os.environ.get("ST_ENABLE_LLM", "True"))
+MODEL = os.environ.get("ST_MODEL", "glm-4.7-flash")
+OLLAMA_BASE_URL = os.environ.get("ST_OLLAMA_BASE_URL", "http://192.168.1.171:11434")
+TOOL_TIER = int(os.environ.get("ST_TOOL_TIER", "1"))  # 1=essential, 2=all tools
+
 TICK_INTERVAL = 10  # Seconds between tactical ticks (rate limit safety)
 STRATEGY_INTERVAL = 600  # 10 minutes — periodic strategic review
 
