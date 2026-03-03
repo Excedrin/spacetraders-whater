@@ -2820,22 +2820,23 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", 
 
 
 @tool
-def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, one_shot: bool = False, start_step: int = 0) -> str:
+def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, 
+                       end_step: str = "stop", start_step: int = 0) -> str:
     """[STATE: behavior] Assign a buying and selling route.
     The ship will:
     1. Go to buy_waypoint
     2. Buy the specified good (attempt to fill cargo) (automatically sets max price)
     3. Go to sell_waypoint
     4. Sell the good (automatically sets min price)
-    5. Repeat (or stop if one_shot=True).
+    5. stop (or repeat if end_step="repeat")
     Smart navigation handles refueling automatically.
     Args:
-        ship_symbol: The hauler ship.
+        ship_symbol: The ship.
         buy_waypoint: Where to buy (e.g., 'X1-KD26-D44').
         buy_good: The symbol to trade (e.g., 'SHIP_PARTS').
         sell_waypoint: Where to sell.
         sell_good: Optional. Defaults to buy_good. Use if refining/transforming, otherwise leave empty.
-        one_shot: If True, run once and stop (return to idle). If False, repeat indefinitely.
+        end_step: Optional. Either "stop" or "repeat", defaults to "stop"
     """
     s_good = sell_good if sell_good else buy_good
     cache = load_market_cache()
@@ -2862,7 +2863,6 @@ def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_
                 sell_step = f"sell {s_good} min:{min_sell}"
             break
 
-    end_step = "stop" if one_shot else "repeat"
     steps_str = f"goto {buy_waypoint}, {buy_step}, goto {sell_waypoint}, {sell_step}, {end_step}"
     return get_engine().assign(ship_symbol, steps_str, start_step)
 
