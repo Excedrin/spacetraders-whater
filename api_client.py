@@ -1,6 +1,6 @@
 import sys
 import time
-
+import threading
 import requests
 
 BASE_URL = "https://api.spacetraders.io/v2"
@@ -9,6 +9,42 @@ _RETRYABLE = (
     requests.exceptions.Timeout,
 )
 
+class RateLimiter:
+    """
+    Thread-safe Token Bucket Rate Limiter.
+    Ensures we don't exceed max_rate requests per second.
+    """
+    def __init__(self, max_rate: float = 2.0, time_period: float = 1.0):
+        self._max_tokens = max_rate
+        self._tokens = max_rate
+        self._lock = threading.Lock()
+        self._last_update = time.monotonic()
+
+        # Calculate how many seconds per token (e.g., 0.5s for 2 req/s)
+        self._refill_rate = max_rate / time_period
+
+    def acquire(self):
+        """Blocks until a token is available."""
+        with self._lock:
+            while True:
+                now = time.monotonic()
+                # Refill tokens based on time passed
+                elapsed = now - self._last_update
+                new_tokens = elapsed * self._refill_rate
+
+                if new_tokens > 0:
+                    self._tokens = min(self._max_tokens, self._tokens + new_tokens)
+                    self._last_update = now
+
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return
+
+                # Calculate wait time for next token
+                # We need 1.0 token, we have self._tokens. We need (1 - self._tokens) more.
+                needed = 1.0 - self._tokens
+                wait_time = needed / self._refill_rate
+                time.sleep(wait_time)
 
 class SpaceTradersClient:
     def __init__(self, token: str):
@@ -17,133 +53,34 @@ class SpaceTradersClient:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
-        # Simple in-memory cache: {path: (timestamp, data)}
         self._cache = {}
-        self._cache_ttl = 2.0  # Seconds to trust a cached GET response
+        self._cache_ttl = 2.0
 
-    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
-        # 1. READ CACHE (GET only)
-        if method == "GET":
-            cached = self._cache.get(path)
-            if cached:
-                ts, data = cached
-                if time.time() - ts < self._cache_ttl:
-                    # Debug: Uncomment to see cache hits
-                    # print(f"[CACHE] HIT {path}", file=sys.stderr)
-                    return data
-                else:
-                    # Expired
-                    del self._cache[path]
+        # Strict 2 requests per second limiter
+        self._limiter = RateLimiter(max_rate=2.0, time_period=1.0)
 
-        # 2. PERFORM REQUEST
-        if method == "POST" and "json" not in kwargs:
-            kwargs["json"] = {}
+    def _paginate_request(self, endpoint: str, **params) -> dict:
+        """Helper: Paginate through GET results until all data is retrieved.
 
-        print(f"[API] {method} {path}", file=sys.stderr)
-        if "json" in kwargs and kwargs["json"]:
-            print(f"      Payload: {kwargs['json']}", file=sys.stderr)
+        Args:
+            endpoint: Full URL path (e.g., "/my/ships" or "/systems/{system}/waypoints")
+            **params: Query parameters to include
 
-        # 3. INVALIDATION (Write operations)
-        # If we change state (POST/PATCH), we must assume related GETs are stale.
-        if method in ["POST", "PATCH", "DELETE"]:
-            # Logic: If I modify '/my/ships/WHATER-1/refuel',
-            # I must invalidate '/my/ships/WHATER-1' and '/my/ships' and '/my/agent'
-
-            # Always invalidate agent (credits change on almost everything)
-            self._cache.pop("/my/agent", None)
-
-            # If acting on a ship, invalidate that ship and the ship list
-            if "/my/ships" in path:
-                self._cache.pop("/my/ships", None) # Invalidate full list
-
-                # Try to extract ship ID to invalidate specific entry
-                # Path usually looks like: /my/ships/WHATER-1/navigate
-                parts = path.split("/")
-                # parts = ['', 'my', 'ships', 'WHATER-1', 'navigate']
-                if len(parts) >= 4:
-                    ship_path = f"/{parts[1]}/{parts[2]}/{parts[3]}" # /my/ships/WHATER-1
-                    self._cache.pop(ship_path, None)
-                    # Also invalidate cargo/cooldown specific sub-paths
-                    self._cache.pop(f"{ship_path}/cargo", None)
-                    self._cache.pop(f"{ship_path}/cooldown", None)
-                    self._cache.pop(f"{ship_path}/nav", None)
-
-        last_err = None
-        for attempt in range(retries):
-            try:
-                resp = self.session.request(
-                    method, f"{BASE_URL}{path}", timeout=30, **kwargs
-                )
-            except _RETRYABLE as e:
-                last_err = str(e)
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
-                continue
-            except requests.exceptions.RequestException as e:
-                return {"error": str(e)}
-
-            # Rate limited — wait and retry
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 2))
-                if attempt < retries - 1:
-                    time.sleep(retry_after)
-                    continue
-                return {"error": "Rate limited, all retries exhausted"}
-
-            # 204 No Content (e.g. cooldown endpoint when no cooldown active)
-            if resp.status_code == 204 or not resp.content:
-                return {}
-
-            body = resp.json()
-            if "error" in body:
-                return {"error": body["error"].get("message", str(body["error"]))}
-
-            data = body.get("data", body)
-
-            # 4. WRITE CACHE (GET only, Success only)
-            if method == "GET":
-                self._cache[path] = (time.time(), data)
-
-            return data
-
-        return {"error": f"Connection failed after {retries} attempts: {last_err}"}
-
-    # --- Agent ---
-
-    def get_agent(self) -> dict:
-        return self._request("GET", "/my/agent")
-
-    # --- Contracts ---
-
-    def list_contracts(self) -> dict:
-        return self._request("GET", "/my/contracts")
-
-    def accept_contract(self, contract_id: str) -> dict:
-        return self._request("POST", f"/my/contracts/{contract_id}/accept")
-
-    def deliver_contract(self, contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/contracts/{contract_id}/deliver", json={
-            "shipSymbol": ship_symbol,
-            "tradeSymbol": trade_symbol,
-            "units": units,
-        })
-
-    def fulfill_contract(self, contract_id: str) -> dict:
-        return self._request("POST", f"/my/contracts/{contract_id}/fulfill")
-
-    # --- Systems / Waypoints ---
-
-    def list_waypoints(self, system: str, **params) -> dict:
-        """List waypoints with automatic pagination to get ALL results."""
+        Returns:
+            List of all data from all pages, or dict with error if failed
+        """
         all_data = []
         page = 1
         limit = 20  # SpaceTraders default
 
         while True:
             params_with_page = {**params, "page": page, "limit": limit}
-            #print(f"[API] list_waypoints {params_with_page}", file=sys.stderr)
-            resp = self.session.request("GET", f"{BASE_URL}/systems/{system}/waypoints", params=params_with_page)
-            #print(f"[API] list_waypoints {resp.content}", file=sys.stderr)
+
+            try:
+                resp = self.session.request("GET", f"{BASE_URL}{endpoint}", params=params_with_page, timeout=30)
+            except _RETRYABLE:
+                # On connection error, return what we have so far
+                return all_data if all_data else {"error": "Connection failed during pagination"}
 
             if resp.status_code == 204 or not resp.content:
                 break
@@ -168,6 +105,109 @@ class SpaceTradersClient:
 
         return all_data
 
+    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
+        # 1. CACHE CHECK (GET only)
+        if method == "GET":
+            cached = self._cache.get(path)
+            if cached:
+                ts, data = cached
+                if time.time() - ts < self._cache_ttl:
+                    return data
+                else:
+                    del self._cache[path]
+
+        if method == "POST" and "json" not in kwargs:
+            kwargs["json"] = {}
+
+        # 2. INVALIDATION LOGIC
+        if method in ["POST", "PATCH", "DELETE"]:
+            self._cache.pop("/my/agent", None)
+            if "/my/ships" in path:
+                self._cache.pop("/my/ships", None)
+                parts = path.split("/")
+                if len(parts) >= 4:
+                    ship_path = f"/{parts[1]}/{parts[2]}/{parts[3]}"
+                    self._cache.pop(ship_path, None)
+                    self._cache.pop(f"{ship_path}/cargo", None)
+                    self._cache.pop(f"{ship_path}/cooldown", None)
+                    self._cache.pop(f"{ship_path}/nav", None)
+
+        print(f"[API] {method} {path}", file=sys.stderr)
+
+        last_err = None
+        for attempt in range(retries):
+            # --- BLOCK HERE IF RATE LIMITED ---
+            self._limiter.acquire()
+
+            try:
+                resp = self.session.request(
+                    method, f"{BASE_URL}{path}", timeout=30, **kwargs
+                )
+            except _RETRYABLE as e:
+                last_err = str(e)
+                if attempt < retries - 1:
+                    time.sleep(1 + attempt)
+                continue
+            except requests.exceptions.RequestException as e:
+                return {"error": str(e)}
+
+            # Handle 429 specifically provided by server
+            if resp.status_code == 429:
+                # If we hit this, our local limiter was slightly off or server is strict
+                retry_after = float(resp.headers.get("Retry-After", 2))
+                print(f"[429] Rate limit hit. Server requested wait: {retry_after}s", file=sys.stderr)
+                time.sleep(retry_after)
+                continue
+
+            if resp.status_code == 204 or not resp.content:
+                return {}
+
+            body = resp.json()
+            if "error" in body:
+                return {"error": body["error"].get("message", str(body["error"]))}
+
+            data = body.get("data", body)
+
+            # Write to cache
+            if method == "GET":
+                self._cache[path] = (time.time(), data)
+
+            return data
+
+        return {"error": f"Connection failed after {retries} attempts: {last_err}"}
+
+    # --- Agent ---
+
+    def get_agent(self) -> dict:
+        return self._request("GET", "/my/agent")
+
+    # --- Contracts ---
+
+    def get_contract(self, contract_id: str) -> dict:
+        return self._request("GET", f"/my/contracts/{contract_id}")
+
+    def list_contracts(self) -> dict:
+        return self._paginate_request("/my/contracts")
+
+    def accept_contract(self, contract_id: str) -> dict:
+        return self._request("POST", f"/my/contracts/{contract_id}/accept")
+
+    def deliver_contract(self, contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> dict:
+        return self._request("POST", f"/my/contracts/{contract_id}/deliver", json={
+            "shipSymbol": ship_symbol,
+            "tradeSymbol": trade_symbol,
+            "units": units,
+        })
+
+    def fulfill_contract(self, contract_id: str) -> dict:
+        return self._request("POST", f"/my/contracts/{contract_id}/fulfill")
+
+    # --- Systems / Waypoints ---
+
+    def list_waypoints(self, system: str, **params) -> list:
+        """List waypoints with automatic pagination to get ALL results."""
+        return self._paginate_request(f"/systems/{system}/waypoints", **params)
+
     def get_shipyard(self, system: str, waypoint: str) -> dict:
         return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/shipyard")
 
@@ -176,8 +216,9 @@ class SpaceTradersClient:
 
     # --- Ships ---
 
-    def list_ships(self) -> dict:
-        return self._request("GET", "/my/ships")
+    def list_ships(self) -> list:
+        """List all ships with automatic pagination."""
+        return self._paginate_request("/my/ships")
 
     def get_ship(self, ship: str) -> dict:
         return self._request("GET", f"/my/ships/{ship}")

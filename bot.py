@@ -29,7 +29,7 @@ from ship_status import FleetTracker
 from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS,
                    client)
 from tools import get_engine as get_behavior_engine
-from tools import get_last_wait, get_tool_by_name, load_market_cache
+from tools import get_tool_by_name, load_market_cache, set_fleet
 
 load_dotenv()
 
@@ -113,9 +113,8 @@ Your Goal: MAXIMIZE CREDITS PER HOUR and fund fleet expansion.
 
 You are a STRATEGIC PLANNER, not a pilot.
 1. Use these:
-    find_trades
+    assign_auto_trade
     assign_satellite_scout
-    assign_trade_route
     assign_mining_loop
 2. Intervene manually to resolve ALERTS or seize high-value opportunities.
 3. Use 'create_behavior' to define custom behavior.
@@ -125,21 +124,22 @@ You are a STRATEGIC PLANNER, not a pilot.
 
 === TRADING ===
 
-1. `find_trades SHIP` will find profitable trades that are near this ship.
+Use `assign_auto_trade SHIP` to automatically:
 
-2. Use `assign_trade_route`!
+1. Handle existing cargo, finding the best place to sell it    
+2. Analyze market data for the best trade route relative to ship location
+3. Fly to buy location, buy goods with 10% price guard
+4. Fly to sell location, sell goods with 10% price guard
+5. Repeat forever, continuously finding better routes as prices change
 
-3. `assign_trade_route` can be used to make a route where you trade one item
-from A to B then when that is done, `find_trades SHIP` and assign another route from B to A.
+IMPORTANT: Market prices CHANGE when you buy or sell goods! The autotrade system
+dynamically recalculates routes, so it adapts to price fluctuations automatically.
 
-4. IMPORTANT: Market prices CHANGE when you buy or sell goods! If you can only buy
-    part of the cargo capacity, it's likely that the route is still profitable.
-    So just use `continue_behavior SHIP`, but pay attention to the updated prices.
+Keep a buffer of credits based on typical cargo costs for your trading ships.
 
-5. find_trades -> assign_trade_route -> find_trades -> assign_trade_route
+=== CONTRACTS ===
 
-6. Keep a buffer of credits that's based on how much a typical load of
-    goods costs and how many trading ships you're using.
+Contracts are not the most profitable way to use ships, but completing them unlocks other game options. It's a good idea to have 1 ship (maybe more if the fleet is large) dedicated to completing contracts.
 
 === SHIP ROLES ===
 
@@ -464,7 +464,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     agent info, fleet status, contracts, known markets, and strategic context.
     This is the ONLY game state injection — no separate fleet or narrative injection.
     """
-    from tools import client, find_trades
+    from tools import client, find_trades, load_market_cache
 
     sections = []
 
@@ -538,6 +538,27 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
 
     except Exception as e:
         sections.append(f"[Market Intelligence]\nError analyzing markets: {e}")
+
+    # Shipyard Intel (Synthesized from Cache)
+    try:
+        market_cache = load_market_cache()
+        ship_prices = {} # type -> (price, waypoint)
+        for wp, data in market_cache.items():
+            if "ships" in data:
+                for s in data["ships"]:
+                    sType = s.get("type")
+                    price = s.get("purchasePrice")
+                    if sType and price:
+                        # Keep the lowest price found
+                        if sType not in ship_prices or price < ship_prices[sType][0]:
+                            ship_prices[sType] = (price, wp)
+        if ship_prices:
+            lines = ["[Shipyard Intel] (Cheapest known prices)"]
+            for sType, (price, wp) in sorted(ship_prices.items()):
+                lines.append(f"{sType.ljust(22)}: {str(price).rjust(8)} cr @ {wp}")
+            sections.append("\n".join(lines))
+    except Exception:
+        pass
 
     # Current plan (from file)
     plan = load_plan()
@@ -992,15 +1013,6 @@ def _run_llm_cycle(
         if tool_name in SIGNIFICANT_TOOLS and not is_error:
             has_significant_action = True
 
-        if tool_name in WAITING_TOOLS and not is_error:
-            wait_time = get_last_wait(tool_name)
-            if wait_time > 0:
-                if ship_symbol:
-                    if tool_name == "navigate_ship":
-                        fleet.set_transit(ship_symbol, wait_time)
-                    elif tool_name == "extract_ore":
-                        fleet.set_extraction_cooldown(ship_symbol, wait_time)
-
         msg_content = result
         if not is_error and tool_name in REDUNDANT_RESULT_TOOLS:
             msg_content = "OK"
@@ -1061,6 +1073,7 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
 
     context = NarrativeContext.load()
     fleet = FleetTracker()
+    set_fleet(fleet)
     behavior_engine = get_behavior_engine()
 
     display_title()
@@ -1174,14 +1187,6 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                         try:
                             result = tool_func.invoke(tool_args)
                             display_tool_result(tool_name, result, "Error:" in result)
-                            # Track wait times for navigation/extraction
-                            if tool_name in WAITING_TOOLS and "Error:" not in result:
-                                wait_time = get_last_wait(tool_name)
-                                if wait_time > 0 and ship_symbol:
-                                    if tool_name == "navigate_ship":
-                                        fleet.set_transit(ship_symbol, wait_time)
-                                    elif tool_name == "extract_ore":
-                                        fleet.set_extraction_cooldown(ship_symbol, wait_time)
                         except Exception as e:
                             console.print(f"    [red]Queued {tool_name} failed: {e}[/red]")
 

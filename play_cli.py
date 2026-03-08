@@ -5,7 +5,7 @@ import traceback
 
 from bot import gather_game_state
 from ship_status import FleetTracker
-from tools import ALL_TOOLS, get_engine
+from tools import ALL_TOOLS, get_engine, set_fleet
 
 
 def get_arg_type_hints(func):
@@ -85,9 +85,8 @@ def configure_readline(tools_map):
     readline.set_completer(completer)
     readline.parse_and_bind("tab: complete")
 
-def print_hud(fleet_tracker=None):
+def print_hud(fleet):
     """Prints the Gather Game State output with behavior status."""
-    fleet = FleetTracker()
     try:
         output = gather_game_state(fleet)
 
@@ -104,10 +103,12 @@ def print_hud(fleet_tracker=None):
 def main_loop(tools_list):
     tool_map = {t.name: t for t in tools_list}
     configure_readline(tool_map)
-    
+
     print("\n🚀 SPACETRADERS ENHANCED CLI")
     print("Type 'help', 'hud', or a command.")
 
+    fleet = FleetTracker()
+    set_fleet(fleet)
     engine = get_engine()
     
     while True:
@@ -128,7 +129,7 @@ def main_loop(tools_list):
                 print("\033[H\033[J", end="") # ANSI clear
                 continue
             if cmd in ["hud", "state", "status"]:
-                print_hud() # Call the gather_game_state function
+                print_hud(fleet)
                 continue
             
             if cmd == "help":

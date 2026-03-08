@@ -19,6 +19,13 @@ from api_client import SpaceTradersClient
 # ──────────────────────────────────────────────
 load_dotenv()
 client = SpaceTradersClient(os.environ["ST_TOKEN"])
+
+# Fleet tracker — injected by the caller (bot.py or play_cli.py) via set_fleet().
+_fleet = None
+
+def set_fleet(f):
+    global _fleet
+    _fleet = f
 MARKET_CACHE_FILE = Path("market_cache.json")
 BEHAVIORS_FILE = Path("behaviors.json")
 log = logging.getLogger(__name__)
@@ -66,6 +73,29 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
         entry["last_updated"] = int(time.time())
 
     # Save if we have any relevant data
+    if entry:
+        cache[waypoint_symbol] = entry
+        MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
+    """Save shipyard pricing data to cache."""
+    cache = load_market_cache()
+    entry = cache.get(waypoint_symbol, {})
+
+    ships = data.get("ships", data.get("shipTypes", []))
+    if ships:
+        # Filter down to essential fields to save space
+        clean_ships = []
+        for s in ships:
+            if isinstance(s, dict):
+                clean_ships.append({
+                    "type": s.get("type"),
+                    "name": s.get("name"),
+                    "purchasePrice": s.get("purchasePrice")
+                })
+        entry["ships"] = clean_ships
+        entry["has_shipyard"] = True
+
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -405,6 +435,8 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         # fall back to the calculated estimate so transit always registers.
         if wait_secs <= 0:
             wait_secs = max(float(direct_time), 1.0)
+        if _fleet:
+            _fleet.set_transit(ship_symbol, wait_secs)
         result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
 
         if is_multi_hop:
@@ -451,13 +483,12 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
 
 def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     """Returns (log_string, cooldown_seconds)."""
-    # Check cooldown first
-    cooldown = client.get_cooldown(ship_symbol)
-    if isinstance(cooldown, dict) and not cooldown.get("error"):
-        remaining = cooldown.get("remainingSeconds", 0)
-        if remaining > 0:
-             # We return this as a valid state, handled by caller
-             return f"Cooldown remaining: {remaining}s", float(remaining)
+    # Check cooldown from fleet tracker (avoids an extra API call)
+    if _fleet:
+        ship_status = _fleet.get_ship(ship_symbol)
+        if ship_status and not ship_status.is_available() and ship_status.busy_reason == "extraction_cooldown":
+            remaining = ship_status.seconds_until_available()
+            return f"Cooldown remaining: {remaining:.0f}s", remaining
 
     _ensure_orbit_logic(ship_symbol)
     data = client.extract(ship_symbol)
@@ -488,7 +519,37 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
 
     result = f"Extracted {yielded.get('units', '?')} {yielded.get('symbol', '?')}."
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
-    return result, float(cd.get("remainingSeconds", 0))
+    cd_secs = float(cd.get("remainingSeconds", 0))
+    if _fleet and cd_secs > 0:
+        _fleet.set_extraction_cooldown(ship_symbol, cd_secs)
+    return result, cd_secs
+
+def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
+    """Find cheapest/best market for a good in the system using cache."""
+    cache = load_market_cache()
+    candidates = []
+    for wp, mdata in cache.items():
+        if not wp.startswith(ship_system): continue
+        # Check if good is sold here (Purchase Price or Export/Exchange)
+        price = float('inf')
+        found = False
+        for tg in mdata.get("trade_goods", []):
+            if tg["symbol"] == trade_symbol:
+                pp = tg.get("purchasePrice")
+                if pp:
+                    price = pp
+                    found = True
+                break
+        if not found:
+            if trade_symbol in mdata.get("exports", []) or trade_symbol in mdata.get("exchange", []):
+                found = True
+                price = 1000000 # Penalty for unknown price
+        if found:
+            candidates.append((price, wp))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False, min_price: int = None) -> str:
     # 1. Check Contract Safety
@@ -677,18 +738,10 @@ def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: st
     Respects: contract requirements, cargo available, and explicit unit request.
     """
     # 1. Fetch contract to see remaining units needed
-    contracts = client.list_contracts()
-    if not isinstance(contracts, list):
-        raise Exception("Could not fetch contracts")
+    contract = client.get_contract(contract_id)
 
-    contract = None
-    for c in contracts:
-        if c.get("id") == contract_id:
-            contract = c
-            break
-
-    if not contract:
-        raise Exception(f"Contract {contract_id} not found")
+    if not contract or contract.get("error", None):
+        raise Exception(f"Error fetching contract {contract.get('error')}")
 
     if contract.get("fulfilled"):
         raise Exception(f"Contract {contract_id} is already fulfilled")
@@ -734,9 +787,26 @@ def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: st
     contract = data.get("contract", {})
     terms = contract.get("terms", {})
     result = f"Delivered {final_units} {trade_symbol} to contract {contract_id}."
+
+    # Check if all terms fulfilled
+    all_fulfilled = True
     for d in terms.get("deliver", []):
-        if d.get("tradeSymbol") == trade_symbol:
-            result += f" Progress: {d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', 0)}"
+         if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0):
+             all_fulfilled = False
+             break
+
+    if all_fulfilled:
+        # Auto-fulfill
+        fulfill_data = client.fulfill_contract(contract_id)
+        if isinstance(fulfill_data, dict) and "error" not in fulfill_data:
+            result += " Contract FULFILLED!"
+        else:
+            result += f" (Fulfillment failed: {fulfill_data.get('error')})"
+    else:
+        for d in terms.get("deliver", []):
+            if d.get("tradeSymbol") == trade_symbol:
+                result += f" Progress: {d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', 0)}"
+
     return result
 
 
@@ -840,6 +910,7 @@ class StepType(Enum):
     STOP = "stop"
     NEGOTIATE = "negotiate"
     BUY_SHIP = "buy_ship"
+    AUTOTRADE = "autotrade"
 
 @dataclass
 class Step:
@@ -849,13 +920,20 @@ class Step:
         if self.args: return f"{self.step_type.value} {' '.join(self.args)}"
         return self.step_type.value
 
-def _refresh_market_cache(waypoint: str) -> None:
-    """Fetch live market data for a waypoint and update the cache. Silent on error."""
+def _refresh_waypoint_data(waypoint: str) -> None:
+    """Fetch live market AND shipyard data for a waypoint and update the cache. Silent on error."""
     system = "-".join(waypoint.split("-")[:2])
     try:
         data = client.get_market(system, waypoint)
         if data and isinstance(data, dict) and "error" not in data:
             _save_market_to_cache(waypoint, data)
+    except Exception:
+        pass
+
+    try:
+        data = client.get_shipyard(system, waypoint)
+        if data and isinstance(data, dict) and "error" not in data:
+            _save_shipyard_to_cache(waypoint, data)
     except Exception:
         pass
 
@@ -872,6 +950,10 @@ def parse_steps(steps_str: str) -> list[Step]:
         except ValueError:
             raise ValueError(f"Unknown step type: '{verb}'")
     return steps
+
+def reconstruct_steps_str(steps: list[Step]) -> str:
+    """Reconstructs the steps string from a list of Step objects."""
+    return ", ".join(str(s) for s in steps)
 
 @dataclass
 class BehaviorConfig:
@@ -892,6 +974,150 @@ def get_engine() -> "BehaviorEngine":
     if _engine_instance is None:
         _engine_instance = BehaviorEngine()
     return _engine_instance
+
+def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[dict]:
+    """Helper: returns a list of trade dictionaries sorted by profitability."""
+    import time
+    cache = load_market_cache()
+    if not cache:
+        return []
+
+    # Build per-good source/sink lists
+    sources = {}  # good -> [(market_wp, buy_cost, volume)]
+    sinks = {}    # good -> [(market_wp, sell_revenue, volume)]
+
+    for wp, mdata in cache.items():
+        trade_goods = mdata.get("trade_goods")
+        if not trade_goods:
+            continue
+
+        # Identify exports/imports based on structural data + price availability
+        exports = set(mdata.get("exports", []))
+        imports = set(mdata.get("imports", []))
+        exchange = set(mdata.get("exchange", []))
+        source_goods = exports | exchange
+        sink_goods = imports | exchange
+
+        for tg in trade_goods:
+            sym = tg["symbol"]
+            buy_cost = tg.get("purchasePrice")
+            sell_revenue = tg.get("sellPrice")
+
+            if sym in source_goods and buy_cost is not None:
+                sources.setdefault(sym, []).append((wp, buy_cost, tg.get("tradeVolume", 0)))
+            if sym in sink_goods and sell_revenue is not None:
+                sinks.setdefault(sym, []).append((wp, sell_revenue, tg.get("tradeVolume", 0)))
+
+    all_goods = set(sources.keys()) & set(sinks.keys())
+    if not all_goods:
+        return []
+
+    # Get ship position for distance calculation
+    ship_pos = None
+    wp_coords = {}
+    if ship_symbol:
+        ship = client.get_ship(ship_symbol)
+        if isinstance(ship, dict) and "error" not in ship:
+            nav = ship.get("nav", {})
+            ship_wp = nav.get("waypointSymbol", "")
+            system_symbol = nav.get("systemSymbol", "")
+            waypoints = client.list_waypoints(system_symbol)
+            if isinstance(waypoints, list):
+                for wp in waypoints:
+                    wp_coords[wp["symbol"]] = (wp.get("x", 0), wp.get("y", 0))
+                ship_pos = wp_coords.get(ship_wp)
+
+    routes = []
+    now = time.time()
+
+    for sym in all_goods:
+        for src_wp, buy_cost, src_vol in sources.get(sym, []):
+            for snk_wp, sell_rev, snk_vol in sinks.get(sym, []):
+                if src_wp == snk_wp:
+                    continue
+                profit = sell_rev - buy_cost
+                if profit < min_profit:
+                    continue
+
+                volume = min(src_vol, snk_vol)
+
+                # Check staleness
+                src_updated = cache.get(src_wp, {}).get("last_updated", 0)
+                snk_updated = cache.get(snk_wp, {}).get("last_updated", 0)
+                oldest = min(src_updated, snk_updated)
+                stale = (now - oldest) > 7200 if oldest else True
+
+                route = {
+                    "good": sym,
+                    "src": src_wp,
+                    "snk": snk_wp,
+                    "buy": buy_cost,
+                    "sell": sell_rev,
+                    "profit": profit,
+                    "volume": volume,
+                    "stale": stale,
+                    "dist": None
+                }
+
+                if ship_pos:
+                    src_pos_coords = wp_coords.get(src_wp)
+                    if src_pos_coords:
+                        d = math.sqrt((src_pos_coords[0] - ship_pos[0])**2 + (src_pos_coords[1] - ship_pos[1])**2)
+                        route["dist"] = max(d, 1.0)
+
+                routes.append(route)
+
+    # Sort
+    if ship_pos:
+        # Efficiency: profit / distance to pickup
+        routes.sort(key=lambda r: r["profit"] / r["dist"] if r.get("dist") else 0, reverse=True)
+    else:
+        routes.sort(key=lambda r: r["profit"], reverse=True)
+
+    return routes
+
+def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
+    """Helper: finds the best market to sell existing cargo."""
+    cache = load_market_cache()
+    candidates = []
+
+    ship = client.get_ship(ship_symbol)
+    if not ship or "error" in ship: return None
+
+    system = ship['nav']['systemSymbol']
+    ship_x = ship['nav']['route']['destination']['x']
+    ship_y = ship['nav']['route']['destination']['y']
+
+    # We need system waypoints to calc distance if not in cache
+    # But usually cache keys are waypoint symbols.
+
+    for wp, mdata in cache.items():
+        if not wp.startswith(system): continue
+
+        # Check if market buys this good (Imports or Exchange)
+        imports = set(mdata.get("imports", []))
+        exchange = set(mdata.get("exchange", []))
+        if good not in (imports | exchange):
+            continue
+
+        # Get price
+        price = 0
+        for tg in mdata.get("trade_goods", []):
+            if tg['symbol'] == good:
+                price = tg.get("sellPrice", 0)
+                break
+
+        # Approximate distance (if we don't have coords, assume far)
+        # For simplicity, we might rely on the tool cache or just assume 0 if unknown
+        # Ideally we fetch coords. For now, let's just use raw price.
+        candidates.append({"wp": wp, "price": price})
+
+    if not candidates:
+        return None
+
+    # Sort by price descending
+    candidates.sort(key=lambda x: x["price"], reverse=True)
+    return candidates[0]
 
 class BehaviorEngine:
     """
@@ -1049,6 +1275,8 @@ class BehaviorEngine:
             elif step.step_type == StepType.REPEAT: result = self._step_repeat(cfg)
             elif step.step_type == StepType.STOP: result = self._step_stop(cfg)
             elif step.step_type == StepType.ALERT: result = self._step_alert(cfg, step)
+            elif step.step_type == StepType.AUTOTRADE: result = self._step_autotrade(cfg)
+            elif step.step_type == StepType.NEGOTIATE: result = self._step_negotiate(cfg)
             # Store last action for logging
             cfg.last_action = f"step {cfg.current_step_index + 1}: {step_display}"
             self._save()
@@ -1182,7 +1410,7 @@ class BehaviorEngine:
                 break
         # Refresh market cache before selling so prices are current
         if ship.location:
-            _refresh_market_cache(ship.location)
+            _refresh_waypoint_data(ship.location)
         # Get inventory
         c = client.get_cargo(cfg.ship_symbol)
         inventory = c.get("inventory", [])
@@ -1213,7 +1441,7 @@ class BehaviorEngine:
 
         # Refresh market cache before buying so affordability check uses current prices
         if ship.location:
-            _refresh_market_cache(ship.location)
+            _refresh_waypoint_data(ship.location)
 
         trade_symbol = step.args[0]
         units = None
@@ -1287,7 +1515,7 @@ class BehaviorEngine:
 
     def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
         if not ship.location: raise Exception("No location")
-        _refresh_market_cache(ship.location)
+        _refresh_waypoint_data(ship.location)
         self._advance(cfg)
         return None
 
@@ -1297,6 +1525,145 @@ class BehaviorEngine:
             cfg.alert_sent = True
             self._save()
             return f"{cfg.ship_symbol} ALERT: {' '.join(step.args)}"
+        return None
+
+    def _step_autotrade(self, cfg) -> Optional[str]:
+        """
+        Dynamic Step:
+        1. Analyzes market/cargo to generate a specific trade route string.
+        2. Calls self.assign() to overwrite the current behavior with the new plan.
+        """
+        # 1. Check Cargo
+        cargo_data = client.get_cargo(cfg.ship_symbol)
+        inventory = cargo_data.get("inventory", [])
+
+        new_plan = ""
+
+        # A. Handle Existing Cargo (Sell it off first)
+        if inventory:
+            # Pick the first item
+            item = inventory[0]
+            symbol = item['symbol']
+
+            best_market = _find_best_sell_market(cfg.ship_symbol, symbol)
+            if best_market:
+                # Plan: Goto -> Sell -> Autotrade (loop)
+                new_plan = f"goto {best_market['wp']}, sell {symbol}, autotrade"
+            else:
+                # Pause and alert if we can't sell what we have
+                cfg.paused = True
+                cfg.alert_sent = True
+                self._save()
+                return f"{cfg.ship_symbol} ALERT: Auto-trade has {symbol} but no known buyer in system. Scout markets."
+
+        # B. Find New Trade (Buy low, sell high)
+        else:
+            routes = _analyze_trade_routes(cfg.ship_symbol, min_profit=50)
+            if not routes:
+                # Pause and alert if no routes found
+                cfg.paused = True
+                cfg.alert_sent = True
+                self._save()
+                return f"{cfg.ship_symbol} ALERT: Auto-trade found no profitable routes. Scout more markets."
+
+            best = routes[0]
+            max_buy = int(best['buy'] * 1.10)
+            min_sell = int(best['sell'] * 0.90)
+
+            # Plan: Goto Src -> Buy -> Goto Snk -> Sell -> Autotrade (loop)
+            new_plan = (
+                f"goto {best['src']}, "
+                f"buy {best['good']} max:{max_buy}, "
+                f"goto {best['snk']}, "
+                f"sell {best['good']} min:{min_sell}, "
+                f"autotrade"
+            )
+
+        # 2. Delegate to assign()
+        # This handles parsing, state reset (step 0, phase INIT), and saving automatically.
+        # It completely replaces the current behavior config with the new one.
+        self.assign(cfg.ship_symbol, new_plan)
+
+        return None
+
+    def _step_negotiate(self, cfg) -> Optional[str]:
+        """
+        Smart Contract Manager Step.
+        1. If active contract exists -> Set behavior to fulfill it (Buy -> Deliver loop).
+        2. If no active contract -> Go to HQ -> Negotiate -> Accept -> Loop.
+        """
+        # 1. Check for active unfulfilled contracts
+        contracts = client.list_contracts()
+        if isinstance(contracts, dict) and "error" in contracts:
+            raise Exception(f"Failed to list contracts: {contracts['error']}")
+
+        active_contract = next((c for c in contracts if c.get("accepted") and not c.get("fulfilled")), None)
+
+        if active_contract:
+            # Plan route to fulfill it
+            terms = active_contract.get("terms", {})
+            # Find first incomplete delivery
+            target_delivery = next((d for d in terms.get("deliver", []) if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0)), None)
+
+            if not target_delivery:
+                # Contract seems done but not fulfilled? Try fulfill.
+                client.fulfill_contract(active_contract["id"])
+                active_contract = None # Proceed to get new one next loop
+            else:
+                c_id = active_contract["id"]
+                symbol = target_delivery["tradeSymbol"]
+                dest = target_delivery["destinationSymbol"]
+
+                # Calculate exact quantity needed for this delivery
+                units_needed = target_delivery["unitsRequired"] - target_delivery["unitsFulfilled"]
+
+                # Check current cargo
+                cargo = client.get_cargo(cfg.ship_symbol)
+                current_units = next((i["units"] for i in cargo.get("inventory", [])
+                                     if i["symbol"] == symbol), 0)
+
+                # Calculate how much to buy
+                units_to_buy = max(0, units_needed - current_units)
+
+                if units_to_buy == 0:
+                    # Already have enough, just deliver
+                    self.assign(cfg.ship_symbol, f"goto {dest}, deliver {c_id} {symbol}, negotiate")
+                else:
+                    # Need to buy more
+                    ship = client.get_ship(cfg.ship_symbol)
+                    cargo_capacity = ship.get("cargo", {}).get("capacity", 0)
+                    units_in_cargo = cargo.get("units", 0)
+
+                    # Cap by available cargo space
+                    units_to_buy = min(units_to_buy, cargo_capacity - units_in_cargo)
+
+                    if units_to_buy <= 0:
+                        # Cargo is full, deliver what we have first
+                        self.assign(cfg.ship_symbol, f"goto {dest}, deliver {c_id} {symbol}, negotiate")
+                    else:
+                        src = _find_best_source(symbol, ship['nav']['systemSymbol'])
+                        if not src:
+                            cfg.paused = True
+                            cfg.alert_sent = True
+                            self._save()
+                            return f"{cfg.ship_symbol} ALERT: Contract {c_id} needs {symbol} but no source found in cache."
+                        self.assign(cfg.ship_symbol, f"goto {src}, buy {symbol} {units_to_buy}, goto {dest}, deliver {c_id} {symbol}, negotiate")
+                return None
+
+        # 2. No Active Contract -> Go to HQ and Negotiate
+        ship = client.get_ship(cfg.ship_symbol)
+        hq = client.get_agent().get("headquarters")
+
+        if ship['nav']['waypointSymbol'] != hq:
+            self.assign(cfg.ship_symbol, f"goto {hq}, negotiate")
+            return None
+
+        # At HQ: Negotiate & Accept
+        _ensure_dock_logic(cfg.ship_symbol)
+        data = client.negotiate_contract(cfg.ship_symbol)
+        if isinstance(data, dict) and "error" in data: raise Exception(f"Negotiation failed: {data['error']}")
+        client.accept_contract(data.get("contract", {}).get("id"))
+        self.assign(cfg.ship_symbol, "negotiate") # Loop to process the new contract
         return None
 
     def _step_repeat(self, cfg) -> Optional[str]:
@@ -1391,6 +1758,9 @@ def view_ships() -> str:
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
 
+    if _fleet:
+        _fleet.update_from_api(data)
+
     lines = []
     for s in data:
         symbol = s['symbol']
@@ -1398,13 +1768,13 @@ def view_ships() -> str:
         fuel = s.get("fuel", {})
         cargo = s.get("cargo", {})
 
-        # Check Cooldown
-        cooldown = client.get_cooldown(symbol)
+        # Check extraction cooldown from fleet tracker (no extra API call)
         cd_text = ""
-        if isinstance(cooldown, dict) and not cooldown.get("error"):
-            rem = cooldown.get("remainingSeconds", 0)
-            if rem > 0:
-                cd_text = f" [COOLDOWN: {rem}s]"
+        if _fleet:
+            ship_status = _fleet.get_ship(symbol)
+            if ship_status and not ship_status.is_available() and ship_status.busy_reason == "extraction_cooldown":
+                rem = ship_status.seconds_until_available()
+                cd_text = f" [COOLDOWN: {rem:.0f}s]"
 
         # Check Transit
         status = nav.get('status', '?')
@@ -1935,12 +2305,14 @@ def view_shipyard(waypoint_symbol: str) -> str:
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
     ships = data.get("ships", data.get("shipTypes", []))
+    # Save to cache immediately so purchase_ship knows about it
+    _save_shipyard_to_cache(waypoint_symbol, data)
+
     lines = [f"Shipyard at {waypoint_symbol}:"]
     if isinstance(ships, list) and ships:
         for s in ships:
             if isinstance(s, dict) and "name" in s:
-                lines.append(f"  {s.get('name', s.get('type', '?'))} — {s.get('purchasePrice', '?')} credits")
-                lines.append(f"    Type: {s.get('type', '?')}")
+                lines.append(f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits")
             else:
                 lines.append(f"  {s.get('type', str(s))}")
     else:
@@ -2022,12 +2394,13 @@ def view_market(waypoint_symbol: str) -> str:
     try:
         shipyard = client.get_shipyard(system_symbol, waypoint_symbol)
         if isinstance(shipyard, dict) and "error" not in shipyard and shipyard:
+            _save_shipyard_to_cache(waypoint_symbol, shipyard)
             ships = shipyard.get("ships", shipyard.get("shipTypes", []))
             lines.append(f"\nShipyard at {waypoint_symbol}:")
             if isinstance(ships, list) and ships:
                 for s in ships:
                     if isinstance(s, dict) and "name" in s:
-                        lines.append(f"  {s.get('name', s.get('type', '?'))} — {s.get('purchasePrice', '?')} credits")
+                        lines.append(f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits")
                     else:
                         lines.append(f"  {s.get('type', str(s))}")
             else:
@@ -2203,7 +2576,11 @@ def accept_contract(contract_id: str) -> str:
 
 @tool
 def purchase_ship(ship_type: str, waypoint_symbol: str) -> str:
-    """[STATE: credits, fleet] Purchase a ship at a shipyard. Need a ship present and enough credits."""
+    """[STATE: credits, fleet] Purchase a ship at a shipyard.
+    You MUST have a ship or probe present at the shipyard to purchase.
+    Common types: SHIP_PROBE, SHIP_MINING_DRONE, SHIP_SIPHON_DRONE, SHIP_LIGHT_HAULER,
+    SHIP_COMMAND_FRIGATE, SHIP_EXPLORER, SHIP_HEAVY_FREIGHTER, SHIP_ORE_HOUND, SHIP_REFINING_FREIGHTER.
+    """
     data = client.purchase_ship(ship_type, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -2480,19 +2857,21 @@ def warp_ship(ship_symbol: str, waypoint_symbol: str) -> str:
 
 @tool
 def negotiate_contract(ship_symbol: str) -> str:
-    """[STATE: contracts] Negotiate a new contract. Ship must be docked at a faction HQ."""
-    data = client.negotiate_contract(ship_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    contract = data.get("contract", {})
-    terms = contract.get("terms", {})
-    lines = [f"Negotiated new contract: {contract.get('id', '?')}"]
-    lines.append(f"  Type: {contract.get('type', '?')}")
-    lines.append(f"  Payment: {terms.get('payment', {}).get('onAccepted', 0)} on accept, "
-                 f"{terms.get('payment', {}).get('onFulfilled', 0)} on fulfill")
-    for d in terms.get("deliver", []):
-        lines.append(f"  Deliver: {d.get('unitsRequired', '?')} {d.get('tradeSymbol', '?')} to {d.get('destinationSymbol', '?')}")
-    return "\n".join(lines)
+    """[STATE: contracts] Negotiate a new contract. Creates a behavior to go to HQ and negotiate."""
+    # Get HQ location from agent
+    agent = client.get_agent()
+    if isinstance(agent, dict) and "error" in agent:
+        return f"Error: {agent['error']}"
+
+    hq_waypoint = agent.get("headquarters")
+    if not hq_waypoint:
+        return "Error: Could not find headquarters waypoint"
+
+    # Create behavior: goto HQ, negotiate, stop
+    steps_str = f"goto {hq_waypoint}, negotiate, stop"
+    result = get_engine().assign(ship_symbol, steps_str)
+
+    return f"Assigned negotiation behavior to {ship_symbol}: {steps_str}\n{result}"
 
 
 @tool
@@ -2579,135 +2958,34 @@ def fulfill_contract(contract_id: str) -> str:
 @tool
 def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) -> str:
     """[READ-ONLY] Find profitable trade routes from cached market data.
-
     Compares buy prices (exports/exchange) with sell prices (imports/exchange) across
     all known markets. Only uses cached price data — send ships to markets for fresh prices.
-
     Args:
         ship_symbol: Optional. If given, shows distance from this ship and sorts by profit/distance.
         good: Optional. Filter to a specific trade good (e.g. "IRON_ORE").
         min_profit: Minimum profit per unit to include (default: 1).
     """
-    import time
-
-    cache = load_market_cache()
-    if not cache:
-        return "No market data cached. Send ships to markets or run scan_system first."
-
-    # Build per-good source/sink lists from markets that have price data
-    # source = where to BUY (exports/exchange) — cost is sellPrice (what you pay the market)
-    # sink = where to SELL (imports/exchange) — revenue is purchasePrice (what market pays you)
-    sources = {}  # good -> [(market_wp, buy_cost, volume)]
-    sinks = {}    # good -> [(market_wp, sell_revenue, volume)]
-
-    for wp, mdata in cache.items():
-        trade_goods = mdata.get("trade_goods")
-        if not trade_goods:
-            continue
-
-        exports = set(mdata.get("exports", []))
-        imports = set(mdata.get("imports", []))
-        exchange = set(mdata.get("exchange", []))
-        source_goods = exports | exchange
-        sink_goods = imports | exchange
-
-        for tg in trade_goods:
-            sym = tg["symbol"]
-            buy_cost = tg.get("purchasePrice")       # what you PAY the market
-            sell_revenue = tg.get("sellPrice")  # what market PAYS you
-
-            if sym in source_goods and buy_cost is not None:
-                sources.setdefault(sym, []).append((wp, buy_cost, tg.get("tradeVolume", 0)))
-            if sym in sink_goods and sell_revenue is not None:
-                sinks.setdefault(sym, []).append((wp, sell_revenue, tg.get("tradeVolume", 0)))
-
-    # Filter to specific good if requested
-    if good:
-        good = good.upper()
-        all_goods = {good} if good in sources and good in sinks else set()
-    else:
-        all_goods = set(sources.keys()) & set(sinks.keys())
-
-    if not all_goods:
-        if good:
-            return f"No trade routes found for {good}. Need both a source (exports/exchange) and sink (imports/exchange) with price data."
-        return "No trade routes found. Need more market price data — send ships to scout markets."
-
-    # Build routes: pair each source with each sink, compute profit
-    routes = []
-    now = time.time()
-
-    for sym in all_goods:
-        for src_wp, buy_cost, src_vol in sources.get(sym, []):
-            for snk_wp, sell_rev, snk_vol in sinks.get(sym, []):
-                if src_wp == snk_wp:
-                    continue
-                profit = sell_rev - buy_cost
-                if profit < min_profit:
-                    continue
-                volume = min(src_vol, snk_vol)
-                # Check staleness of both markets
-                src_updated = cache.get(src_wp, {}).get("last_updated", 0)
-                snk_updated = cache.get(snk_wp, {}).get("last_updated", 0)
-                oldest = min(src_updated, snk_updated)
-                stale = (now - oldest) > 7200 if oldest else True  # >2h
-                routes.append({
-                    "good": sym,
-                    "src": src_wp,
-                    "snk": snk_wp,
-                    "buy": buy_cost,
-                    "sell": sell_rev,
-                    "profit": profit,
-                    "volume": volume,
-                    "stale": stale,
-                })
+    routes = _analyze_trade_routes(ship_symbol, min_profit)
 
     if not routes:
         return f"No profitable routes found (min_profit={min_profit}). Try lowering min_profit or scouting more markets."
 
-    # If ship_symbol given, compute distance from ship to source and sort by efficiency
-    ship_wp = None
-    ship_pos = None
-    wp_coords = {}
-
-    if ship_symbol:
-        ship = client.get_ship(ship_symbol)
-        if isinstance(ship, dict) and "error" not in ship:
-            nav = ship.get("nav", {})
-            ship_wp = nav.get("waypointSymbol", "")
-            system_symbol = nav.get("systemSymbol", "")
-
-            waypoints = client.list_waypoints(system_symbol)
-            if isinstance(waypoints, list):
-                for wp in waypoints:
-                    wp_coords[wp["symbol"]] = (wp.get("x", 0), wp.get("y", 0))
-                ship_pos = wp_coords.get(ship_wp)
-
-    if ship_pos:
-        # Add distance info and sort by profit / distance (efficiency)
-        for r in routes:
-            src_pos = wp_coords.get(r["src"])
-            if src_pos:
-                dist = math.sqrt((src_pos[0] - ship_pos[0])**2 + (src_pos[1] - ship_pos[1])**2)
-                r["dist"] = max(dist, 1.0)  # avoid div by zero
-            else:
-                r["dist"] = None
-        routes.sort(key=lambda r: r["profit"] / r["dist"] if r.get("dist") else 0, reverse=True)
-    else:
-        # Sort by raw profit per unit
-        routes.sort(key=lambda r: r["profit"], reverse=True)
+    # Filter by good if requested
+    if good:
+        routes = [r for r in routes if r['good'] == good.upper()]
+        if not routes:
+            return f"No routes found for {good}."
 
     # Format top 10
     lines = ["Top trade routes (from cached prices):\n"]
     for r in routes[:10]:
         lines.append(f"  {r['good']}: buy at {r['src']} ({r['buy']}/unit) -> sell at {r['snk']} ({r['sell']}/unit)")
         detail = f"    Profit: {r['profit']}/unit | Volume: {r['volume']}"
-        if ship_pos and r.get("dist"):
+        if r.get("dist"):
             detail += f" | Dist: {r['dist']:.1f} from {ship_symbol}"
         if r["stale"]:
             detail += " | STALE PRICES (2h+)"
         lines.append(detail)
-
     return "\n".join(lines)
 
 
@@ -2932,6 +3210,26 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
     return "\n".join(results)
 
 
+@tool
+def assign_auto_trade(ship_symbol: str) -> str:
+    """[STATE: behavior] Assign the ship to automatically find and execute profitable trades.
+    The ship will:
+    1. Analyze cached market data for the best trade relative to its location.
+    2. Fly to buy, buy goods, fly to sell, sell goods.
+    3. Repeat step 1 forever.
+    Requires cached market data (use satellites/scouting first).
+    """
+    return get_engine().assign(ship_symbol, "autotrade")
+
+@tool
+def assign_contract_duty(ship_symbol: str) -> str:
+    """[STATE: behavior] Assign ship to contract duty: Goto HQ, negotiate/accept contracts, and automatically fulfill them.
+    Loop: Fetch contract -> Buy goods -> Deliver -> Repeat.
+    """
+    # Simply assigning 'negotiate' triggers the smart logic:
+    # If no contract -> goto HQ, negotiate. If contract exists -> fulfill it.
+    return get_engine().assign(ship_symbol, "negotiate")
+
 # ──────────────────────────────────────────────
 #  Tool registry
 # ──────────────────────────────────────────────
@@ -2952,7 +3250,7 @@ TIER_1_TOOLS = [
     update_plan,
     # Behavior control
     resume_behavior, skip_step, cancel_behavior, pause_behavior,
-    assign_mining_loop, assign_satellite_scout, assign_trade_route,
+    assign_mining_loop, assign_satellite_scout, assign_trade_route, assign_auto_trade, assign_contract_duty,
     create_behavior,
 ]
 
@@ -2983,7 +3281,7 @@ ALL_TOOLS = [
     find_trades,
     # Behavior control
     create_behavior, resume_behavior, skip_step, cancel_behavior, pause_behavior,
-    assign_mining_loop, assign_satellite_scout, assign_trade_route,
+    assign_mining_loop, assign_satellite_scout, assign_trade_route, assign_auto_trade, assign_contract_duty,
 ]
 
 # Tools that are "significant" actions worth narrating
