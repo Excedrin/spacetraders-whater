@@ -3724,6 +3724,24 @@ WAITING_TOOLS = {
     "warp_ship",
 }
 
+# State-changing tools (tools that modify ship state — not read-only)
+STATE_CHANGING_TOOLS = {
+    "navigate_ship",
+    "extract_ore",
+    "sell_cargo",
+    "jettison_cargo",
+    "transfer_cargo",
+    "refuel_ship",
+    "deliver_contract",
+    "dock_ship",
+    "orbit_ship",
+    "survey_asteroid",
+    "scan_waypoints",
+    "scan_ships",
+    "jump_ship",
+    "warp_ship",
+}
+
 
 def get_tool_by_name(name: str):
     """Get a tool function by its name. Searches ALL_TOOLS (superset)."""

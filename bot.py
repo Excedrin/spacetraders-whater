@@ -36,7 +36,7 @@ from narrative import (
     generate_strategic_reflection,
 )
 from ship_status import FleetTracker
-from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS, client
+from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS, STATE_CHANGING_TOOLS, client
 from tools import get_engine as get_behavior_engine
 from tools import get_tool_by_name, load_market_cache, set_fleet
 
@@ -64,24 +64,6 @@ MAX_TOKENS_ESTIMATE = 8000  # Target max tokens (rough estimate)
 
 # Action queue
 MAX_QUEUED_ACTIONS = 3  # Max queued actions per ship
-
-# State-changing tools (tools that modify ship state — not read-only)
-STATE_CHANGING_TOOLS = {
-    "navigate_ship",
-    "extract_ore",
-    "sell_cargo",
-    "jettison_cargo",
-    "transfer_cargo",
-    "refuel_ship",
-    "deliver_contract",
-    "dock_ship",
-    "orbit_ship",
-    "survey_asteroid",
-    "scan_waypoints",
-    "scan_ships",
-    "jump_ship",
-    "warp_ship",
-}
 
 
 class ActionQueue:
@@ -681,21 +663,6 @@ def display_tool_result(name: str, result: str, is_error: bool = False):
         console.print(f"    [{color}]{line}[/{color}]")
 
 
-# NOTE: display_waiting removed - bot no longer blocks on cooldowns
-# Ships track their own cooldown state and bot continues working
-
-
-def _unused_display_waiting(seconds: float, reason: str):
-    """DEPRECATED: Display countdown while waiting."""
-    end = time.time() + seconds
-    while True:
-        remaining = end - time.time()
-        if remaining <= 0:
-            break
-        console.print(f"    [dim]⏳ {reason}: {remaining:.0f}s remaining...[/dim]")
-        time.sleep(min(remaining, 15))
-
-
 def display_narrative(segment: NarrativeSegment, context: NarrativeContext):
     """Display a narrative segment with style."""
     console.print()
@@ -703,13 +670,9 @@ def display_narrative(segment: NarrativeSegment, context: NarrativeContext):
     console.print(f"  [bold bright_cyan]⚡ {segment.tool_name}[/bold bright_cyan]")
     console.print()
 
-    # Typewriter effect for narrative
     sys.stdout.write("  \033[97m\033[3m")  # bright white, italic
     sys.stdout.flush()
-    for char in segment.narrative:
-        sys.stdout.write(char if char != "\n" else "\n  ")
-        sys.stdout.flush()
-        time.sleep(0.015)
+    sys.stdout.write(segment.narrative)
     sys.stdout.write("\033[0m\n")
     sys.stdout.flush()
 
@@ -878,7 +841,6 @@ def discover_all_markets(fleet: FleetTracker):
                     if isinstance(m_data, dict) and "error" not in m_data:
                         _save_market_to_cache(wp_sym, m_data)
                         api_calls += 1
-                        time.sleep(0.2)  # Rate limit kindness
 
         if api_calls > 0:
             console.print(
@@ -892,13 +854,9 @@ def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeCo
     console.rule("[bold yellow]★ STRATEGIC REFLECTION ★[/bold yellow]", style="yellow")
     console.print()
 
-    # Typewriter effect for narrative (slower for dramatic effect)
     sys.stdout.write("  \033[93m\033[3m")  # yellow, italic
     sys.stdout.flush()
-    for char in segment.narrative:
-        sys.stdout.write(char if char != "\n" else "\n  ")
-        sys.stdout.flush()
-        time.sleep(0.025)
+    sys.stdout.write(segment.narrative)
     sys.stdout.write("\033[0m\n")
     sys.stdout.flush()
 
