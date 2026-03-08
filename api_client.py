@@ -54,7 +54,7 @@ class SpaceTradersClient:
             "Content-Type": "application/json",
         })
         self._cache = {}
-        self._cache_ttl = 2.0
+        self._cache_ttl = 3.0
 
         # Strict 2 requests per second limiter
         self._limiter = RateLimiter(max_rate=2.0, time_period=1.0)
@@ -75,6 +75,7 @@ class SpaceTradersClient:
 
         while True:
             params_with_page = {**params, "page": page, "limit": limit}
+            self._limiter.acquire()
 
             try:
                 resp = self.session.request("GET", f"{BASE_URL}{endpoint}", params=params_with_page, timeout=30)
