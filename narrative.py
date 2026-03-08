@@ -5,6 +5,7 @@ Maintains a rolling window of narrative segments that get injected into
 the bot's decision prompt, giving it a persistent "high-level view" of
 the world, its goals, and what it's working toward.
 """
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -12,8 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
 import ollama
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -43,6 +44,7 @@ Be CLINICAL and PRECISE. No flowery prose. Example:
 @dataclass
 class NarrativeSegment:
     """A single narrative moment in WHATER's story."""
+
     timestamp: datetime
     tool_name: str
     narrative: str  # 2-3 dramatic sentences
@@ -71,6 +73,7 @@ class NarrativeContext:
     Strategic planning is handled by plan.txt (updated via strategic reflection).
     This class only maintains the factual captain's log segments.
     """
+
     segments: list[NarrativeSegment] = field(default_factory=list)
     chapter: int = 1  # Current chapter number
     chapter_title: str = "Awakening"  # Current chapter title
@@ -145,8 +148,7 @@ class NarrativeContext:
                 context.chapter = state.get("chapter", 1)
                 context.chapter_title = state.get("chapter_title", "Awakening")
                 context.segments = [
-                    NarrativeSegment.from_dict(s)
-                    for s in state.get("segments", [])
+                    NarrativeSegment.from_dict(s) for s in state.get("segments", [])
                 ]
                 return context
             except (json.JSONDecodeError, KeyError):
@@ -193,9 +195,7 @@ def generate_narrative(
 
     # Build story context from recent segments
     if context.segments:
-        story_so_far = "\n".join(
-            f"• {seg.narrative}" for seg in context.segments[-3:]
-        )
+        story_so_far = "\n".join(f"• {seg.narrative}" for seg in context.segments[-3:])
     else:
         story_so_far = "(This is the beginning of your story.)"
 
@@ -281,9 +281,11 @@ def generate_strategic_reflection(
         The response_dict contains the full JSON including recommended_plan
     """
     # Build a summary of recent narrative
-    recent_narrative = "\n".join(
-        f"• {seg.narrative}" for seg in context.segments[-5:]
-    ) if context.segments else "(No recent events)"
+    recent_narrative = (
+        "\n".join(f"• {seg.narrative}" for seg in context.segments[-5:])
+        if context.segments
+        else "(No recent events)"
+    )
 
     prompt = f"""{NARRATOR_PERSONA}
 

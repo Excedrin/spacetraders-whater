@@ -7,6 +7,7 @@ This bot uses a custom agent loop with two distinct LLM calls:
 
 Narrative generation happens in parallel during tool downtime (navigation, cooldowns).
 """
+
 import ast
 import json
 import os
@@ -16,18 +17,26 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
-                                     ToolMessage, messages_from_dict,
-                                     messages_to_dict)
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    messages_from_dict,
+    messages_to_dict,
+)
 from langchain_ollama import ChatOllama
 from rich.console import Console
 
 from events import write_event
-from narrative import (NarrativeContext, NarrativeSegment, generate_narrative,
-                       generate_strategic_reflection)
+from narrative import (
+    NarrativeContext,
+    NarrativeSegment,
+    generate_narrative,
+    generate_strategic_reflection,
+)
 from ship_status import FleetTracker
-from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS,
-                   client)
+from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS, client
 from tools import get_engine as get_behavior_engine
 from tools import get_tool_by_name, load_market_cache, set_fleet
 
@@ -58,10 +67,20 @@ MAX_QUEUED_ACTIONS = 3  # Max queued actions per ship
 
 # State-changing tools (tools that modify ship state — not read-only)
 STATE_CHANGING_TOOLS = {
-    "navigate_ship", "extract_ore", "sell_cargo", "jettison_cargo",
-    "transfer_cargo", "refuel_ship", "deliver_contract", "dock_ship",
-    "orbit_ship", "survey_asteroid", "scan_waypoints", "scan_ships",
-    "jump_ship", "warp_ship",
+    "navigate_ship",
+    "extract_ore",
+    "sell_cargo",
+    "jettison_cargo",
+    "transfer_cargo",
+    "refuel_ship",
+    "deliver_contract",
+    "dock_ship",
+    "orbit_ship",
+    "survey_asteroid",
+    "scan_waypoints",
+    "scan_ships",
+    "jump_ship",
+    "warp_ship",
 }
 
 
@@ -69,7 +88,9 @@ class ActionQueue:
     """Ephemeral per-ship action queue for serializing operations on busy ships."""
 
     def __init__(self):
-        self.queues: dict[str, list[tuple[str, dict]]] = {}  # ship -> [(tool_name, args)]
+        self.queues: dict[str, list[tuple[str, dict]]] = (
+            {}
+        )  # ship -> [(tool_name, args)]
 
     def enqueue(self, ship_symbol: str, tool_name: str, args: dict) -> str:
         if ship_symbol not in self.queues:
@@ -96,10 +117,10 @@ class ActionQueue:
 
 # Tools whose successful results are already captured in game state and can be compressed
 REDUNDANT_RESULT_TOOLS = {
-    "update_plan",      # plan is in [Current Plan]
-    "view_ships",       # fleet is in [Fleet Status]
-    "view_agent",       # agent is in [Agent]
-    "view_contracts",   # contracts is in [Contracts]
+    "update_plan",  # plan is in [Current Plan]
+    "view_ships",  # fleet is in [Fleet Status]
+    "view_agent",  # agent is in [Agent]
+    "view_contracts",  # contracts is in [Contracts]
 }
 
 # Narrative generation (doubles inference time per iteration)
@@ -177,6 +198,7 @@ If a ship triggers an [ALERT] (e.g., CARGO_FULL, NO_FUEL):
 #  Session persistence
 # ──────────────────────────────────────────────
 
+
 def _get_turn_signature(turn: list) -> tuple:
     """
     Extract a signature from a turn to detect duplicate action sequences.
@@ -187,18 +209,30 @@ def _get_turn_signature(turn: list) -> tuple:
     """
     signature = []
     for msg in turn:
-        if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
                 # Extract tool name and key identifying arguments
-                tool_name = tc.get('name', '?')
-                args = tc.get('args', {})
+                tool_name = tc.get("name", "?")
+                args = tc.get("args", {})
 
                 # For most tools, the key args are ship_symbol and/or waypoint_symbol
                 # This is enough to detect duplicate actions
-                key_args = tuple(sorted([
-                    (k, v) for k, v in args.items()
-                    if k in ['ship_symbol', 'waypoint_symbol', 'trade_symbol', 'contract_id', 'units']
-                ]))
+                key_args = tuple(
+                    sorted(
+                        [
+                            (k, v)
+                            for k, v in args.items()
+                            if k
+                            in [
+                                "ship_symbol",
+                                "waypoint_symbol",
+                                "trade_symbol",
+                                "contract_id",
+                                "units",
+                            ]
+                        ]
+                    )
+                )
 
                 signature.append((tool_name, key_args))
 
@@ -207,7 +241,11 @@ def _get_turn_signature(turn: list) -> tuple:
     return tuple(sorted(signature))
 
 
-def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max_tokens: int = MAX_TOKENS_ESTIMATE) -> list:
+def prune_messages(
+    messages: list,
+    max_recent_turns: int = MAX_RECENT_TURNS,
+    max_tokens: int = MAX_TOKENS_ESTIMATE,
+) -> list:
     """
     Prune message history to keep context manageable.
 
@@ -295,11 +333,15 @@ def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max
 
             if isinstance(msg, AIMessage):
                 # Replace verbose reasoning with brief action summary
-                if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                    tool_names = [tc.get('name', '?') for tc in msg.tool_calls]
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    tool_names = [tc.get("name", "?") for tc in msg.tool_calls]
 
                     # Filter out redundant state-updating tools (their effects are in game state)
-                    action_tools = [name for name in tool_names if name not in REDUNDANT_RESULT_TOOLS]
+                    action_tools = [
+                        name
+                        for name in tool_names
+                        if name not in REDUNDANT_RESULT_TOOLS
+                    ]
 
                     # If only redundant tools were called, skip this entire turn
                     if not action_tools:
@@ -307,13 +349,14 @@ def prune_messages(messages: list, max_recent_turns: int = MAX_RECENT_TURNS, max
 
                     # Create a new AIMessage with minimal content
                     from langchain_core.messages import AIMessage as AI
+
                     content = f"Actions: {', '.join(action_tools)}"
                     if repeat_count and repeat_count > 1:
                         content = f"{content} [repeated {repeat_count}x]"
 
                     cleaned_msg = AI(
                         content=content,
-                        tool_calls=msg.tool_calls  # Keep tool calls for linking to ToolMessages
+                        tool_calls=msg.tool_calls,  # Keep tool calls for linking to ToolMessages
                     )
                     cleaned_turn.append(cleaned_msg)
                 elif msg.content:
@@ -417,20 +460,24 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
         nav = s.get("nav", {})
         fuel = s.get("fuel", {})
         cargo = s.get("cargo", {})
-        role = s.get('registration', {}).get('role', '?')
+        role = s.get("registration", {}).get("role", "?")
         caps = _get_ship_capabilities(s)
 
-        lines.append(f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]")
+        lines.append(
+            f"\n{s['symbol']} ({role}) @ {nav.get('waypointSymbol', '?')} [{nav.get('status', '?')}]"
+        )
 
         # Fuel - make it VERY clear when ship doesn't use fuel
-        if fuel.get('capacity', 0) == 0:
+        if fuel.get("capacity", 0) == 0:
             lines.append(f"  Fuel: SOLAR POWERED (FREE MOVEMENT - NO FUEL COST)")
         else:
-            lines.append(f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}")
+            lines.append(
+                f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}"
+            )
 
         # Cargo with percentage
-        cap = cargo.get('capacity', 0)
-        units = cargo.get('units', 0)
+        cap = cargo.get("capacity", 0)
+        units = cargo.get("units", 0)
         if cap == 0:
             lines.append(f"  Cargo: N/A")
         else:
@@ -448,10 +495,12 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
             lines.append(f"  Capabilities: CAN_NAVIGATE (FREE - uses no fuel)")
 
         # Cooldown info from fleet tracker
-        ship_status = fleet.get_ship(s['symbol'])
+        ship_status = fleet.get_ship(s["symbol"])
         if ship_status and not ship_status.is_available():
             secs = ship_status.seconds_until_available()
-            lines.append(f"  Cooldown: {ship_status.busy_reason}, {secs:.0f}s remaining")
+            lines.append(
+                f"  Cooldown: {ship_status.busy_reason}, {secs:.0f}s remaining"
+            )
 
     return lines
 
@@ -496,16 +545,18 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
         contracts = client.list_contracts()
         if isinstance(contracts, list):
             # Filter out fulfilled contracts immediately
-            active_contracts = [c for c in contracts if not c.get('fulfilled')]
+            active_contracts = [c for c in contracts if not c.get("fulfilled")]
 
             if active_contracts:
                 lines = ["[Contracts]"]
                 for c in active_contracts:
-                    status = "ACTIVE" if c.get('accepted') else "AVAILABLE"
+                    status = "ACTIVE" if c.get("accepted") else "AVAILABLE"
                     lines.append(f"\n{c['id']} ({c.get('type', '?')}) - {status}")
                     terms = c.get("terms", {})
                     payment = terms.get("payment", {})
-                    lines.append(f"  Payment: {payment.get('onAccepted', 0)} upfront, {payment.get('onFulfilled', 0)} on completion")
+                    lines.append(
+                        f"  Payment: {payment.get('onAccepted', 0)} upfront, {payment.get('onFulfilled', 0)} on completion"
+                    )
                     for d in terms.get("deliver", []):
                         lines.append(
                             f"  Deliver: {d.get('unitsRequired', '?')} {d.get('tradeSymbol', '?')} "
@@ -513,11 +564,15 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
                             f"({d.get('unitsFulfilled', 0)}/{d.get('unitsRequired', '?')} done)"
                         )
                     # Add expiration if available to create urgency
-                    if c.get('deadlineToAccept'):
-                        lines.append(f"  Deadline to Accept: {c.get('deadlineToAccept')}")
+                    if c.get("deadlineToAccept"):
+                        lines.append(
+                            f"  Deadline to Accept: {c.get('deadlineToAccept')}"
+                        )
                 sections.append("\n".join(lines))
             else:
-                sections.append("[Contracts]\nNo active contracts. Consider negotiating a new one at HQ.")
+                sections.append(
+                    "[Contracts]\nNo active contracts. Consider negotiating a new one at HQ."
+                )
     except Exception:
         pass
 
@@ -532,7 +587,9 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
         if "No trade routes found" in trade_summary:
             market_cache = load_market_cache()
             market_count = len(market_cache)
-            sections.append(f"[Market Intelligence]\n{trade_summary}\n(Cached markets: {market_count}. Use 'view_market' or 'scan_system' to find details.)")
+            sections.append(
+                f"[Market Intelligence]\n{trade_summary}\n(Cached markets: {market_count}. Use 'view_market' or 'scan_system' to find details.)"
+            )
         else:
             sections.append(f"[Market Intelligence]\n{trade_summary}")
 
@@ -542,7 +599,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     # Shipyard Intel (Synthesized from Cache)
     try:
         market_cache = load_market_cache()
-        ship_prices = {} # type -> (price, waypoint)
+        ship_prices = {}  # type -> (price, waypoint)
         for wp, data in market_cache.items():
             if "ships" in data:
                 for s in data["ships"]:
@@ -567,6 +624,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
         plan_age = ""
         if PLAN_FILE.exists():
             import time
+
             mtime = PLAN_FILE.stat().st_mtime
             age_seconds = time.time() - mtime
             if age_seconds < 60:
@@ -576,7 +634,9 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
             elif age_seconds < 3600:
                 plan_age = f" (updated {int(age_seconds / 60)}min ago)"
             else:
-                plan_age = f" (updated {int(age_seconds / 3600)}h ago - may need refresh)"
+                plan_age = (
+                    f" (updated {int(age_seconds / 3600)}h ago - may need refresh)"
+                )
 
         sections.append(f"[Current Plan]{plan_age}\n{plan}")
 
@@ -588,6 +648,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
 # ──────────────────────────────────────────────
 #  Display helpers
 # ──────────────────────────────────────────────
+
 
 def display_title():
     """Display the epic title banner."""
@@ -601,7 +662,9 @@ def display_title():
     console.print(f"[bold bright_cyan]{title}[/bold bright_cyan]")
     tier_label = f"Tier {TOOL_TIER}" if TOOL_TIER == 1 else "All tools"
     tool_count = len(TIER_1_TOOLS) if TOOL_TIER == 1 else len(ALL_TOOLS)
-    console.print(f"  [dim]Model: [cyan]{MODEL}[/cyan] @ [cyan]{OLLAMA_BASE_URL}[/cyan] | Tools: [cyan]{tier_label} ({tool_count})[/cyan][/dim]")
+    console.print(
+        f"  [dim]Model: [cyan]{MODEL}[/cyan] @ [cyan]{OLLAMA_BASE_URL}[/cyan] | Tools: [cyan]{tier_label} ({tool_count})[/cyan][/dim]"
+    )
     console.rule(style="dim cyan")
 
 
@@ -659,11 +722,11 @@ def estimate_token_count(messages: list) -> tuple[int, int]:
     """Estimate token count for messages. Returns (char_count, estimated_tokens)."""
     total_chars = 0
     for msg in messages:
-        content = msg.content if hasattr(msg, 'content') else str(msg)
+        content = msg.content if hasattr(msg, "content") else str(msg)
         if content:
             total_chars += len(content)
         # Also count tool calls if present
-        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
                 total_chars += len(str(tc))
     # Rough estimate: ~4 chars per token for English text
@@ -675,7 +738,9 @@ def display_thinking(messages: list = None):
     """Show that the bot is thinking, with context size info."""
     if messages:
         chars, tokens = estimate_token_count(messages)
-        console.print(f"  [dim]🤔 Deciding next action... ({len(messages)} msgs, ~{tokens:,} tokens, {chars:,} chars)[/dim]")
+        console.print(
+            f"  [dim]🤔 Deciding next action... ({len(messages)} msgs, ~{tokens:,} tokens, {chars:,} chars)[/dim]"
+        )
     else:
         console.print("  [dim]🤔 Deciding next action...[/dim]")
 
@@ -687,19 +752,19 @@ def display_decision(response):
         content = response
         thinking = None
     else:
-        content = response.content if hasattr(response, 'content') else str(response)
+        content = response.content if hasattr(response, "content") else str(response)
         # Check for thinking in various places models might put it
         thinking = None
-        if hasattr(response, 'additional_kwargs'):
-            thinking = response.additional_kwargs.get('thinking')
-        if not thinking and hasattr(response, 'response_metadata'):
-            thinking = response.response_metadata.get('thinking')
+        if hasattr(response, "additional_kwargs"):
+            thinking = response.additional_kwargs.get("thinking")
+        if not thinking and hasattr(response, "response_metadata"):
+            thinking = response.response_metadata.get("thinking")
 
     # Display thinking first if present
     if thinking:
         console.print(f"  [dim cyan]💭 Thinking:[/dim cyan]")
         thinking_text = thinking if isinstance(thinking, str) else str(thinking)
-        for line in thinking_text.split('\n'):
+        for line in thinking_text.split("\n"):
             console.print(f"    [dim cyan]{line}[/dim cyan]")
 
     # Display main content
@@ -731,21 +796,27 @@ def auto_discover_markets() -> list[tuple[str, str, bool]]:
         system = nav.get("systemSymbol", "")
 
         # Skip if we already checked this waypoint or already know this market
-        if not wp_symbol or not system or wp_symbol in checked or wp_symbol in market_cache:
+        if (
+            not wp_symbol
+            or not system
+            or wp_symbol in checked
+            or wp_symbol in market_cache
+        ):
             continue
 
         checked.add(wp_symbol)
 
         # Try to view market at this waypoint
         try:
-            result = view_market.invoke({
-                "system_symbol": system,
-                "waypoint_symbol": wp_symbol
-            })
+            result = view_market.invoke(
+                {"system_symbol": system, "waypoint_symbol": wp_symbol}
+            )
 
             # Only log if we actually found market data (not "No market" error)
             if "Market at" in result and "No market" not in result:
-                console.print(f"  [dim green]🔍 Auto-discovered market at {wp_symbol}[/dim green]")
+                console.print(
+                    f"  [dim green]🔍 Auto-discovered market at {wp_symbol}[/dim green]"
+                )
                 discovered.append(("view_market", result, False))
         except Exception:
             pass  # Silently skip if waypoint has no market
@@ -772,13 +843,15 @@ def discover_all_markets(fleet: FleetTracker):
         # 1. Fetch all relevant waypoints
         # We fetch both traits to ensure we have a complete map
         market_wps = client.list_waypoints(system, traits="MARKETPLACE")
-        if isinstance(market_wps, dict) and "error" in market_wps: market_wps = []
+        if isinstance(market_wps, dict) and "error" in market_wps:
+            market_wps = []
 
         shipyard_wps = client.list_waypoints(system, traits="SHIPYARD")
-        if isinstance(shipyard_wps, dict) and "error" in shipyard_wps: shipyard_wps = []
+        if isinstance(shipyard_wps, dict) and "error" in shipyard_wps:
+            shipyard_wps = []
 
         # Merge by symbol to handle waypoints that might be both
-        all_wps = {w['symbol']: w for w in (market_wps + shipyard_wps)}
+        all_wps = {w["symbol"]: w for w in (market_wps + shipyard_wps)}
 
         # 2. Update Cache & Hydrate Missing Data
         cache = load_market_cache()
@@ -789,14 +862,14 @@ def discover_all_markets(fleet: FleetTracker):
             _save_market_to_cache(wp_sym, wp_data)
 
             # Check if this is a market
-            traits = [t['symbol'] for t in wp_data.get('traits', [])]
+            traits = [t["symbol"] for t in wp_data.get("traits", [])]
             if "MARKETPLACE" in traits:
                 # Check if we already have structural data (imports/exports)
                 cached_entry = cache.get(wp_sym, {})
                 has_structure = (
-                    cached_entry.get("imports") or
-                    cached_entry.get("exports") or
-                    cached_entry.get("exchange")
+                    cached_entry.get("imports")
+                    or cached_entry.get("exports")
+                    or cached_entry.get("exchange")
                 )
 
                 # If cache is empty/incomplete, fetch full market details
@@ -808,7 +881,9 @@ def discover_all_markets(fleet: FleetTracker):
                         time.sleep(0.2)  # Rate limit kindness
 
         if api_calls > 0:
-            console.print(f"  [dim green]Hydrated {api_calls} markets in {system}[/dim green]")
+            console.print(
+                f"  [dim green]Hydrated {api_calls} markets in {system}[/dim green]"
+            )
 
 
 def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeContext):
@@ -836,6 +911,7 @@ def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeCo
 #  LLM decision cycle (one call + tool execution)
 # ──────────────────────────────────────────────
 
+
 def _run_llm_cycle(
     messages: list,
     context: NarrativeContext,
@@ -858,13 +934,18 @@ def _run_llm_cycle(
     old_count = len(messages)
     messages = prune_messages(messages)
     if len(messages) < old_count:
-        console.print(f"  [dim yellow]Pruned {old_count - len(messages)} old messages[/dim yellow]")
+        console.print(
+            f"  [dim yellow]Pruned {old_count - len(messages)} old messages[/dim yellow]"
+        )
 
     # Remove stale game state before injecting fresh one
     messages = [
-        msg for msg in messages
-        if not (isinstance(msg, SystemMessage) and
-                "=== CURRENT GAME STATE ===" in msg.content)
+        msg
+        for msg in messages
+        if not (
+            isinstance(msg, SystemMessage)
+            and "=== CURRENT GAME STATE ===" in msg.content
+        )
     ]
 
     # Build fresh game state, appending behavior status and any alerts
@@ -878,15 +959,19 @@ def _run_llm_cycle(
 
     # Debug: dump full prompt
     if debug:
-        console.print("\n[bold yellow]===== DEBUG: Full LLM Context =====[/bold yellow]")
+        console.print(
+            "\n[bold yellow]===== DEBUG: Full LLM Context =====[/bold yellow]"
+        )
 
         for i, msg in enumerate(messages):
             msg_type = type(msg).__name__
-            content = msg.content if hasattr(msg, 'content') else str(msg)
+            content = msg.content if hasattr(msg, "content") else str(msg)
 
             if isinstance(msg, SystemMessage):
                 if "=== CURRENT GAME STATE ===" in content:
-                    console.print(f"[yellow]--- [{i}] CURRENT GAME STATE (injected) ---[/yellow]")
+                    console.print(
+                        f"[yellow]--- [{i}] CURRENT GAME STATE (injected) ---[/yellow]"
+                    )
                     console.print(f"[cyan]{content}[/cyan]")
                 else:
                     console.print(f"[yellow]--- [{i}] SYSTEM PROMPT ---[/yellow]")
@@ -900,27 +985,34 @@ def _run_llm_cycle(
                 console.print(f"[yellow]--- [{i}] AI DECISION ---[/yellow]")
                 if content and content.strip():
                     console.print(f"[dim italic]{content}[/dim italic]")
-                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
-                        tool_name = tc.get('name', '?')
-                        tool_args = tc.get('args', {})
+                        tool_name = tc.get("name", "?")
+                        tool_args = tc.get("args", {})
                         args_str = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
                         console.print(f"[green]  → {tool_name}({args_str})[/green]")
 
             elif isinstance(msg, ToolMessage):
-                tool_id = msg.tool_call_id if hasattr(msg, 'tool_call_id') else '?'
+                tool_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else "?"
                 tool_name = "?"
                 if i > 0:
-                    for j in range(i-1, -1, -1):
-                        if isinstance(messages[j], AIMessage) and hasattr(messages[j], 'tool_calls'):
+                    for j in range(i - 1, -1, -1):
+                        if isinstance(messages[j], AIMessage) and hasattr(
+                            messages[j], "tool_calls"
+                        ):
                             for tc in messages[j].tool_calls:
-                                if tc.get('id') == tool_id:
-                                    tool_name = tc.get('name', '?')
+                                if tc.get("id") == tool_id:
+                                    tool_name = tc.get("name", "?")
                                     break
                             if tool_name != "?":
                                 break
 
-                informational_tools = {"view_ships", "view_agent", "view_contracts", "list_ships"}
+                informational_tools = {
+                    "view_ships",
+                    "view_agent",
+                    "view_contracts",
+                    "list_ships",
+                }
                 if content == "OK":
                     console.print(f"[dim]  ← {tool_name}: OK[/dim]")
                 elif "Error:" in content:
@@ -930,7 +1022,9 @@ def _run_llm_cycle(
                 else:
                     console.print(f"[dim]  ← {tool_name}: {content}[/dim]")
 
-        console.print(f"[yellow]--- Available tools: {', '.join(t.name for t in active_tools)} ---[/yellow]")
+        console.print(
+            f"[yellow]--- Available tools: {', '.join(t.name for t in active_tools)} ---[/yellow]"
+        )
         console.print("[bold yellow]===== END DEBUG =====[/bold yellow]\n")
 
     # DECIDE — call LLM with tools
@@ -942,7 +1036,10 @@ def _run_llm_cycle(
 
     messages.append(response)
 
-    if response.content or (hasattr(response, 'additional_kwargs') and response.additional_kwargs.get('thinking')):
+    if response.content or (
+        hasattr(response, "additional_kwargs")
+        and response.additional_kwargs.get("thinking")
+    ):
         display_decision(response)
         if response.content and "MISSION COMPLETE" in response.content.upper():
             console.print("\n  [bold green]✓ Mission complete![/bold green]")
@@ -950,8 +1047,14 @@ def _run_llm_cycle(
 
     if not response.tool_calls:
         if not response.content:
-            console.print("  [yellow]No action taken. Prompting to continue...[/yellow]")
-            messages.append(HumanMessage(content="Please take an action or say MISSION COMPLETE if done."))
+            console.print(
+                "  [yellow]No action taken. Prompting to continue...[/yellow]"
+            )
+            messages.append(
+                HumanMessage(
+                    content="Please take an action or say MISSION COMPLETE if done."
+                )
+            )
         return messages
 
     # EXECUTE — run each tool
@@ -973,8 +1076,10 @@ def _run_llm_cycle(
                 has_behavior = ship_symbol in behavior_engine.behaviors
                 if has_behavior:
                     secs = ship_status.seconds_until_available()
-                    result = (f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining) "
-                              f"and has an active behavior. cancel_behavior first to operate manually.")
+                    result = (
+                        f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining) "
+                        f"and has an active behavior. cancel_behavior first to operate manually."
+                    )
                     is_error = True
                     ship_blocked = True
                 elif action_queue and tool_name in STATE_CHANGING_TOOLS:
@@ -1016,10 +1121,12 @@ def _run_llm_cycle(
         msg_content = result
         if not is_error and tool_name in REDUNDANT_RESULT_TOOLS:
             msg_content = "OK"
-        messages.append(ToolMessage(
-            content=msg_content,
-            tool_call_id=tool_call["id"],
-        ))
+        messages.append(
+            ToolMessage(
+                content=msg_content,
+                tool_call_id=tool_call["id"],
+            )
+        )
 
     # AUTO-DISCOVER: Check markets at ship locations after tool execution
     if tool_results:
@@ -1029,9 +1136,12 @@ def _run_llm_cycle(
     # Refresh game state immediately after tool execution
     if tool_results:
         messages = [
-            msg for msg in messages
-            if not (isinstance(msg, SystemMessage) and
-                    "=== CURRENT GAME STATE ===" in msg.content)
+            msg
+            for msg in messages
+            if not (
+                isinstance(msg, SystemMessage)
+                and "=== CURRENT GAME STATE ===" in msg.content
+            )
         ]
         console.print("  [dim]Refreshing game state after actions...[/dim]")
         fresh_state = gather_game_state(fleet, context)
@@ -1040,12 +1150,20 @@ def _run_llm_cycle(
             messages.append(SystemMessage(content=fresh_state))
 
     # NARRATE (optional)
-    narrative_tool_results = [(name, result) for name, result, is_err in tool_results if not is_err]
+    narrative_tool_results = [
+        (name, result) for name, result, is_err in tool_results if not is_err
+    ]
     fleet_state = fleet.fleet_summary() if has_significant_action else ""
 
-    if ENABLE_PER_ACTION_NARRATIVE and has_significant_action and narrative_tool_results:
+    if (
+        ENABLE_PER_ACTION_NARRATIVE
+        and has_significant_action
+        and narrative_tool_results
+    ):
         console.print("  [dim]📝 Generating log entry...[/dim]")
-        segment = generate_narrative(narrative_tool_results, context, MODEL, fleet_state)
+        segment = generate_narrative(
+            narrative_tool_results, context, MODEL, fleet_state
+        )
         if segment:
             context.add_segment(segment)
             context.persist()
@@ -1058,6 +1176,7 @@ def _run_llm_cycle(
 # ──────────────────────────────────────────────
 #  Agent loop
 # ──────────────────────────────────────────────
+
 
 def run_agent(fresh_start: bool = False, debug: bool = False):
     """Main agent loop with integrated narrative.
@@ -1086,13 +1205,21 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         saved = load_session()
         if saved:
             messages, start_iteration = saved
-            console.print(f"  [green]Resuming from iteration {start_iteration + 1}[/green]")
-            console.print(f"  [dim]Loaded {len(messages)} messages from previous session[/dim]")
+            console.print(
+                f"  [green]Resuming from iteration {start_iteration + 1}[/green]"
+            )
+            console.print(
+                f"  [dim]Loaded {len(messages)} messages from previous session[/dim]"
+            )
 
             # Remove any old system prompts from loaded session
             messages = [
-                msg for msg in messages
-                if not (isinstance(msg, SystemMessage) and msg.content.strip().startswith("You are WHATER"))
+                msg
+                for msg in messages
+                if not (
+                    isinstance(msg, SystemMessage)
+                    and msg.content.strip().startswith("You are WHATER")
+                )
             ]
 
             # Always prepend the latest SYSTEM_PROMPT
@@ -1105,7 +1232,9 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 messages.append(SystemMessage(content=fresh_state))
 
             # Discover all marketplace waypoints in all known systems
-            console.print("  [dim]Discovering all marketplaces in known systems...[/dim]")
+            console.print(
+                "  [dim]Discovering all marketplaces in known systems...[/dim]"
+            )
             discover_all_markets(fleet)
             auto_discover_markets()
 
@@ -1113,7 +1242,14 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             fresh_state = gather_game_state(fleet, context)
             if fresh_state:
                 # Replace the previous game state with updated one
-                messages = [msg for msg in messages if not (isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content)]
+                messages = [
+                    msg
+                    for msg in messages
+                    if not (
+                        isinstance(msg, SystemMessage)
+                        and "=== CURRENT GAME STATE ===" in msg.content
+                    )
+                ]
                 messages.append(SystemMessage(content=fresh_state))
             console.print()
 
@@ -1138,18 +1274,31 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         fresh_state = gather_game_state(fleet, context)
         if fresh_state:
             # Replace the previous game state with updated one
-            messages = [msg for msg in messages if not (isinstance(msg, SystemMessage) and "=== CURRENT GAME STATE ===" in msg.content)]
+            messages = [
+                msg
+                for msg in messages
+                if not (
+                    isinstance(msg, SystemMessage)
+                    and "=== CURRENT GAME STATE ===" in msg.content
+                )
+            ]
             messages.append(SystemMessage(content=fresh_state))
 
-        messages.append(HumanMessage(
-            content="Review [Behavior Status]. Assign behaviors to any IDLE ships. If all ships are already assigned, check [ALERTS] and handle any that are present."
-        ))
+        messages.append(
+            HumanMessage(
+                content="Review [Behavior Status]. Assign behaviors to any IDLE ships. If all ships are already assigned, check [ALERTS] and handle any that are present."
+            )
+        )
 
     # Always run strategic reflection on startup to ensure fresh plan
     if not load_plan():  # Only if no plan exists
-        console.print("\n  [yellow]🔮 No plan found - running strategic reflection...[/yellow]")
+        console.print(
+            "\n  [yellow]🔮 No plan found - running strategic reflection...[/yellow]"
+        )
         game_state = gather_game_state(fleet, context)
-        reflection_segment, reflection_data = generate_strategic_reflection(context, game_state, MODEL)
+        reflection_segment, reflection_data = generate_strategic_reflection(
+            context, game_state, MODEL
+        )
 
         if reflection_segment:
             context.add_segment(reflection_segment)
@@ -1161,8 +1310,11 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 recommended_plan = reflection_data["recommended_plan"]
                 if recommended_plan:
                     from tools import update_plan
+
                     result = update_plan.invoke({"plan": recommended_plan})
-                    console.print(f"  [dim green]📋 Initial plan created: {result}[/dim green]")
+                    console.print(
+                        f"  [dim green]📋 Initial plan created: {result}[/dim green]"
+                    )
 
     iteration = start_iteration
     alert_queue: list[str] = []
@@ -1177,18 +1329,26 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         # Execute queued actions for ships that just became available.
         for ship_symbol in list(fleet.ships):
             ship_status = fleet.get_ship(ship_symbol)
-            if ship_status and ship_status.is_available() and action_queue.has_queued(ship_symbol):
+            if (
+                ship_status
+                and ship_status.is_available()
+                and action_queue.has_queued(ship_symbol)
+            ):
                 action = action_queue.get_ready(ship_symbol)
                 if action:
                     tool_name, tool_args = action
-                    console.print(f"  [dim green]Executing queued {tool_name} for {ship_symbol}[/dim green]")
+                    console.print(
+                        f"  [dim green]Executing queued {tool_name} for {ship_symbol}[/dim green]"
+                    )
                     tool_func = get_tool_by_name(tool_name)
                     if tool_func:
                         try:
                             result = tool_func.invoke(tool_args)
                             display_tool_result(tool_name, result, "Error:" in result)
                         except Exception as e:
-                            console.print(f"    [red]Queued {tool_name} failed: {e}[/red]")
+                            console.print(
+                                f"    [red]Queued {tool_name} failed: {e}[/red]"
+                            )
 
         # ── TACTICAL LAYER ────────────────────────────────────────────────
         # Tick all ship behaviors. Fast — no LLM involved.
@@ -1198,7 +1358,9 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             cfg = behavior_engine.behaviors.get(ship_symbol)
             if cfg and cfg.last_action:
                 status_color = "red" if "ERROR" in cfg.last_action else "dim green"
-                console.print(f"  [{status_color}]⚙ {ship_symbol}: {cfg.last_action}[/{status_color}]")
+                console.print(
+                    f"  [{status_color}]⚙ {ship_symbol}: {cfg.last_action}[/{status_color}]"
+                )
             if alert and alert not in alert_queue:
                 alert_queue.append(alert)
 
@@ -1216,7 +1378,9 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         if ENABLE_LLM and (has_alerts or idle_ships or strategic_review_needed):
             # If waking up strictly for strategy, inject a prompt
             if strategic_review_needed and not has_alerts and not idle_ships:
-                console.print(f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]")
+                console.print(
+                    f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]"
+                )
                 # We add this to alert_queue so it gets passed to the LLM context
                 alert_queue.append(
                     f"PERIODIC_STRATEGIC_REVIEW: It has been {int(time_since_strategy/60)} minutes since the last review. "
@@ -1228,7 +1392,9 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 has_alerts = True
 
             if idle_ships:
-                console.print(f"  [dim]Idle ships (no behavior): {', '.join(idle_ships)}[/dim]")
+                console.print(
+                    f"  [dim]Idle ships (no behavior): {', '.join(idle_ships)}[/dim]"
+                )
 
             alert_text = "\n".join(alert_queue)
             alert_queue.clear()

@@ -1,6 +1,7 @@
 import sys
-import time
 import threading
+import time
+
 import requests
 
 BASE_URL = "https://api.spacetraders.io/v2"
@@ -9,11 +10,13 @@ _RETRYABLE = (
     requests.exceptions.Timeout,
 )
 
+
 class RateLimiter:
     """
     Thread-safe Token Bucket Rate Limiter.
     Ensures we don't exceed max_rate requests per second.
     """
+
     def __init__(self, max_rate: float = 2.0, time_period: float = 1.0):
         self._max_tokens = max_rate
         self._tokens = max_rate
@@ -46,13 +49,16 @@ class RateLimiter:
                 wait_time = needed / self._refill_rate
                 time.sleep(wait_time)
 
+
 class SpaceTradersClient:
     def __init__(self, token: str):
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+        )
         self._cache = {}
         self._cache_ttl = 3.0
 
@@ -78,10 +84,16 @@ class SpaceTradersClient:
             self._limiter.acquire()
 
             try:
-                resp = self.session.request("GET", f"{BASE_URL}{endpoint}", params=params_with_page, timeout=30)
+                resp = self.session.request(
+                    "GET", f"{BASE_URL}{endpoint}", params=params_with_page, timeout=30
+                )
             except _RETRYABLE:
                 # On connection error, return what we have so far
-                return all_data if all_data else {"error": "Connection failed during pagination"}
+                return (
+                    all_data
+                    if all_data
+                    else {"error": "Connection failed during pagination"}
+                )
 
             if resp.status_code == 204 or not resp.content:
                 break
@@ -156,7 +168,10 @@ class SpaceTradersClient:
             if resp.status_code == 429:
                 # If we hit this, our local limiter was slightly off or server is strict
                 retry_after = float(resp.headers.get("Retry-After", 2))
-                print(f"[429] Rate limit hit. Server requested wait: {retry_after}s", file=sys.stderr)
+                print(
+                    f"[429] Rate limit hit. Server requested wait: {retry_after}s",
+                    file=sys.stderr,
+                )
                 time.sleep(retry_after)
                 continue
 
@@ -193,12 +208,18 @@ class SpaceTradersClient:
     def accept_contract(self, contract_id: str) -> dict:
         return self._request("POST", f"/my/contracts/{contract_id}/accept")
 
-    def deliver_contract(self, contract_id: str, ship_symbol: str, trade_symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/contracts/{contract_id}/deliver", json={
-            "shipSymbol": ship_symbol,
-            "tradeSymbol": trade_symbol,
-            "units": units,
-        })
+    def deliver_contract(
+        self, contract_id: str, ship_symbol: str, trade_symbol: str, units: int
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/my/contracts/{contract_id}/deliver",
+            json={
+                "shipSymbol": ship_symbol,
+                "tradeSymbol": trade_symbol,
+                "units": units,
+            },
+        )
 
     def fulfill_contract(self, contract_id: str) -> dict:
         return self._request("POST", f"/my/contracts/{contract_id}/fulfill")
@@ -225,10 +246,14 @@ class SpaceTradersClient:
         return self._request("GET", f"/my/ships/{ship}")
 
     def purchase_ship(self, ship_type: str, waypoint: str) -> dict:
-        return self._request("POST", "/my/ships", json={
-            "shipType": ship_type,
-            "waypointSymbol": waypoint,
-        })
+        return self._request(
+            "POST",
+            "/my/ships",
+            json={
+                "shipType": ship_type,
+                "waypointSymbol": waypoint,
+            },
+        )
 
     def get_cargo(self, ship: str) -> dict:
         return self._request("GET", f"/my/ships/{ship}/cargo")
@@ -240,9 +265,13 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/ships/{ship}/dock")
 
     def navigate(self, ship: str, waypoint: str) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/navigate", json={
-            "waypointSymbol": waypoint,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/navigate",
+            json={
+                "waypointSymbol": waypoint,
+            },
+        )
 
     def refuel(self, ship: str) -> dict:
         return self._request("POST", f"/my/ships/{ship}/refuel")
@@ -251,29 +280,47 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/ships/{ship}/extract")
 
     def sell_cargo(self, ship: str, symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/sell", json={
-            "symbol": symbol,
-            "units": units,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/sell",
+            json={
+                "symbol": symbol,
+                "units": units,
+            },
+        )
 
     def buy_cargo(self, ship: str, symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/purchase", json={
-            "symbol": symbol,
-            "units": units,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/purchase",
+            json={
+                "symbol": symbol,
+                "units": units,
+            },
+        )
 
     def jettison(self, ship: str, symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/jettison", json={
-            "symbol": symbol,
-            "units": units,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/jettison",
+            json={
+                "symbol": symbol,
+                "units": units,
+            },
+        )
 
-    def transfer_cargo(self, from_ship: str, to_ship: str, symbol: str, units: int) -> dict:
-        return self._request("POST", f"/my/ships/{from_ship}/transfer", json={
-            "shipSymbol": to_ship,
-            "tradeSymbol": symbol,
-            "units": units,
-        })
+    def transfer_cargo(
+        self, from_ship: str, to_ship: str, symbol: str, units: int
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/my/ships/{from_ship}/transfer",
+            json={
+                "shipSymbol": to_ship,
+                "tradeSymbol": symbol,
+                "units": units,
+            },
+        )
 
     # --- Advanced Ship Operations ---
 
@@ -281,9 +328,13 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/ships/{ship}/survey")
 
     def extract_with_survey(self, ship: str, survey: dict) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/extract/survey", json={
-            "survey": survey,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/extract/survey",
+            json={
+                "survey": survey,
+            },
+        )
 
     def scan_waypoints(self, ship: str) -> dict:
         return self._request("POST", f"/my/ships/{ship}/scan/waypoints")
@@ -295,14 +346,22 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/ships/{ship}/scan/systems")
 
     def jump(self, ship: str, system: str) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/jump", json={
-            "systemSymbol": system,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/jump",
+            json={
+                "systemSymbol": system,
+            },
+        )
 
     def warp(self, ship: str, waypoint: str) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/warp", json={
-            "waypointSymbol": waypoint,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/warp",
+            json={
+                "waypointSymbol": waypoint,
+            },
+        )
 
     def negotiate_contract(self, ship: str) -> dict:
         return self._request("POST", f"/my/ships/{ship}/negotiate/contract")
@@ -311,9 +370,13 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/ships/{ship}/chart")
 
     def refine(self, ship: str, produce: str) -> dict:
-        return self._request("POST", f"/my/ships/{ship}/refine", json={
-            "produce": produce,
-        })
+        return self._request(
+            "POST",
+            f"/my/ships/{ship}/refine",
+            json={
+                "produce": produce,
+            },
+        )
 
     def siphon(self, ship: str) -> dict:
         return self._request("POST", f"/my/ships/{ship}/siphon")
@@ -322,9 +385,13 @@ class SpaceTradersClient:
         return self._request("GET", f"/my/ships/{ship}/cooldown")
 
     def set_flight_mode(self, ship: str, mode: str) -> dict:
-        return self._request("PATCH", f"/my/ships/{ship}/nav", json={
-            "flightMode": mode,
-        })
+        return self._request(
+            "PATCH",
+            f"/my/ships/{ship}/nav",
+            json={
+                "flightMode": mode,
+            },
+        )
 
     # --- Jump Gate ---
 
@@ -334,11 +401,19 @@ class SpaceTradersClient:
     # --- Construction ---
 
     def get_construction(self, system: str, waypoint: str) -> dict:
-        return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/construction")
+        return self._request(
+            "GET", f"/systems/{system}/waypoints/{waypoint}/construction"
+        )
 
-    def supply_construction(self, system: str, waypoint: str, ship: str, symbol: str, units: int) -> dict:
-        return self._request("POST", f"/systems/{system}/waypoints/{waypoint}/construction/supply", json={
-            "shipSymbol": ship,
-            "tradeSymbol": symbol,
-            "units": units,
-        })
+    def supply_construction(
+        self, system: str, waypoint: str, ship: str, symbol: str, units: int
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/systems/{system}/waypoints/{waypoint}/construction/supply",
+            json={
+                "shipSymbol": ship,
+                "tradeSymbol": symbol,
+                "units": units,
+            },
+        )

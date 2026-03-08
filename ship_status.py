@@ -4,6 +4,7 @@ ship_status.py — Track ship cooldowns and availability.
 Maintains local state about which ships are busy (on cooldown, in transit)
 so the bot can make decisions about which ships to use without waiting.
 """
+
 import json
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Optional
 @dataclass
 class ShipStatus:
     """Status of a single ship."""
+
     symbol: str
     role: str = "UNKNOWN"
     location: str = ""
@@ -148,8 +150,12 @@ class FleetTracker:
                 arrival_str = route.get("arrival")
                 if arrival_str:
                     try:
-                        arrival = datetime.fromisoformat(arrival_str.replace("Z", "+00:00"))
-                        remaining = (arrival - datetime.now(timezone.utc)).total_seconds()
+                        arrival = datetime.fromisoformat(
+                            arrival_str.replace("Z", "+00:00")
+                        )
+                        remaining = (
+                            arrival - datetime.now(timezone.utc)
+                        ).total_seconds()
                         if remaining > 0:
                             ship.set_cooldown(remaining, "in_transit")
                     except ValueError:

@@ -23,12 +23,16 @@ client = SpaceTradersClient(os.environ["ST_TOKEN"])
 # Fleet tracker — injected by the caller (bot.py or play_cli.py) via set_fleet().
 _fleet = None
 
+
 def set_fleet(f):
     global _fleet
     _fleet = f
+
+
 MARKET_CACHE_FILE = Path("market_cache.json")
 BEHAVIORS_FILE = Path("behaviors.json")
 log = logging.getLogger(__name__)
+
 
 def load_market_cache() -> dict:
     if MARKET_CACHE_FILE.exists():
@@ -38,9 +42,11 @@ def load_market_cache() -> dict:
             pass
     return {}
 
+
 def _save_market_to_cache(waypoint_symbol: str, data: dict):
     """Save market data to cache."""
     import time
+
     cache = load_market_cache()
     entry = cache.get(waypoint_symbol, {})
 
@@ -49,7 +55,9 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     for section in ("exports", "imports", "exchange"):
         items = data.get(section, [])
         if items:
-            entry[section] = [i.get("symbol") if isinstance(i, dict) else str(i) for i in items]
+            entry[section] = [
+                i.get("symbol") if isinstance(i, dict) else str(i) for i in items
+            ]
 
     # Explicitly check for MARKETPLACE trait to ensure existence is cached
     # This ensures discover_all_markets populates the cache keys even if goods data is missing
@@ -66,7 +74,7 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
                 "symbol": g["symbol"],
                 "purchasePrice": g.get("purchasePrice"),
                 "sellPrice": g.get("sellPrice"),
-                "tradeVolume": g.get("tradeVolume")
+                "tradeVolume": g.get("tradeVolume"),
             }
             for g in trade_goods
         ]
@@ -76,6 +84,7 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     if entry:
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
 
 def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
     """Save shipyard pricing data to cache."""
@@ -88,11 +97,13 @@ def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
         clean_ships = []
         for s in ships:
             if isinstance(s, dict):
-                clean_ships.append({
-                    "type": s.get("type"),
-                    "name": s.get("name"),
-                    "purchasePrice": s.get("purchasePrice")
-                })
+                clean_ships.append(
+                    {
+                        "type": s.get("type"),
+                        "name": s.get("name"),
+                        "purchasePrice": s.get("purchasePrice"),
+                    }
+                )
         entry["ships"] = clean_ships
         entry["has_shipyard"] = True
 
@@ -100,11 +111,13 @@ def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
         cache[waypoint_symbol] = entry
         MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
+
 # ──────────────────────────────────────────────
 #  Core Logic Helpers (Shared)
 # ──────────────────────────────────────────────
 # These are pure logic functions used by both Tools and Behaviors.
 # They return structured data (Exceptions or Tuples) rather than user-facing strings.
+
 
 def _ensure_orbit_logic(ship_symbol: str) -> None:
     """Raises Exception if fails."""
@@ -123,34 +136,47 @@ def _ensure_orbit_logic(ship_symbol: str) -> None:
     if status == "IN_TRANSIT":
         raise Exception(f"{ship_symbol} is currently in transit")
 
+
 class PriceFloorHit(Exception):
     """Raised when market price drops below minimum acceptable price."""
+
     def __init__(self, trade_symbol, current_price, min_price, sold, revenue):
         self.trade_symbol = trade_symbol
         self.current_price = current_price
         self.min_price = min_price
         self.sold = sold
         self.revenue = revenue
-        super().__init__(f"{trade_symbol} price {current_price} dropped below floor {min_price}. Sold {sold} for {revenue} cr before stopping.")
+        super().__init__(
+            f"{trade_symbol} price {current_price} dropped below floor {min_price}. Sold {sold} for {revenue} cr before stopping."
+        )
+
 
 class PriceCeilingHit(Exception):
     """Raised when market price exceeds maximum acceptable buy price."""
+
     def __init__(self, trade_symbol, current_price, max_price, bought, spent):
         self.trade_symbol = trade_symbol
         self.current_price = current_price
         self.max_price = max_price
         self.bought = bought
         self.spent = spent
-        super().__init__(f"{trade_symbol} price {current_price} exceeded ceiling {max_price}. Bought {bought} for {spent} cr before stopping.")
+        super().__init__(
+            f"{trade_symbol} price {current_price} exceeded ceiling {max_price}. Bought {bought} for {spent} cr before stopping."
+        )
+
 
 class MinQtyNotMet(Exception):
     """Raised when buy step could not acquire the minimum required quantity."""
+
     def __init__(self, trade_symbol, bought, min_qty, reason=""):
         self.trade_symbol = trade_symbol
         self.bought = bought
         self.min_qty = min_qty
         self.reason = reason
-        super().__init__(f"{trade_symbol}: only bought {bought} (need at least {min_qty}). {reason}".strip())
+        super().__init__(
+            f"{trade_symbol}: only bought {bought} (need at least {min_qty}). {reason}".strip()
+        )
+
 
 def _ensure_dock_logic(ship_symbol: str) -> None:
     """Raises Exception if fails."""
@@ -164,10 +190,11 @@ def _ensure_dock_logic(ship_symbol: str) -> None:
     if status == "IN_ORBIT":
         result = client.dock(ship_symbol)
         if isinstance(result, dict) and "error" in result:
-             raise Exception(f"Could not dock {ship_symbol}: {result['error']}")
+            raise Exception(f"Could not dock {ship_symbol}: {result['error']}")
         return
     if status == "IN_TRANSIT":
         raise Exception(f"{ship_symbol} is currently in transit")
+
 
 def _parse_arrival(nav: dict) -> float:
     route = nav.get("route", {})
@@ -177,6 +204,7 @@ def _parse_arrival(nav: dict) -> float:
     arrival = datetime.fromisoformat(arrival_str.replace("Z", "+00:00"))
     remaining = (arrival - datetime.now(timezone.utc)).total_seconds()
     return max(remaining, 0.0)
+
 
 def _get_contract_goods() -> set[str]:
     contracts = client.list_contracts()
@@ -189,19 +217,22 @@ def _get_contract_goods() -> set[str]:
                 goods.add(d["tradeSymbol"])
     return goods
 
-def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE") -> tuple[int, int, int]:
+
+def _calculate_travel_cost(
+    ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE"
+) -> tuple[int, int, int]:
     """
     Helper to calculate distance, fuel cost, and estimated time.
     Returns: (distance, fuel_cost, flight_seconds)
     """
     # 1. Calculate Distance
-    dx = dest_wp['x'] - origin_wp['x']
-    dy = dest_wp['y'] - origin_wp['y']
+    dx = dest_wp["x"] - origin_wp["x"]
+    dy = dest_wp["y"] - origin_wp["y"]
     distance = math.sqrt(dx**2 + dy**2)
 
     # 2. Get Ship Engine Speed (Default to 30 for Command Ships if missing)
     # Satellites usually have speed 10, Command ships 30, Interceptors >30
-    engine_speed = ship.get('engine', {}).get('speed', 30)
+    engine_speed = ship.get("engine", {}).get("speed", 30)
 
     # 3. Determine Multipliers
     # CRUISE: 1x fuel, 1x speed
@@ -216,16 +247,16 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
         fuel_cost = 1
         # Drift is universally slow, often ignoring engine speed, but let's assume a penalty
         # In SpaceTraders, Drift is usually ~1/10th speed or fixed low speed.
-        speed_multiplier = 0.01 # Severe penalty
+        speed_multiplier = 0.01  # Severe penalty
     elif mode == "BURN":
         fuel_cost = 2 * base_fuel_cost
         speed_multiplier = 2.0
-    else: # CRUISE or STEALTH
+    else:  # CRUISE or STEALTH
         fuel_cost = base_fuel_cost
         speed_multiplier = 1.0
 
     # 4. Handle Solar/Probe Ships (0 Fuel Capacity)
-    fuel_capacity = ship.get('fuel', {}).get('capacity', 0)
+    fuel_capacity = ship.get("fuel", {}).get("capacity", 0)
     if fuel_capacity == 0:
         fuel_cost = 0  # Solar ships don't consume fuel units
 
@@ -245,11 +276,13 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
 
     # Let's use the empirical observation logic:
     if mode == "BURN":
-        flight_mode_mult = 0.5 # Faster
+        flight_mode_mult = 0.5  # Faster
     elif mode == "DRIFT":
-        flight_mode_mult = 5.0 # Slower (The API might differ, but this is a safer estimate)
+        flight_mode_mult = (
+            5.0  # Slower (The API might differ, but this is a safer estimate)
+        )
     else:
-        flight_mode_mult = 1.0 # Cruise/Stealth
+        flight_mode_mult = 1.0  # Cruise/Stealth
 
     # Simpler heuristic that matches your log (36 distance / speed 10 satellite ≈ 113s?)
     # 36 distance. 113s total. 15s is constant.
@@ -258,18 +291,21 @@ def _calculate_travel_cost(ship: dict, dest_wp: dict, origin_wp: dict, mode: str
     # Speed 10 = ~3s per unit. Speed 30 = ~1s per unit.
     # Formula: (Distance * (30 / Speed)) + 15
 
-    travel_time = (distance * (30 / max(1, engine_speed)))
+    travel_time = distance * (30 / max(1, engine_speed))
 
     if mode == "BURN":
         travel_time /= 2
     elif mode == "DRIFT":
-        travel_time *= 5 # Drift is significantly slower
+        travel_time *= 5  # Drift is significantly slower
 
     total_time = travel_time + 15
 
     return round(distance), int(fuel_cost), int(total_time)
 
-def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: list, mode="CRUISE") -> list[str] | None:
+
+def _find_refuel_path(
+    ship: dict, origin_wp: dict, target_wp: dict, waypoints: list, mode="CRUISE"
+) -> list[str] | None:
     """
     Perform BFS to find a path from origin to target using Marketplaces as refuel stops.
     Returns a list of waypoint symbols: [Origin, Stop1, Stop2, Target].
@@ -279,15 +315,19 @@ def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: l
 
     # 1. If solar (0 capacity), path is always direct.
     if fuel_capacity == 0:
-        return [origin_wp['symbol'], target_wp['symbol']]
+        return [origin_wp["symbol"], target_wp["symbol"]]
 
     # 2. Identify potential stops (Marketplaces)
     # Assumption: All marketplaces sell fuel.
-    potential_stops = [w for w in waypoints if "MARKETPLACE" in [t['symbol'] for t in w.get('traits', [])]]
+    potential_stops = [
+        w
+        for w in waypoints
+        if "MARKETPLACE" in [t["symbol"] for t in w.get("traits", [])]
+    ]
 
     # 3. BFS State: (current_wp_obj, path_list_of_symbols, fuel_at_current_node)
-    queue = deque([(origin_wp, [origin_wp['symbol']], current_fuel)])
-    visited = {origin_wp['symbol']}
+    queue = deque([(origin_wp, [origin_wp["symbol"]], current_fuel)])
+    visited = {origin_wp["symbol"]}
 
     while queue:
         curr_node, path, fuel_available = queue.popleft()
@@ -295,27 +335,34 @@ def _find_refuel_path(ship: dict, origin_wp: dict, target_wp: dict, waypoints: l
         # A. Can we reach the Final Target from here?
         _, cost_to_target, _ = _calculate_travel_cost(ship, target_wp, curr_node, mode)
         if cost_to_target <= fuel_available:
-            return path + [target_wp['symbol']]
+            return path + [target_wp["symbol"]]
 
         # B. If not, find reachable Marketplaces to hop to
         for stop in potential_stops:
-            if stop['symbol'] in visited:
+            if stop["symbol"] in visited:
                 continue
 
             _, cost_to_stop, _ = _calculate_travel_cost(ship, stop, curr_node, mode)
 
             if cost_to_stop <= fuel_available:
-                visited.add(stop['symbol'])
+                visited.add(stop["symbol"])
                 # We assume we refuel to FULL CAPACITY at the stop
-                queue.append((stop, path + [stop['symbol']], fuel_capacity))
+                queue.append((stop, path + [stop["symbol"]], fuel_capacity))
 
     return None
+
 
 # ──────────────────────────────────────────────
 #  CORE ACTION LOGIC (The "Smart" Layer)
 # ──────────────────────────────────────────────
 
-def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE", execute: bool = True) -> Tuple[str, float]:
+
+def _navigate_ship_logic(
+    ship_symbol: str,
+    destination_symbol: str,
+    mode: str = "CRUISE",
+    execute: bool = True,
+) -> Tuple[str, float]:
     """
     Returns (result_message, wait_seconds).
     Handles smart routing, auto-refueling, and inter-system logic.
@@ -324,11 +371,13 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     # A valid waypoint symbol MUST be SECTOR-SYSTEM-POINT (at least 2 hyphens).
     # This catches "WHATER-1" (ship) or "X1-RV42" (system only).
     if destination_symbol.count("-") < 2:
-        raise Exception(f"Invalid destination format '{destination_symbol}'. Expected Waypoint Symbol (SECTOR-SYSTEM-WAYPOINT).")
+        raise Exception(
+            f"Invalid destination format '{destination_symbol}'. Expected Waypoint Symbol (SECTOR-SYSTEM-WAYPOINT)."
+        )
 
     ship = client.get_ship(ship_symbol)
     if isinstance(ship, dict) and "error" in ship:
-        raise Exception(ship['error'])
+        raise Exception(ship["error"])
 
     nav = ship.get("nav", {})
     fuel = ship.get("fuel", {})
@@ -353,9 +402,11 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
             raise Exception(f"API Error finding jump gate: {waypoints['error']}")
 
         if not waypoints:
-             raise Exception(f"Destination is in {dest_sys}, but no Jump Gate found in {current_sys}.")
+            raise Exception(
+                f"Destination is in {dest_sys}, but no Jump Gate found in {current_sys}."
+            )
 
-        target_wp_symbol = waypoints[0]['symbol']
+        target_wp_symbol = waypoints[0]["symbol"]
 
         if current_wp == target_wp_symbol:
             return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
@@ -363,10 +414,10 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     # Fetch Waypoints to validate target exists and calculate stats
     waypoints = client.list_waypoints(current_sys)
     if isinstance(waypoints, dict) and "error" in waypoints:
-        raise Exception(waypoints['error'])
+        raise Exception(waypoints["error"])
 
-    origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
-    target_obj = next((w for w in waypoints if w['symbol'] == target_wp_symbol), None)
+    origin_obj = next((w for w in waypoints if w["symbol"] == current_wp), None)
+    target_obj = next((w for w in waypoints if w["symbol"] == target_wp_symbol), None)
 
     # Local Existence Check
     if not origin_obj:
@@ -374,7 +425,9 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
     if not target_obj:
         # If we are staying in-system, this means the destination is bogus
         if not is_inter_system:
-             raise Exception(f"Destination {target_wp_symbol} does not exist in system {current_sys}.")
+            raise Exception(
+                f"Destination {target_wp_symbol} does not exist in system {current_sys}."
+            )
         # If we are inter-system, target_obj is the Jump Gate, which must exist (checked above)
         raise Exception("Could not resolve Jump Gate coordinates.")
 
@@ -385,7 +438,9 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         if fuel.get("capacity", 0) > 0:
             market_cache = load_market_cache()
             curr_market = market_cache.get(current_wp, {})
-            has_fuel = "FUEL" in curr_market.get("exchange", []) or "FUEL" in curr_market.get("exports", [])
+            has_fuel = "FUEL" in curr_market.get(
+                "exchange", []
+            ) or "FUEL" in curr_market.get("exports", [])
 
             # FIX: Added check (fuel_current < fuel_capacity) to prevent 0-unit refuel spam
             current_fuel = fuel.get("current", 0)
@@ -401,7 +456,9 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
                 except Exception:
                     pass
 
-        _, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, mode)
+        _, direct_cost, direct_time = _calculate_travel_cost(
+            ship, target_obj, origin_obj, mode
+        )
         fuel_available = fuel.get("current", 0)
         fuel_capacity = fuel.get("capacity", 0)
 
@@ -412,13 +469,19 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         if fuel_capacity > 0 and direct_cost > fuel_available:
             path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
             if not path:
-                raise Exception(f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found.")
+                raise Exception(
+                    f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found."
+                )
 
             if len(path) > 1:
                 next_hop = path[1]
                 is_multi_hop = True
-                next_hop_obj = next((w for w in waypoints if w['symbol'] == next_hop), None)
-                _, _, direct_time = _calculate_travel_cost(ship, next_hop_obj, origin_obj, mode)
+                next_hop_obj = next(
+                    (w for w in waypoints if w["symbol"] == next_hop), None
+                )
+                _, _, direct_time = _calculate_travel_cost(
+                    ship, next_hop_obj, origin_obj, mode
+                )
 
         # Action
         _ensure_orbit_logic(ship_symbol)
@@ -437,10 +500,14 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
             wait_secs = max(float(direct_time), 1.0)
         if _fleet:
             _fleet.set_transit(ship_symbol, wait_secs)
-        result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
+        result = (
+            f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
+        )
 
         if is_multi_hop:
-            result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+            result += (
+                f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+            )
         elif is_inter_system:
             result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
 
@@ -450,10 +517,14 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
         # 4. Planning Mode (Comparison Table)
         lines = [f"Route Plan: {current_wp} -> {target_wp_symbol}"]
         if is_inter_system:
-             lines.append(f"Note: {target_wp_symbol} is the Jump Gate to reach {dest_sys}.")
+            lines.append(
+                f"Note: {target_wp_symbol} is the Jump Gate to reach {dest_sys}."
+            )
 
         # Check Direct
-        dist, direct_cost, direct_time = _calculate_travel_cost(ship, target_obj, origin_obj, "CRUISE")
+        dist, direct_cost, direct_time = _calculate_travel_cost(
+            ship, target_obj, origin_obj, "CRUISE"
+        )
         lines.append(f"Direct Distance: {dist}")
 
         fuel_cap = fuel.get("capacity", 0)
@@ -470,23 +541,30 @@ def _navigate_ship_logic(ship_symbol: str, destination_symbol: str, mode: str = 
                 if cost <= fuel_curr:
                     status = "✅ Direct"
                 elif path:
-                    stops = len(path) - 2 # Exclude start/end
+                    stops = len(path) - 2  # Exclude start/end
                     status = f"✅ Multi-hop ({stops} stops: {'->'.join(path)})"
                 else:
                     status = "❌ Impossible (Max range exceeded)"
             else:
                 status = "✅ (Solar)"
 
-            lines.append(f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}")
+            lines.append(
+                f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}"
+            )
 
         return "\n".join(lines), 0.0
+
 
 def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     """Returns (log_string, cooldown_seconds)."""
     # Check cooldown from fleet tracker (avoids an extra API call)
     if _fleet:
         ship_status = _fleet.get_ship(ship_symbol)
-        if ship_status and not ship_status.is_available() and ship_status.busy_reason == "extraction_cooldown":
+        if (
+            ship_status
+            and not ship_status.is_available()
+            and ship_status.busy_reason == "extraction_cooldown"
+        ):
             remaining = ship_status.seconds_until_available()
             return f"Cooldown remaining: {remaining:.0f}s", remaining
 
@@ -495,14 +573,16 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     print(data)
 
     if isinstance(data, dict) and "error" in data:
-        err = data['error']
+        err = data["error"]
         err_msg = str(err)
 
         # Handle API error 4000 (Cooldown) specifically if API returns it as error
         # Some versions of the API/Client might structure this differently
-        if "cooldown" in err_msg.lower() or (isinstance(err, dict) and err.get('code') == 4000):
-             # Fallback guess
-             return "Hit cooldown", 70.0
+        if "cooldown" in err_msg.lower() or (
+            isinstance(err, dict) and err.get("code") == 4000
+        ):
+            # Fallback guess
+            return "Hit cooldown", 70.0
 
         # Normalize error message to avoid "0" or "4000"
         if isinstance(err, (int, float)):
@@ -524,14 +604,16 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
         _fleet.set_extraction_cooldown(ship_symbol, cd_secs)
     return result, cd_secs
 
+
 def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
     """Find cheapest/best market for a good in the system using cache."""
     cache = load_market_cache()
     candidates = []
     for wp, mdata in cache.items():
-        if not wp.startswith(ship_system): continue
+        if not wp.startswith(ship_system):
+            continue
         # Check if good is sold here (Purchase Price or Export/Exchange)
-        price = float('inf')
+        price = float("inf")
         found = False
         for tg in mdata.get("trade_goods", []):
             if tg["symbol"] == trade_symbol:
@@ -541,9 +623,11 @@ def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
                     found = True
                 break
         if not found:
-            if trade_symbol in mdata.get("exports", []) or trade_symbol in mdata.get("exchange", []):
+            if trade_symbol in mdata.get("exports", []) or trade_symbol in mdata.get(
+                "exchange", []
+            ):
                 found = True
-                price = 1000000 # Penalty for unknown price
+                price = 1000000  # Penalty for unknown price
         if found:
             candidates.append((price, wp))
     if not candidates:
@@ -551,12 +635,21 @@ def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
-def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False, min_price: int = None) -> str:
+
+def _sell_cargo_logic(
+    ship_symbol: str,
+    trade_symbol: str,
+    units: int = None,
+    force: bool = False,
+    min_price: int = None,
+) -> str:
     # 1. Check Contract Safety
     if not force:
         contract_goods = _get_contract_goods()
         if trade_symbol in contract_goods:
-            raise Exception(f"{trade_symbol} is required by an active contract. Use force=True to override.")
+            raise Exception(
+                f"{trade_symbol} is required by an active contract. Use force=True to override."
+            )
 
     # 2. Get ship location and cargo state
     ship = client.get_ship(ship_symbol)
@@ -605,7 +698,7 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
         data = client.sell_cargo(ship_symbol, trade_symbol, units_to_sell)
         if isinstance(data, dict) and "error" in data:
             if sell_count == 0:
-                raise Exception(data['error'])
+                raise Exception(data["error"])
             break  # Partial success — stop and report what we sold
 
         tx = data.get("transaction", {})
@@ -616,7 +709,9 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
         if min_price and sell_count > 0:
             price_per_unit = tx.get("pricePerUnit", 0)
             if price_per_unit < min_price:
-                raise PriceFloorHit(trade_symbol, price_per_unit, min_price, total_sold, total_revenue)
+                raise PriceFloorHit(
+                    trade_symbol, price_per_unit, min_price, total_sold, total_revenue
+                )
 
     cargo = data.get("cargo", {})
     if sell_count > 1:
@@ -624,7 +719,14 @@ def _sell_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, fo
     else:
         return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
 
-def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max_price: int = None, min_qty: int = None) -> str:
+
+def _buy_cargo_logic(
+    ship_symbol: str,
+    trade_symbol: str,
+    units: int = None,
+    max_price: int = None,
+    min_qty: int = None,
+) -> str:
     """Buy cargo from the current market. Splits purchases across multiple transactions if needed.
 
     Respects cargo capacity, credits available, market transaction limits, and optional price/quantity guards.
@@ -647,7 +749,9 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max
     available_space = capacity - current_units
 
     if available_space <= 0:
-        raise Exception(f"Ship {ship_symbol} cargo is full ({current_units}/{capacity}). No space for purchase.")
+        raise Exception(
+            f"Ship {ship_symbol} cargo is full ({current_units}/{capacity}). No space for purchase."
+        )
 
     # Determine target amount (cargo-limited)
     target_units = available_space if units is None else min(units, available_space)
@@ -667,11 +771,17 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max
 
     # Cap by affordability using cached price + current credits
     agent = client.get_agent()
-    credits = agent.get("credits") if isinstance(agent, dict) and "error" not in agent else None
+    credits = (
+        agent.get("credits")
+        if isinstance(agent, dict) and "error" not in agent
+        else None
+    )
     if credits is not None and cached_price and cached_price > 0:
         affordable = credits // cached_price
         if affordable <= 0:
-            reason = f"Insufficient credits ({credits} cr, need {cached_price} cr/unit)."
+            reason = (
+                f"Insufficient credits ({credits} cr, need {cached_price} cr/unit)."
+            )
             if min_qty:
                 raise MinQtyNotMet(trade_symbol, 0, min_qty, reason)
             raise Exception(f"Cannot afford {trade_symbol}: {reason}")
@@ -697,14 +807,16 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max
         if available_space <= 0:
             break  # Cargo full
 
-        units_to_buy = min(max_per_transaction, available_space, target_units - total_purchased)
+        units_to_buy = min(
+            max_per_transaction, available_space, target_units - total_purchased
+        )
 
         data = client.buy_cargo(ship_symbol, trade_symbol, units_to_buy)
 
         if isinstance(data, dict) and "error" in data:
             if purchase_count == 0:
-                raise Exception(data['error'])
-            stop_reason = data['error']
+                raise Exception(data["error"])
+            stop_reason = data["error"]
             break
 
         tx = data.get("transaction", {})
@@ -715,16 +827,25 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max
         purchase_count += 1
 
         if max_price and price_per_unit > max_price:
-            raise PriceCeilingHit(trade_symbol, price_per_unit, max_price, total_purchased, total_cost)
+            raise PriceCeilingHit(
+                trade_symbol, price_per_unit, max_price, total_purchased, total_cost
+            )
 
     # Check minimum quantity requirement
     if min_qty and total_purchased < min_qty:
-        reason = stop_reason or f"cargo space or credits limited purchase to {total_purchased}"
+        reason = (
+            stop_reason
+            or f"cargo space or credits limited purchase to {total_purchased}"
+        )
         raise MinQtyNotMet(trade_symbol, total_purchased, min_qty, reason)
 
     # Get final cargo state
     cargo_data = client.get_cargo(ship_symbol)
-    final_cargo = cargo_data.get("units", 0) if isinstance(cargo_data, dict) and "error" not in cargo_data else "?"
+    final_cargo = (
+        cargo_data.get("units", 0)
+        if isinstance(cargo_data, dict) and "error" not in cargo_data
+        else "?"
+    )
 
     if purchase_count > 1:
         return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr ({purchase_count} transactions). Cargo: {final_cargo}/{capacity}."
@@ -732,7 +853,9 @@ def _buy_cargo_logic(ship_symbol: str, trade_symbol: str, units: int = None, max
         return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr. Cargo: {final_cargo}/{capacity}."
 
 
-def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+def _deliver_contract_logic(
+    contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None
+) -> str:
     """
     Smart delivery: automatically calculates optimal units to deliver.
     Respects: contract requirements, cargo available, and explicit unit request.
@@ -781,7 +904,7 @@ def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: st
     _ensure_dock_logic(ship_symbol)
     data = client.deliver_contract(contract_id, ship_symbol, trade_symbol, final_units)
     if isinstance(data, dict) and "error" in data:
-        raise Exception(data['error'])
+        raise Exception(data["error"])
 
     # Return summary
     contract = data.get("contract", {})
@@ -791,9 +914,9 @@ def _deliver_contract_logic(contract_id: str, ship_symbol: str, trade_symbol: st
     # Check if all terms fulfilled
     all_fulfilled = True
     for d in terms.get("deliver", []):
-         if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0):
-             all_fulfilled = False
-             break
+        if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0):
+            all_fulfilled = False
+            break
 
     if all_fulfilled:
         # Auto-fulfill
@@ -814,13 +937,16 @@ def _refuel_ship_logic(ship_symbol: str) -> str:
     _ensure_dock_logic(ship_symbol)
     data = client.refuel(ship_symbol)
     if isinstance(data, dict) and "error" in data:
-        raise Exception(data['error'])
+        raise Exception(data["error"])
 
     fuel = data.get("fuel", {})
     tx = data.get("transaction", {})
     return f"Refueled {ship_symbol}. Fuel: {fuel.get('current')}/{fuel.get('capacity')}. Cost: {tx.get('totalPrice', '?')} cr."
 
-def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
+
+def _transfer_cargo_logic(
+    from_ship: str, to_ship: str, trade_symbol: str, units: int = None
+) -> str:
     """Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint.
 
     If trade_symbol is '*', transfers all cargo items.
@@ -852,7 +978,7 @@ def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units
             transfer_units = available if units is None else min(units, available)
             data = client.transfer_cargo(from_ship, to_ship, symbol, transfer_units)
             if isinstance(data, dict) and "error" in data:
-                raise Exception(data['error'])
+                raise Exception(data["error"])
 
             results.append(f"  {symbol}: {transfer_units} units")
             total_units += transfer_units
@@ -861,9 +987,9 @@ def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units
             return f"No cargo available to transfer from {from_ship}."
 
         return (
-            f"Transferred all cargo from {from_ship} to {to_ship}:\n" +
-            "\n".join(results) +
-            f"\nTotal: {total_units} units transferred"
+            f"Transferred all cargo from {from_ship} to {to_ship}:\n"
+            + "\n".join(results)
+            + f"\nTotal: {total_units} units transferred"
         )
 
     # Handle single trade symbol
@@ -884,7 +1010,7 @@ def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units
 
     data = client.transfer_cargo(from_ship, to_ship, trade_symbol, safe_units)
     if isinstance(data, dict) and "error" in data:
-        raise Exception(data['error'])
+        raise Exception(data["error"])
 
     cargo = data.get("cargo", {})
     return (
@@ -892,9 +1018,11 @@ def _transfer_cargo_logic(from_ship: str, to_ship: str, trade_symbol: str, units
         f"{from_ship} cargo now: {cargo.get('units', 0)}/{cargo.get('capacity', '?')} units"
     )
 
+
 # ──────────────────────────────────────────────
 #  BEHAVIOR ENGINE
 # ──────────────────────────────────────────────
+
 
 class StepType(Enum):
     MINE = "mine"
@@ -912,13 +1040,17 @@ class StepType(Enum):
     BUY_SHIP = "buy_ship"
     AUTOTRADE = "autotrade"
 
+
 @dataclass
 class Step:
     step_type: StepType
     args: list[str] = field(default_factory=list)
+
     def __str__(self):
-        if self.args: return f"{self.step_type.value} {' '.join(self.args)}"
+        if self.args:
+            return f"{self.step_type.value} {' '.join(self.args)}"
         return self.step_type.value
+
 
 def _refresh_waypoint_data(waypoint: str) -> None:
     """Fetch live market AND shipyard data for a waypoint and update the cache. Silent on error."""
@@ -937,11 +1069,13 @@ def _refresh_waypoint_data(waypoint: str) -> None:
     except Exception:
         pass
 
+
 def parse_steps(steps_str: str) -> list[Step]:
     steps = []
     for part in steps_str.split(","):
         part = part.strip()
-        if not part: continue
+        if not part:
+            continue
         tokens = part.split()
         verb = tokens[0].lower()
         args = tokens[1:]
@@ -951,9 +1085,11 @@ def parse_steps(steps_str: str) -> list[Step]:
             raise ValueError(f"Unknown step type: '{verb}'")
     return steps
 
+
 def reconstruct_steps_str(steps: list[Step]) -> str:
     """Reconstructs the steps string from a list of Step objects."""
     return ", ".join(str(s) for s in steps)
+
 
 @dataclass
 class BehaviorConfig:
@@ -967,7 +1103,9 @@ class BehaviorConfig:
     alert_sent: bool = False
     last_action: str = ""  # Track most recent action for logging
 
+
 _engine_instance: Optional["BehaviorEngine"] = None
+
 
 def get_engine() -> "BehaviorEngine":
     global _engine_instance
@@ -975,16 +1113,18 @@ def get_engine() -> "BehaviorEngine":
         _engine_instance = BehaviorEngine()
     return _engine_instance
 
+
 def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[dict]:
     """Helper: returns a list of trade dictionaries sorted by profitability."""
     import time
+
     cache = load_market_cache()
     if not cache:
         return []
 
     # Build per-good source/sink lists
     sources = {}  # good -> [(market_wp, buy_cost, volume)]
-    sinks = {}    # good -> [(market_wp, sell_revenue, volume)]
+    sinks = {}  # good -> [(market_wp, sell_revenue, volume)]
 
     for wp, mdata in cache.items():
         trade_goods = mdata.get("trade_goods")
@@ -1004,9 +1144,13 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
             sell_revenue = tg.get("sellPrice")
 
             if sym in source_goods and buy_cost is not None:
-                sources.setdefault(sym, []).append((wp, buy_cost, tg.get("tradeVolume", 0)))
+                sources.setdefault(sym, []).append(
+                    (wp, buy_cost, tg.get("tradeVolume", 0))
+                )
             if sym in sink_goods and sell_revenue is not None:
-                sinks.setdefault(sym, []).append((wp, sell_revenue, tg.get("tradeVolume", 0)))
+                sinks.setdefault(sym, []).append(
+                    (wp, sell_revenue, tg.get("tradeVolume", 0))
+                )
 
     all_goods = set(sources.keys()) & set(sinks.keys())
     if not all_goods:
@@ -1056,13 +1200,16 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
                     "profit": profit,
                     "volume": volume,
                     "stale": stale,
-                    "dist": None
+                    "dist": None,
                 }
 
                 if ship_pos:
                     src_pos_coords = wp_coords.get(src_wp)
                     if src_pos_coords:
-                        d = math.sqrt((src_pos_coords[0] - ship_pos[0])**2 + (src_pos_coords[1] - ship_pos[1])**2)
+                        d = math.sqrt(
+                            (src_pos_coords[0] - ship_pos[0]) ** 2
+                            + (src_pos_coords[1] - ship_pos[1]) ** 2
+                        )
                         route["dist"] = max(d, 1.0)
 
                 routes.append(route)
@@ -1070,11 +1217,14 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     # Sort
     if ship_pos:
         # Efficiency: profit / distance to pickup
-        routes.sort(key=lambda r: r["profit"] / r["dist"] if r.get("dist") else 0, reverse=True)
+        routes.sort(
+            key=lambda r: r["profit"] / r["dist"] if r.get("dist") else 0, reverse=True
+        )
     else:
         routes.sort(key=lambda r: r["profit"], reverse=True)
 
     return routes
+
 
 def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
     """Helper: finds the best market to sell existing cargo."""
@@ -1082,17 +1232,19 @@ def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
     candidates = []
 
     ship = client.get_ship(ship_symbol)
-    if not ship or "error" in ship: return None
+    if not ship or "error" in ship:
+        return None
 
-    system = ship['nav']['systemSymbol']
-    ship_x = ship['nav']['route']['destination']['x']
-    ship_y = ship['nav']['route']['destination']['y']
+    system = ship["nav"]["systemSymbol"]
+    ship_x = ship["nav"]["route"]["destination"]["x"]
+    ship_y = ship["nav"]["route"]["destination"]["y"]
 
     # We need system waypoints to calc distance if not in cache
     # But usually cache keys are waypoint symbols.
 
     for wp, mdata in cache.items():
-        if not wp.startswith(system): continue
+        if not wp.startswith(system):
+            continue
 
         # Check if market buys this good (Imports or Exchange)
         imports = set(mdata.get("imports", []))
@@ -1103,7 +1255,7 @@ def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
         # Get price
         price = 0
         for tg in mdata.get("trade_goods", []):
-            if tg['symbol'] == good:
+            if tg["symbol"] == good:
                 price = tg.get("sellPrice", 0)
                 break
 
@@ -1119,19 +1271,22 @@ def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
     candidates.sort(key=lambda x: x["price"], reverse=True)
     return candidates[0]
 
+
 class BehaviorEngine:
     """
     Manages autonomous ship behaviors.
     Crucially, it uses the CORE LOGIC functions above, ensuring behavior ships
     are just as 'smart' (auto-refuel, etc) as LLM-controlled ships.
     """
+
     def __init__(self):
         self.behaviors: dict[str, BehaviorConfig] = {}
         self._last_mtime = 0.0
         self._load()
 
     def _load(self):
-        if not BEHAVIORS_FILE.exists(): return
+        if not BEHAVIORS_FILE.exists():
+            return
         try:
             self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
             entries = json.loads(BEHAVIORS_FILE.read_text())
@@ -1150,7 +1305,8 @@ class BehaviorEngine:
                             last_action=e.get("last_action", ""),
                         )
                         self.behaviors[cfg.ship_symbol] = cfg
-                    except ValueError: continue
+                    except ValueError:
+                        continue
         except Exception as exc:
             log.warning("Failed to load behaviors.json: %s", exc)
 
@@ -1169,22 +1325,28 @@ class BehaviorEngine:
             for c in self.behaviors.values()
         ]
         BEHAVIORS_FILE.write_text(json.dumps(data, indent=2))
-        try: self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
-        except OSError: pass
+        try:
+            self._last_mtime = BEHAVIORS_FILE.stat().st_mtime
+        except OSError:
+            pass
 
     def sync_state(self):
-        if not BEHAVIORS_FILE.exists(): return
+        if not BEHAVIORS_FILE.exists():
+            return
         try:
             if BEHAVIORS_FILE.stat().st_mtime > self._last_mtime:
                 self.behaviors.clear()
                 self._load()
-        except OSError: pass
+        except OSError:
+            pass
 
     def assign(self, ship_symbol: str, steps_str: str, start_step: int = 0) -> str:
         try:
             steps = parse_steps(steps_str)
-        except ValueError as e: return f"Error: {e}"
-        if not steps: return "Error: no steps provided"
+        except ValueError as e:
+            return f"Error: {e}"
+        if not steps:
+            return "Error: no steps provided"
 
         clamped = max(0, min(start_step, len(steps) - 1))
         self.behaviors[ship_symbol] = BehaviorConfig(
@@ -1213,20 +1375,25 @@ class BehaviorEngine:
             status = "PAUSED" if cfg.paused else cfg.step_phase
             if cfg.error_message:
                 status = f"ERROR: {cfg.error_message}"
-            lines.append(f"  {cfg.ship_symbol}: step {step_idx + 1}/{len(cfg.steps)} [{current_step}] ({status})")
+            lines.append(
+                f"  {cfg.ship_symbol}: step {step_idx + 1}/{len(cfg.steps)} [{current_step}] ({status})"
+            )
         return "\n".join(lines)
 
     def pause(self, ship_symbol: str) -> str:
         cfg = self.behaviors.get(ship_symbol)
-        if not cfg: return f"{ship_symbol} has no assigned behavior."
-        if cfg.paused: return f"{ship_symbol} is already paused."
+        if not cfg:
+            return f"{ship_symbol} has no assigned behavior."
+        if cfg.paused:
+            return f"{ship_symbol} is already paused."
         cfg.paused = True
         self._save()
         return f"Paused {ship_symbol} at step {cfg.current_step_index + 1}/{len(cfg.steps)}."
 
     def resume(self, ship_symbol: str) -> str:
         cfg = self.behaviors.get(ship_symbol)
-        if not cfg or not cfg.paused: return "Nothing to resume."
+        if not cfg or not cfg.paused:
+            return "Nothing to resume."
         cfg.paused = False
         cfg.alert_sent = False
         cfg.current_step_index += 1
@@ -1236,7 +1403,8 @@ class BehaviorEngine:
 
     def skip_step(self, ship_symbol: str) -> str:
         cfg = self.behaviors.get(ship_symbol)
-        if not cfg: return "No behavior."
+        if not cfg:
+            return "No behavior."
         cfg.current_step_index += 1
         cfg.step_phase = "INIT"
         cfg.paused = False
@@ -1250,10 +1418,12 @@ class BehaviorEngine:
         Returns None if step executed normally or ship unavailable.
         """
         cfg = self.behaviors.get(ship_symbol)
-        if not cfg or cfg.paused: return None
+        if not cfg or cfg.paused:
+            return None
 
         ship = fleet.get_ship(ship_symbol)
-        if not ship or not ship.is_available(): return None
+        if not ship or not ship.is_available():
+            return None
 
         if cfg.current_step_index >= len(cfg.steps):
             cfg.current_step_index = 0
@@ -1264,19 +1434,32 @@ class BehaviorEngine:
 
         try:
             result = None
-            if step.step_type == StepType.MINE: result = self._step_mine(cfg, step, ship, fleet)
-            elif step.step_type == StepType.GOTO: result = self._step_goto(cfg, step, ship, fleet)
-            elif step.step_type == StepType.BUY: result = self._step_buy(cfg, step, ship, fleet)
-            elif step.step_type == StepType.SELL: result = self._step_sell(cfg, step, ship, fleet)
-            elif step.step_type == StepType.REFUEL: result = self._step_refuel(cfg, step, ship, fleet)
-            elif step.step_type == StepType.DELIVER: result = self._step_deliver(cfg, step, ship, fleet)
-            elif step.step_type == StepType.TRANSFER: result = self._step_transfer(cfg, step, ship, fleet)
-            elif step.step_type == StepType.SCOUT: result = self._step_scout(cfg, step, ship, fleet)
-            elif step.step_type == StepType.REPEAT: result = self._step_repeat(cfg)
-            elif step.step_type == StepType.STOP: result = self._step_stop(cfg)
-            elif step.step_type == StepType.ALERT: result = self._step_alert(cfg, step)
-            elif step.step_type == StepType.AUTOTRADE: result = self._step_autotrade(cfg)
-            elif step.step_type == StepType.NEGOTIATE: result = self._step_negotiate(cfg)
+            if step.step_type == StepType.MINE:
+                result = self._step_mine(cfg, step, ship, fleet)
+            elif step.step_type == StepType.GOTO:
+                result = self._step_goto(cfg, step, ship, fleet)
+            elif step.step_type == StepType.BUY:
+                result = self._step_buy(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SELL:
+                result = self._step_sell(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REFUEL:
+                result = self._step_refuel(cfg, step, ship, fleet)
+            elif step.step_type == StepType.DELIVER:
+                result = self._step_deliver(cfg, step, ship, fleet)
+            elif step.step_type == StepType.TRANSFER:
+                result = self._step_transfer(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SCOUT:
+                result = self._step_scout(cfg, step, ship, fleet)
+            elif step.step_type == StepType.REPEAT:
+                result = self._step_repeat(cfg)
+            elif step.step_type == StepType.STOP:
+                result = self._step_stop(cfg)
+            elif step.step_type == StepType.ALERT:
+                result = self._step_alert(cfg, step)
+            elif step.step_type == StepType.AUTOTRADE:
+                result = self._step_autotrade(cfg)
+            elif step.step_type == StepType.NEGOTIATE:
+                result = self._step_negotiate(cfg)
             # Store last action for logging
             cfg.last_action = f"step {cfg.current_step_index + 1}: {step_display}"
             self._save()
@@ -1284,7 +1467,9 @@ class BehaviorEngine:
         except Exception as e:
             cfg.error_message = str(e)
             cfg.paused = True
-            cfg.last_action = f"step {cfg.current_step_index + 1}: {step_display} [ERROR: {str(e)}]"
+            cfg.last_action = (
+                f"step {cfg.current_step_index + 1}: {step_display} [ERROR: {str(e)}]"
+            )
             self._save()
             return f"{ship_symbol} ERROR: {e}"
 
@@ -1429,7 +1614,8 @@ class BehaviorEngine:
                     return f"{cfg.ship_symbol} ALERT: {e}"
                 except Exception as e:
                     # If target is *, ignore failures (e.g. contract goods)
-                    if target != "*": raise e
+                    if target != "*":
+                        raise e
 
         self._advance(cfg)
         return None
@@ -1459,7 +1645,13 @@ class BehaviorEngine:
                     pass
 
         try:
-            _buy_cargo_logic(cfg.ship_symbol, trade_symbol, units, max_price=max_price, min_qty=min_qty)
+            _buy_cargo_logic(
+                cfg.ship_symbol,
+                trade_symbol,
+                units,
+                max_price=max_price,
+                min_qty=min_qty,
+            )
         except (PriceCeilingHit, MinQtyNotMet) as e:
             cfg.paused = True
             cfg.alert_sent = True
@@ -1478,7 +1670,9 @@ class BehaviorEngine:
     def _step_deliver(self, cfg, step, ship, fleet) -> Optional[str]:
         """Deliver cargo for a contract. Usage: deliver CONTRACT_ID ITEM [UNITS]"""
         if len(step.args) < 2:
-            raise Exception("deliver step requires contract_id and trade_symbol (e.g., 'deliver CONT001 DIAMONDS 5')")
+            raise Exception(
+                "deliver step requires contract_id and trade_symbol (e.g., 'deliver CONT001 DIAMONDS 5')"
+            )
 
         contract_id = step.args[0]
         trade_symbol = step.args[1]
@@ -1499,14 +1693,18 @@ class BehaviorEngine:
         Examples: transfer SHIP-2 IRON_ORE, transfer SHIP-2 IRON_ORE 50, transfer SHIP-2 *
         """
         if len(step.args) < 2:
-            raise Exception("transfer step requires destination ship and trade symbol (e.g., 'transfer SHIP-2 IRON_ORE 50' or 'transfer SHIP-2 *')")
+            raise Exception(
+                "transfer step requires destination ship and trade symbol (e.g., 'transfer SHIP-2 IRON_ORE 50' or 'transfer SHIP-2 *')"
+            )
 
         destination_ship = step.args[0]
         trade_symbol = step.args[1]
         units = int(step.args[2]) if len(step.args) > 2 else None
 
         try:
-            _transfer_cargo_logic(cfg.ship_symbol, destination_ship, trade_symbol, units)
+            _transfer_cargo_logic(
+                cfg.ship_symbol, destination_ship, trade_symbol, units
+            )
         except Exception as e:
             raise e
 
@@ -1514,7 +1712,8 @@ class BehaviorEngine:
         return None
 
     def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
-        if not ship.location: raise Exception("No location")
+        if not ship.location:
+            raise Exception("No location")
         _refresh_waypoint_data(ship.location)
         self._advance(cfg)
         return None
@@ -1543,7 +1742,7 @@ class BehaviorEngine:
         if inventory:
             # Pick the first item
             item = inventory[0]
-            symbol = item['symbol']
+            symbol = item["symbol"]
 
             best_market = _find_best_sell_market(cfg.ship_symbol, symbol)
             if best_market:
@@ -1567,8 +1766,8 @@ class BehaviorEngine:
                 return f"{cfg.ship_symbol} ALERT: Auto-trade found no profitable routes. Scout more markets."
 
             best = routes[0]
-            max_buy = int(best['buy'] * 1.10)
-            min_sell = int(best['sell'] * 0.90)
+            max_buy = int(best["buy"] * 1.10)
+            min_sell = int(best["sell"] * 0.90)
 
             # Plan: Goto Src -> Buy -> Goto Snk -> Sell -> Autotrade (loop)
             new_plan = (
@@ -1597,37 +1796,57 @@ class BehaviorEngine:
         if isinstance(contracts, dict) and "error" in contracts:
             raise Exception(f"Failed to list contracts: {contracts['error']}")
 
-        active_contract = next((c for c in contracts if c.get("accepted") and not c.get("fulfilled")), None)
+        active_contract = next(
+            (c for c in contracts if c.get("accepted") and not c.get("fulfilled")), None
+        )
 
         if active_contract:
             # Plan route to fulfill it
             terms = active_contract.get("terms", {})
             # Find first incomplete delivery
-            target_delivery = next((d for d in terms.get("deliver", []) if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0)), None)
+            target_delivery = next(
+                (
+                    d
+                    for d in terms.get("deliver", [])
+                    if d.get("unitsFulfilled", 0) < d.get("unitsRequired", 0)
+                ),
+                None,
+            )
 
             if not target_delivery:
                 # Contract seems done but not fulfilled? Try fulfill.
                 client.fulfill_contract(active_contract["id"])
-                active_contract = None # Proceed to get new one next loop
+                active_contract = None  # Proceed to get new one next loop
             else:
                 c_id = active_contract["id"]
                 symbol = target_delivery["tradeSymbol"]
                 dest = target_delivery["destinationSymbol"]
 
                 # Calculate exact quantity needed for this delivery
-                units_needed = target_delivery["unitsRequired"] - target_delivery["unitsFulfilled"]
+                units_needed = (
+                    target_delivery["unitsRequired"] - target_delivery["unitsFulfilled"]
+                )
 
                 # Check current cargo
                 cargo = client.get_cargo(cfg.ship_symbol)
-                current_units = next((i["units"] for i in cargo.get("inventory", [])
-                                     if i["symbol"] == symbol), 0)
+                current_units = next(
+                    (
+                        i["units"]
+                        for i in cargo.get("inventory", [])
+                        if i["symbol"] == symbol
+                    ),
+                    0,
+                )
 
                 # Calculate how much to buy
                 units_to_buy = max(0, units_needed - current_units)
 
                 if units_to_buy == 0:
                     # Already have enough, just deliver
-                    self.assign(cfg.ship_symbol, f"goto {dest}, deliver {c_id} {symbol}, negotiate")
+                    self.assign(
+                        cfg.ship_symbol,
+                        f"goto {dest}, deliver {c_id} {symbol}, negotiate",
+                    )
                 else:
                     # Need to buy more
                     ship = client.get_ship(cfg.ship_symbol)
@@ -1639,31 +1858,38 @@ class BehaviorEngine:
 
                     if units_to_buy <= 0:
                         # Cargo is full, deliver what we have first
-                        self.assign(cfg.ship_symbol, f"goto {dest}, deliver {c_id} {symbol}, negotiate")
+                        self.assign(
+                            cfg.ship_symbol,
+                            f"goto {dest}, deliver {c_id} {symbol}, negotiate",
+                        )
                     else:
-                        src = _find_best_source(symbol, ship['nav']['systemSymbol'])
+                        src = _find_best_source(symbol, ship["nav"]["systemSymbol"])
                         if not src:
                             cfg.paused = True
                             cfg.alert_sent = True
                             self._save()
                             return f"{cfg.ship_symbol} ALERT: Contract {c_id} needs {symbol} but no source found in cache."
-                        self.assign(cfg.ship_symbol, f"goto {src}, buy {symbol} {units_to_buy}, goto {dest}, deliver {c_id} {symbol}, negotiate")
+                        self.assign(
+                            cfg.ship_symbol,
+                            f"goto {src}, buy {symbol} {units_to_buy}, goto {dest}, deliver {c_id} {symbol}, negotiate",
+                        )
                 return None
 
         # 2. No Active Contract -> Go to HQ and Negotiate
         ship = client.get_ship(cfg.ship_symbol)
         hq = client.get_agent().get("headquarters")
 
-        if ship['nav']['waypointSymbol'] != hq:
+        if ship["nav"]["waypointSymbol"] != hq:
             self.assign(cfg.ship_symbol, f"goto {hq}, negotiate")
             return None
 
         # At HQ: Negotiate & Accept
         _ensure_dock_logic(cfg.ship_symbol)
         data = client.negotiate_contract(cfg.ship_symbol)
-        if isinstance(data, dict) and "error" in data: raise Exception(f"Negotiation failed: {data['error']}")
+        if isinstance(data, dict) and "error" in data:
+            raise Exception(f"Negotiation failed: {data['error']}")
         client.accept_contract(data.get("contract", {}).get("id"))
-        self.assign(cfg.ship_symbol, "negotiate") # Loop to process the new contract
+        self.assign(cfg.ship_symbol, "negotiate")  # Loop to process the new contract
         return None
 
     def _step_repeat(self, cfg) -> Optional[str]:
@@ -1688,6 +1914,7 @@ class BehaviorEngine:
 # ──────────────────────────────────────────────
 #  Observation tools
 # ──────────────────────────────────────────────
+
 
 @tool
 def view_agent() -> str:
@@ -1715,13 +1942,19 @@ def view_contracts() -> str:
     lines = []
     for c in data:
         lines.append(f"Contract: {c['id']}")
-        lines.append(f"  Type: {c['type']}  |  Accepted: {c['accepted']}  |  Fulfilled: {c['fulfilled']}")
+        lines.append(
+            f"  Type: {c['type']}  |  Accepted: {c['accepted']}  |  Fulfilled: {c['fulfilled']}"
+        )
         terms = c.get("terms", {})
-        lines.append(f"  Payment: {terms.get('payment', {}).get('onAccepted', 0)} on accept, "
-                      f"{terms.get('payment', {}).get('onFulfilled', 0)} on fulfill")
+        lines.append(
+            f"  Payment: {terms.get('payment', {}).get('onAccepted', 0)} on accept, "
+            f"{terms.get('payment', {}).get('onFulfilled', 0)} on fulfill"
+        )
         for d in terms.get("deliver", []):
-            lines.append(f"  Deliver: {d['unitsRequired']} {d['tradeSymbol']} to {d['destinationSymbol']} "
-                          f"({d['unitsFulfilled']}/{d['unitsRequired']} done)")
+            lines.append(
+                f"  Deliver: {d['unitsRequired']} {d['tradeSymbol']} to {d['destinationSymbol']} "
+                f"({d['unitsFulfilled']}/{d['unitsRequired']} done)"
+            )
         lines.append("")
     return "\n".join(lines)
 
@@ -1763,7 +1996,7 @@ def view_ships() -> str:
 
     lines = []
     for s in data:
-        symbol = s['symbol']
+        symbol = s["symbol"]
         nav = s.get("nav", {})
         fuel = s.get("fuel", {})
         cargo = s.get("cargo", {})
@@ -1772,12 +2005,16 @@ def view_ships() -> str:
         cd_text = ""
         if _fleet:
             ship_status = _fleet.get_ship(symbol)
-            if ship_status and not ship_status.is_available() and ship_status.busy_reason == "extraction_cooldown":
+            if (
+                ship_status
+                and not ship_status.is_available()
+                and ship_status.busy_reason == "extraction_cooldown"
+            ):
                 rem = ship_status.seconds_until_available()
                 cd_text = f" [COOLDOWN: {rem:.0f}s]"
 
         # Check Transit
-        status = nav.get('status', '?')
+        status = nav.get("status", "?")
         arrival_text = ""
         if status == "IN_TRANSIT":
             arrival_seconds = _parse_arrival(nav)
@@ -1785,24 +2022,31 @@ def view_ships() -> str:
                 arrival_text = f" (Arriving in {int(arrival_seconds)}s)"
 
         lines.append(f"   {symbol} ({s.get('registration', {}).get('role', '?')})")
-        lines.append(f"   Loc: {nav.get('waypointSymbol', '?')} ({status}){arrival_text}")
-        lines.append(f"   Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} | Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}{cd_text}")
+        lines.append(
+            f"   Loc: {nav.get('waypointSymbol', '?')} ({status}){arrival_text}"
+        )
+        lines.append(
+            f"   Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} | Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}{cd_text}"
+        )
         lines.append("")
 
     return "\n".join(lines)
 
+
 def _buys_or_sells(m_data: dict, target: str):
     # Define logic for buying and selling
-    buys = target in (m_data.get('imports', []) + m_data.get('exchange', []))
-    sells = target in (m_data.get('exports', []) + m_data.get('exchange', []))
+    buys = target in (m_data.get("imports", []) + m_data.get("exchange", []))
+    sells = target in (m_data.get("exports", []) + m_data.get("exchange", []))
     hit = False
     match_reason = ""
 
     if buys or sells:
         hit = True
         actions = []
-        if buys: actions.append("buys")
-        if sells: actions.append("sells")
+        if buys:
+            actions.append("buys")
+        if sells:
+            actions.append("sells")
 
         # Joins with "and/or" if both are true, otherwise just the single action
         action_str = " and ".join(actions)
@@ -1825,9 +2069,9 @@ def find_nearest(ship_symbol: str, target: str) -> str:
     if isinstance(ship, dict) and "error" in ship:
         return f"Error: {ship['error']}"
 
-    system_symbol = ship['nav']['systemSymbol']
-    ship_x = ship['nav']['route']['destination']['x']
-    ship_y = ship['nav']['route']['destination']['y']
+    system_symbol = ship["nav"]["systemSymbol"]
+    ship_x = ship["nav"]["route"]["destination"]["x"]
+    ship_y = ship["nav"]["route"]["destination"]["y"]
 
     # 1. Fetch all waypoints in system (this is cached by the client usually, or cheap)
     all_waypoints = client.list_waypoints(system_symbol)
@@ -1838,22 +2082,22 @@ def find_nearest(ship_symbol: str, target: str) -> str:
     target = target.upper()
 
     # 2. Search Logic
-    market_cache = load_market_cache() # Use your existing cache loader
+    market_cache = load_market_cache()  # Use your existing cache loader
 
     for wp in all_waypoints:
-        wp_sym = wp['symbol']
-        dist = math.sqrt((wp['x'] - ship_x)**2 + (wp['y'] - ship_y)**2)
+        wp_sym = wp["symbol"]
+        dist = math.sqrt((wp["x"] - ship_x) ** 2 + (wp["y"] - ship_y) ** 2)
 
         hit = False
         match_reason = ""
 
         # Check Type
-        if wp['type'] == target:
+        if wp["type"] == target:
             hit = True
             match_reason = f"Type: {target}"
 
         # Check Traits
-        traits = [t['symbol'] for t in wp.get('traits', [])]
+        traits = [t["symbol"] for t in wp.get("traits", [])]
         if target in traits:
             hit = True
             match_reason = f"Trait: {target}"
@@ -1869,7 +2113,7 @@ def find_nearest(ship_symbol: str, target: str) -> str:
     if not candidates:
         return f"No locations found for '{target}' in {system_symbol}."
 
-    candidates.sort(key=lambda x: x[0]) # Sort by distance
+    candidates.sort(key=lambda x: x[0])  # Sort by distance
 
     lines = [f"Found {len(candidates)} locations for '{target}' near {ship_symbol}:"]
     for dist, sym, reason in candidates[:5]:
@@ -1921,11 +2165,15 @@ def view_ship_details(ship_symbol: str) -> str:
     # Frame
     frame = ship.get("frame", {})
     lines.append(f"\nFrame: {frame.get('name', '?')} ({frame.get('symbol', '?')})")
-    lines.append(f"  Module slots: {frame.get('moduleSlots', '?')}, Mounting points: {frame.get('mountingPoints', '?')}")
+    lines.append(
+        f"  Module slots: {frame.get('moduleSlots', '?')}, Mounting points: {frame.get('mountingPoints', '?')}"
+    )
 
     # Engine
     engine = ship.get("engine", {})
-    lines.append(f"\nEngine: {engine.get('name', '?')} (speed: {engine.get('speed', '?')})")
+    lines.append(
+        f"\nEngine: {engine.get('name', '?')} (speed: {engine.get('speed', '?')})"
+    )
 
     # Mounts (weapons, lasers, etc.)
     mounts = ship.get("mounts", [])
@@ -1933,7 +2181,7 @@ def view_ship_details(ship_symbol: str) -> str:
         lines.append(f"\nMounts ({len(mounts)}):")
         for m in mounts:
             lines.append(f"  • {m.get('name', m.get('symbol', '?'))}")
-            if m.get('strength'):
+            if m.get("strength"):
                 lines.append(f"    Strength: {m.get('strength')}")
     else:
         lines.append("\nMounts: None")
@@ -1943,7 +2191,7 @@ def view_ship_details(ship_symbol: str) -> str:
     if modules:
         lines.append(f"\nModules ({len(modules)}):")
         for m in modules:
-            cap = f" (capacity: {m.get('capacity')})" if m.get('capacity') else ""
+            cap = f" (capacity: {m.get('capacity')})" if m.get("capacity") else ""
             lines.append(f"  • {m.get('name', m.get('symbol', '?'))}{cap}")
     else:
         lines.append("\nModules: None")
@@ -1962,7 +2210,7 @@ def find_waypoints(
     trait: str = None,
     trade_symbol: str = None,
     system_symbol: str = None,
-    reference_ship: str = None
+    reference_ship: str = None,
 ) -> str:
     """Find locations of interest. Merges functionality of finding waypoints, markets, and nearest resources.
 
@@ -1978,8 +2226,11 @@ def find_waypoints(
     if reference_ship:
         ship = client.get_ship(reference_ship)
         if isinstance(ship, dict) and "error" not in ship:
-            system_symbol = ship['nav']['systemSymbol']
-            ref_coords = (ship['nav']['route']['destination']['x'], ship['nav']['route']['destination']['y'])
+            system_symbol = ship["nav"]["systemSymbol"]
+            ref_coords = (
+                ship["nav"]["route"]["destination"]["x"],
+                ship["nav"]["route"]["destination"]["y"],
+            )
 
     if not system_symbol:
         # Fallback to agent HQ system
@@ -1996,7 +2247,11 @@ def find_waypoints(
 
         # We need waypoint coordinates for the whole system to calculate distance
         all_wps = client.list_waypoints(system_symbol)
-        wp_lut = {w['symbol']: (w['x'], w['y']) for w in all_wps} if isinstance(all_wps, list) else {}
+        wp_lut = (
+            {w["symbol"]: (w["x"], w["y"]) for w in all_wps}
+            if isinstance(all_wps, list)
+            else {}
+        )
 
         for wp_sym, mdata in cache.items():
             # Check if this market is in the target system
@@ -2004,13 +2259,13 @@ def find_waypoints(
                 continue
 
             # Check if good exists here
-            goods = mdata.get('trade_goods', [])
-            exports = mdata.get('exports', [])
-            imports = mdata.get('imports', [])
-            exchange = mdata.get('exchange', [])
+            goods = mdata.get("trade_goods", [])
+            exports = mdata.get("exports", [])
+            imports = mdata.get("imports", [])
+            exchange = mdata.get("exchange", [])
 
             # Check price data first
-            price_match = next((g for g in goods if g['symbol'] == trade_symbol), None)
+            price_match = next((g for g in goods if g["symbol"] == trade_symbol), None)
 
             # Check structural data
             is_import = trade_symbol in imports
@@ -2018,16 +2273,18 @@ def find_waypoints(
             is_exchange = trade_symbol in exchange
 
             if price_match or is_import or is_export or is_exchange:
-                dist = float('inf')
+                dist = float("inf")
                 if ref_coords and wp_sym in wp_lut:
                     wx, wy = wp_lut[wp_sym]
-                    dist = math.sqrt((wx - ref_coords[0])**2 + (wy - ref_coords[1])**2)
+                    dist = math.sqrt(
+                        (wx - ref_coords[0]) ** 2 + (wy - ref_coords[1]) ** 2
+                    )
 
                 details = []
                 if price_match:
-                    if price_match.get('purchasePrice'):
+                    if price_match.get("purchasePrice"):
                         details.append(f"BUY: {price_match['purchasePrice']}")
-                    if price_match.get('sellPrice'):
+                    if price_match.get("sellPrice"):
                         details.append(f"SELL: {price_match['sellPrice']}")
                 else:
                     if is_import:
@@ -2046,16 +2303,16 @@ def find_waypoints(
         candidates.sort(key=lambda x: x[0])
         lines = [f"Markets for {trade_symbol} in {system_symbol}:"]
         for dist, sym, det in candidates:
-            d_str = f" ({dist:.1f} dist)" if dist != float('inf') else ""
+            d_str = f" ({dist:.1f} dist)" if dist != float("inf") else ""
             lines.append(f"  {sym}{d_str}: {det}")
         return "\n".join(lines)
 
     # 3. Logic Branch: Waypoint/Trait Search
     params = {}
     if waypoint_type:
-        params['type'] = waypoint_type
+        params["type"] = waypoint_type
     if trait:
-        params['traits'] = trait
+        params["traits"] = trait
 
     data = client.list_waypoints(system_symbol, **params)
 
@@ -2072,18 +2329,24 @@ def find_waypoints(
 
     # Sort by distance
     if ref_coords:
+
         def get_dist(w):
-            return math.sqrt((w['x'] - ref_coords[0])**2 + (w['y'] - ref_coords[1])**2)
+            return math.sqrt(
+                (w["x"] - ref_coords[0]) ** 2 + (w["y"] - ref_coords[1]) ** 2
+            )
+
         data.sort(key=get_dist)
 
     lines = [f"Waypoints in {system_symbol}:"]
     for wp in data[:20]:  # Limit output
         d_str = ""
         if ref_coords:
-            d = math.sqrt((wp['x'] - ref_coords[0])**2 + (wp['y'] - ref_coords[1])**2)
+            d = math.sqrt(
+                (wp["x"] - ref_coords[0]) ** 2 + (wp["y"] - ref_coords[1]) ** 2
+            )
             d_str = f" ({d:.1f} dist)"
 
-        t_list = [t['symbol'] for t in wp.get('traits', [])]
+        t_list = [t["symbol"] for t in wp.get("traits", [])]
         lines.append(f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}")
 
     if len(data) > 20:
@@ -2093,7 +2356,12 @@ def find_waypoints(
 
 
 @tool
-def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bool = False, within_cruise_range: bool = False) -> str:
+def scan_system(
+    system_symbol: str,
+    reference_ship: str = None,
+    closest_only: bool = False,
+    within_cruise_range: bool = False,
+) -> str:
     """Scan all waypoints in a system to discover markets, shipyards, and resources WITHOUT requiring ship visits.
 
     This is VERY efficient - one API call reveals structural market data (what each market imports/exports) for the entire system.
@@ -2106,12 +2374,13 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
         closest_only: If True, return only the closest waypoint of each category (1 market, 1 shipyard, 1 asteroid)
         within_cruise_range: If True and reference_ship provided, filter to only waypoints within ship's CRUISE fuel range
 
-    The system_symbol looks like 'X1-AB12'. If you pass a waypoint like 'X1-AB12-C3', the system will be extracted."""
+    The system_symbol looks like 'X1-AB12'. If you pass a waypoint like 'X1-AB12-C3', the system will be extracted.
+    """
 
     # Extract system from waypoint if needed (e.g., 'X1-KD26-A1' -> 'X1-KD26')
     # System format: SECTOR-SYSTEM (e.g., X1-KD26)
     # Waypoint format: SECTOR-SYSTEM-WAYPOINT (e.g., X1-KD26-A1)
-    parts = system_symbol.split('-')
+    parts = system_symbol.split("-")
     if len(parts) > 2:
         # This is a waypoint, extract system (first two parts)
         system_symbol = f"{parts[0]}-{parts[1]}"
@@ -2187,12 +2456,17 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
                     if key in wp and wp[key]:
                         items = wp[key]
                         if isinstance(items, list):
-                            entry[key] = [i.get("symbol") if isinstance(i, dict) else str(i) for i in items]
+                            entry[key] = [
+                                i.get("symbol") if isinstance(i, dict) else str(i)
+                                for i in items
+                            ]
 
                 # Save to cache if we found any market data
                 if entry:
                     cache[wp_symbol] = entry
-                    MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+                    MARKET_CACHE_FILE.write_text(
+                        json.dumps(cache, indent=2), encoding="utf-8"
+                    )
 
         if "SHIPYARD" in traits:
             shipyard_waypoints.append(wp)
@@ -2214,9 +2488,15 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
     # Filter by cruise range if requested
     if within_cruise_range and reference_position and ship_fuel_capacity > 0:
         max_distance = ship_fuel_capacity  # CRUISE uses ~1 fuel per distance
-        market_waypoints = [wp for wp in market_waypoints if calc_distance(wp) <= max_distance]
-        shipyard_waypoints = [wp for wp in shipyard_waypoints if calc_distance(wp) <= max_distance]
-        asteroid_waypoints = [wp for wp in asteroid_waypoints if calc_distance(wp) <= max_distance]
+        market_waypoints = [
+            wp for wp in market_waypoints if calc_distance(wp) <= max_distance
+        ]
+        shipyard_waypoints = [
+            wp for wp in shipyard_waypoints if calc_distance(wp) <= max_distance
+        ]
+        asteroid_waypoints = [
+            wp for wp in asteroid_waypoints if calc_distance(wp) <= max_distance
+        ]
         lines.append(f"Filtered to within CRUISE range ({max_distance} units):\n")
 
     # Limit to closest only if requested
@@ -2228,7 +2508,9 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
     # Summary
     if reference_ship_name:
         lines.append(f"System Scan (distances from {reference_ship_name}):")
-    lines.append(f"Markets: {len(market_waypoints)} | Shipyards: {len(shipyard_waypoints)} | Asteroids: {len(asteroid_waypoints)}\n")
+    lines.append(
+        f"Markets: {len(market_waypoints)} | Shipyards: {len(shipyard_waypoints)} | Asteroids: {len(asteroid_waypoints)}\n"
+    )
 
     # Show markets with structural data
     if market_waypoints:
@@ -2248,22 +2530,33 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
 
             # Show imports/exports if available
             if "imports" in wp:
-                imports = [i.get("symbol") if isinstance(i, dict) else str(i) for i in wp.get("imports", [])]
+                imports = [
+                    i.get("symbol") if isinstance(i, dict) else str(i)
+                    for i in wp.get("imports", [])
+                ]
                 if imports:
                     lines.append(f"  Imports (buys): {', '.join(imports[:10])}")
             if "exports" in wp:
-                exports = [e.get("symbol") if isinstance(e, dict) else str(e) for e in wp.get("exports", [])]
+                exports = [
+                    e.get("symbol") if isinstance(e, dict) else str(e)
+                    for e in wp.get("exports", [])
+                ]
                 if exports:
                     lines.append(f"  Exports (sells): {', '.join(exports[:10])}")
             if "exchange" in wp:
-                exchange = [e.get("symbol") if isinstance(e, dict) else str(e) for e in wp.get("exchange", [])]
+                exchange = [
+                    e.get("symbol") if isinstance(e, dict) else str(e)
+                    for e in wp.get("exchange", [])
+                ]
                 if exchange:
                     lines.append(f"  Exchange: {', '.join(exchange)}")
 
     # Show shipyards
     if shipyard_waypoints:
         lines.append("\n=== SHIPYARDS ===")
-        display_shipyards = shipyard_waypoints[:5] if not closest_only else shipyard_waypoints
+        display_shipyards = (
+            shipyard_waypoints[:5] if not closest_only else shipyard_waypoints
+        )
         for wp in display_shipyards:
             dist_str = ""
             if reference_position:
@@ -2276,7 +2569,9 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
         lines.append(f"\n=== ASTEROIDS ===")
         # Already sorted by distance if reference_position exists
         # Show first 5 (or all if closest_only was used)
-        display_asteroids = asteroid_waypoints[:5] if not closest_only else asteroid_waypoints
+        display_asteroids = (
+            asteroid_waypoints[:5] if not closest_only else asteroid_waypoints
+        )
 
         for wp in display_asteroids:
             dist_str = ""
@@ -2284,7 +2579,11 @@ def scan_system(system_symbol: str, reference_ship: str = None, closest_only: bo
                 dist = calc_distance(wp)
                 dist_str = f" (distance from {reference_ship_name}: {dist:.1f})"
 
-            traits = [t.get("symbol", "") for t in wp.get("traits", []) if t.get("symbol") not in ["MARKETPLACE", "SHIPYARD"]]
+            traits = [
+                t.get("symbol", "")
+                for t in wp.get("traits", [])
+                if t.get("symbol") not in ["MARKETPLACE", "SHIPYARD"]
+            ]
             trait_str = f" - {', '.join(traits)}" if traits else ""
             lines.append(f"{wp.get('symbol')} ({wp.get('type')}){dist_str}{trait_str}")
 
@@ -2299,7 +2598,7 @@ def view_shipyard(waypoint_symbol: str) -> str:
         waypoint_symbol: Waypoint with shipyard (e.g., 'X1-KD26-A1')
     """
     # Extract system from waypoint (e.g., 'X1-KD26-A1' -> 'X1-KD26')
-    system_symbol = '-'.join(waypoint_symbol.split('-')[:2])
+    system_symbol = "-".join(waypoint_symbol.split("-")[:2])
 
     data = client.get_shipyard(system_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
@@ -2312,11 +2611,15 @@ def view_shipyard(waypoint_symbol: str) -> str:
     if isinstance(ships, list) and ships:
         for s in ships:
             if isinstance(s, dict) and "name" in s:
-                lines.append(f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits")
+                lines.append(
+                    f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits"
+                )
             else:
                 lines.append(f"  {s.get('type', str(s))}")
     else:
-        lines.append("  No ship details available (need a ship present at this waypoint to see prices).")
+        lines.append(
+            "  No ship details available (need a ship present at this waypoint to see prices)."
+        )
     return "\n".join(lines)
 
 
@@ -2329,7 +2632,8 @@ def view_market(waypoint_symbol: str) -> str:
         waypoint_symbol: Waypoint with market (e.g., 'X1-KD26-B7')
     """
     import time
-    system_symbol = '-'.join(waypoint_symbol.split('-')[:2])
+
+    system_symbol = "-".join(waypoint_symbol.split("-")[:2])
     lines = [f"Market at {waypoint_symbol}:"]
 
     # Try live API data (succeeds with full prices only when a ship is present)
@@ -2353,12 +2657,22 @@ def view_market(waypoint_symbol: str) -> str:
 
     # Imports / Exports / Exchange — prefer live, fall back to cache
     if api_data:
-        for section, label in [("exports", "Exports"), ("imports", "Imports"), ("exchange", "Exchange")]:
+        for section, label in [
+            ("exports", "Exports"),
+            ("imports", "Imports"),
+            ("exchange", "Exchange"),
+        ]:
             items = api_data.get(section, [])
             if items:
-                lines.append(f"  {label}: {', '.join(i['symbol'] if isinstance(i, dict) else i for i in items)}")
+                lines.append(
+                    f"  {label}: {', '.join(i['symbol'] if isinstance(i, dict) else i for i in items)}"
+                )
     elif cached:
-        for section, label in [("exports", "Exports"), ("imports", "Imports"), ("exchange", "Exchange")]:
+        for section, label in [
+            ("exports", "Exports"),
+            ("imports", "Imports"),
+            ("exchange", "Exchange"),
+        ]:
             items = cached.get(section, [])
             if items:
                 lines.append(f"  {label}: {', '.join(items)}")
@@ -2367,7 +2681,9 @@ def view_market(waypoint_symbol: str) -> str:
     if live_trade_goods:
         lines.append("  Prices (live):")
         for g in live_trade_goods:
-            lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
+            lines.append(
+                f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})"
+            )
     else:
         cached_goods = cached.get("trade_goods", [])
         if cached_goods:
@@ -2384,7 +2700,9 @@ def view_market(waypoint_symbol: str) -> str:
                 age_str = "age unknown"
             lines.append(f"  Prices (cached, {age_str}):")
             for g in cached_goods:
-                lines.append(f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})")
+                lines.append(
+                    f"    {g['symbol']}: buy {g.get('purchasePrice', '?')} / sell {g.get('sellPrice', '?')} (vol: {g.get('tradeVolume', '?')})"
+                )
         else:
             lines.append("  No price data (no ship present, nothing cached).")
             if api_error:
@@ -2400,11 +2718,15 @@ def view_market(waypoint_symbol: str) -> str:
             if isinstance(ships, list) and ships:
                 for s in ships:
                     if isinstance(s, dict) and "name" in s:
-                        lines.append(f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits")
+                        lines.append(
+                            f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits"
+                        )
                     else:
                         lines.append(f"  {s.get('type', str(s))}")
             else:
-                lines.append("  No ship details available (need a ship present to see prices).")
+                lines.append(
+                    "  No ship details available (need a ship present to see prices)."
+                )
     except Exception:
         pass
 
@@ -2413,8 +2735,7 @@ def view_market(waypoint_symbol: str) -> str:
 
 @tool
 def query_markets(
-    trade_symbol: Optional[str] = None,
-    near_waypoint: Optional[str] = None
+    trade_symbol: Optional[str] = None, near_waypoint: Optional[str] = None
 ) -> str:
     """[READ-ONLY] Query cached market data with flexible filters.
 
@@ -2446,39 +2767,44 @@ def query_markets(
         coords = {}
         if isinstance(all_waypoints, list):
             for wp in all_waypoints:
-                coords[wp.get('symbol')] = (wp.get('x'), wp.get('y'))
+                coords[wp.get("symbol")] = (wp.get("x"), wp.get("y"))
         return coords
 
     if near_waypoint:
-        system_symbol = '-'.join(near_waypoint.split('-')[:2])
+        system_symbol = "-".join(near_waypoint.split("-")[:2])
         waypoint_coords.update(get_waypoint_coords(system_symbol))
         ref_x, ref_y = waypoint_coords.get(near_waypoint, (None, None))
 
     def dist_to_ref(x, y) -> float:
         if ref_x is None or x is None:
-            return float('inf')
+            return float("inf")
         return ((ref_x - x) ** 2 + (ref_y - y) ** 2) ** 0.5
 
     # Process each cached market, collecting (dist, waypoint_symbol, market_data, matching_goods)
     results = []
     for waypoint_symbol, market_data in cache.items():
-        trade_goods = market_data.get('trade_goods', [])
+        trade_goods = market_data.get("trade_goods", [])
 
         # Filter by trade_symbol if specified
         if trade_symbol:
-            matching_goods = [g for g in trade_goods if g.get('symbol') == trade_symbol]
+            matching_goods = [g for g in trade_goods if g.get("symbol") == trade_symbol]
             if not matching_goods:
                 continue
         else:
             matching_goods = trade_goods
-            if not (market_data.get('exports') or market_data.get('imports') or market_data.get('exchange') or trade_goods):
+            if not (
+                market_data.get("exports")
+                or market_data.get("imports")
+                or market_data.get("exchange")
+                or trade_goods
+            ):
                 continue
 
         # Get coordinates for distance sorting
-        dist = float('inf')
+        dist = float("inf")
         if ref_x is not None:
-            sys_sym = '-'.join(waypoint_symbol.split('-')[:2])
-            if sys_sym not in {'-'.join(k.split('-')[:2]) for k in waypoint_coords}:
+            sys_sym = "-".join(waypoint_symbol.split("-")[:2])
+            if sys_sym not in {"-".join(k.split("-")[:2]) for k in waypoint_coords}:
                 waypoint_coords.update(get_waypoint_coords(sys_sym))
             x, y = waypoint_coords.get(waypoint_symbol, (None, None))
             dist = dist_to_ref(x, y)
@@ -2515,10 +2841,12 @@ def query_markets(
     for dist, waypoint_symbol, market_data, goods in results:
         # Build header annotations
         annotations = []
-        if dist != float('inf'):
+        if dist != float("inf"):
             annotations.append(f"dist:{dist:.0f}")
-        if market_data.get('last_updated') and any(g.get('purchasePrice') or g.get('sellPrice') for g in goods):
-            annotations.append(format_staleness(market_data['last_updated']))
+        if market_data.get("last_updated") and any(
+            g.get("purchasePrice") or g.get("sellPrice") for g in goods
+        ):
+            annotations.append(format_staleness(market_data["last_updated"]))
         header = waypoint_symbol
         if annotations:
             header += f" ({', '.join(annotations)})"
@@ -2526,9 +2854,9 @@ def query_markets(
 
         # Show market structure (exports/imports/exchange) when not filtering by good
         if not trade_symbol:
-            exports = market_data.get('exports', [])
-            imports = market_data.get('imports', [])
-            exchange = market_data.get('exchange', [])
+            exports = market_data.get("exports", [])
+            imports = market_data.get("imports", [])
+            exchange = market_data.get("exchange", [])
             if exports:
                 lines.append(f"  exports:  {', '.join(exports)}")
             if imports:
@@ -2537,14 +2865,16 @@ def query_markets(
                 lines.append(f"  exchange: {', '.join(exchange)}")
 
         # Show live prices if available
-        priced_goods = [g for g in goods if g.get('purchasePrice') or g.get('sellPrice')]
+        priced_goods = [
+            g for g in goods if g.get("purchasePrice") or g.get("sellPrice")
+        ]
         if priced_goods:
             lines.append("  prices:")
             for g in priced_goods:
-                symbol = g.get('symbol', '?')
-                buy_price = g.get('purchasePrice')
-                sell_price = g.get('sellPrice')
-                volume = g.get('tradeVolume')
+                symbol = g.get("symbol", "?")
+                buy_price = g.get("purchasePrice")
+                sell_price = g.get("sellPrice")
+                volume = g.get("tradeVolume")
                 parts = []
                 if buy_price:
                     parts.append(f"buy {buy_price}")
@@ -2559,6 +2889,7 @@ def query_markets(
 # ──────────────────────────────────────────────
 #  Action tools
 # ──────────────────────────────────────────────
+
 
 @tool
 def accept_contract(contract_id: str) -> str:
@@ -2601,12 +2932,16 @@ def orbit_ship(ship_symbol: str) -> str:
     nav = data.get("nav", {})
     return f"{ship_symbol} is now in orbit at {nav.get('waypointSymbol', '?')}."
 
+
 # ──────────────────────────────────────────────
 #  Navigation & Action tools
 # ──────────────────────────────────────────────
 
+
 @tool
-def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE") -> str:
+def navigate_ship(
+    ship_symbol: str, destination_symbol: str, mode: str = "CRUISE"
+) -> str:
     """
     [STATE: position, fuel] Smart Navigation.
     - If destination is close: Navigates directly.
@@ -2627,8 +2962,10 @@ def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE
         # Fetch route details without executing to check distance/hops
         # We assume standard CRUISE for calculation if mode not specified
         waypoints = client.list_waypoints(nav.get("systemSymbol"))
-        origin_obj = next((w for w in waypoints if w['symbol'] == current_wp), None)
-        target_obj = next((w for w in waypoints if w['symbol'] == destination_symbol), None)
+        origin_obj = next((w for w in waypoints if w["symbol"] == current_wp), None)
+        target_obj = next(
+            (w for w in waypoints if w["symbol"] == destination_symbol), None
+        )
 
         if origin_obj and target_obj:
             path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
@@ -2645,19 +2982,25 @@ def navigate_ship(ship_symbol: str, destination_symbol: str, mode: str = "CRUISE
                 engine.assign(ship_symbol, cmds)
 
                 stops = len(path) - 2
-                return (f"🚀 AUTOPILOT ENGAGED for {ship_symbol}. Multi-hop route detected ({stops} stops).\n"
-                        f"Assigned behavior: '{cmds}'\n"
-                        f"Ship will auto-refuel and travel to {destination_symbol}. check 'view_ships' for progress.")
+                return (
+                    f"🚀 AUTOPILOT ENGAGED for {ship_symbol}. Multi-hop route detected ({stops} stops).\n"
+                    f"Assigned behavior: '{cmds}'\n"
+                    f"Ship will auto-refuel and travel to {destination_symbol}. check 'view_ships' for progress."
+                )
 
         # 3. If direct route or simple jump, just execute standard logic
-        msg, wait = _navigate_ship_logic(ship_symbol, destination_symbol, mode, execute=True)
+        msg, wait = _navigate_ship_logic(
+            ship_symbol, destination_symbol, mode, execute=True
+        )
         navigate_ship._last_wait = wait
         return msg
     except Exception as e:
         return f"Error: {e}"
 
+
 # Initialize attribute
 navigate_ship._last_wait = 0.0
+
 
 @tool
 def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
@@ -2670,6 +3013,7 @@ def plan_route(ship_symbol: str, destination: str, mode: str = "CRUISE") -> str:
         return result
     except Exception as e:
         return f"Error: {e}"
+
 
 @tool
 def dock_ship(ship_symbol: str) -> str:
@@ -2700,12 +3044,15 @@ def extract_ore(ship_symbol: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 # Initialize the wait tracking attribute
 extract_ore._last_wait = 0.0
 
 
 @tool
-def sell_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+def sell_cargo(
+    ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False
+) -> str:
     """[STATE: cargo, credits] Sell cargo at current market. Auto-docks. Refuses to sell contract goods."""
     try:
         return _sell_cargo_logic(ship_symbol, trade_symbol, units, force)
@@ -2723,7 +3070,9 @@ def buy_cargo(ship_symbol: str, trade_symbol: str, units: int = None) -> str:
 
 
 @tool
-def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False) -> str:
+def jettison_cargo(
+    ship_symbol: str, trade_symbol: str, units: int = None, force: bool = False
+) -> str:
     """[STATE: cargo] Jettison cargo into space. Refuses to jettison contract goods unless force=True."""
     if not force:
         contract_goods = _get_contract_goods()
@@ -2766,16 +3115,20 @@ def jettison_cargo(ship_symbol: str, trade_symbol: str, units: int = None, force
 
 
 @tool
-def transfer_cargo(from_ship: str, to_ship: str, trade_symbol: str, units: int = None) -> str:
+def transfer_cargo(
+    from_ship: str, to_ship: str, trade_symbol: str, units: int = None
+) -> str:
     """[STATE: cargo] Transfer cargo between ships. Auto-orbits both. Both must be at same waypoint."""
     try:
         return _transfer_cargo_logic(from_ship, to_ship, trade_symbol, units)
     except Exception as e:
         return f"Error: {e}"
 
+
 # ──────────────────────────────────────────────
 #  Advanced ship operations
 # ──────────────────────────────────────────────
+
 
 @tool
 def survey_asteroid(ship_symbol: str) -> str:
@@ -2785,10 +3138,14 @@ def survey_asteroid(ship_symbol: str) -> str:
         return f"Error: {data['error']}"
     surveys = data.get("surveys", [])
     cooldown = data.get("cooldown", {})
-    lines = [f"Created {len(surveys)} survey(s). Cooldown: {cooldown.get('remainingSeconds', 0)}s"]
+    lines = [
+        f"Created {len(surveys)} survey(s). Cooldown: {cooldown.get('remainingSeconds', 0)}s"
+    ]
     for i, survey in enumerate(surveys):
         deposits = [d.get("symbol", "?") for d in survey.get("deposits", [])]
-        lines.append(f"  Survey {i+1}: {survey.get('signature', '?')} - Size: {survey.get('size', '?')}")
+        lines.append(
+            f"  Survey {i+1}: {survey.get('signature', '?')} - Size: {survey.get('size', '?')}"
+        )
         lines.append(f"    Deposits: {', '.join(deposits)}")
         lines.append(f"    Expires: {survey.get('expiration', '?')}")
     return "\n".join(lines)
@@ -2802,7 +3159,9 @@ def scan_waypoints(ship_symbol: str) -> str:
         return f"Error: {data['error']}"
     waypoints = data.get("waypoints", [])
     cooldown = data.get("cooldown", {})
-    lines = [f"Found {len(waypoints)} waypoints. Cooldown: {cooldown.get('remainingSeconds', 0)}s"]
+    lines = [
+        f"Found {len(waypoints)} waypoints. Cooldown: {cooldown.get('remainingSeconds', 0)}s"
+    ]
     for wp in waypoints[:15]:  # Limit output
         traits = ", ".join(t.get("symbol", "") for t in wp.get("traits", [])[:3])
         lines.append(f"  {wp.get('symbol', '?')} ({wp.get('type', '?')}) - {traits}")
@@ -2819,10 +3178,14 @@ def scan_ships(ship_symbol: str) -> str:
         return f"Error: {data['error']}"
     ships = data.get("ships", [])
     cooldown = data.get("cooldown", {})
-    lines = [f"Found {len(ships)} ships. Cooldown: {cooldown.get('remainingSeconds', 0)}s"]
+    lines = [
+        f"Found {len(ships)} ships. Cooldown: {cooldown.get('remainingSeconds', 0)}s"
+    ]
     for ship in ships[:10]:
         nav = ship.get("nav", {})
-        lines.append(f"  {ship.get('symbol', '?')} - {ship.get('registration', {}).get('role', '?')} @ {nav.get('waypointSymbol', '?')}")
+        lines.append(
+            f"  {ship.get('symbol', '?')} - {ship.get('registration', {}).get('role', '?')} @ {nav.get('waypointSymbol', '?')}"
+        )
     return "\n".join(lines)
 
 
@@ -2897,7 +3260,7 @@ def view_jump_gate(waypoint_symbol: str) -> str:
         waypoint_symbol: Waypoint with jump gate (e.g., 'X1-KD26-J1')
     """
     # Extract system from waypoint (e.g., 'X1-KD26-J1' -> 'X1-KD26')
-    system_symbol = '-'.join(waypoint_symbol.split('-')[:2])
+    system_symbol = "-".join(waypoint_symbol.split("-")[:2])
 
     data = client.get_jump_gate(system_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
@@ -2921,7 +3284,9 @@ def set_flight_mode(ship_symbol: str, mode: str) -> str:
 
 
 @tool
-def deliver_contract(contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None) -> str:
+def deliver_contract(
+    contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None
+) -> str:
     """[STATE: cargo, contract] Deliver goods for a contract. Auto-docks. Intelligently calculates optimal delivery amount.
 
     If units is specified, delivers that amount (capped by contract requirements and available cargo).
@@ -2972,14 +3337,16 @@ def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) 
 
     # Filter by good if requested
     if good:
-        routes = [r for r in routes if r['good'] == good.upper()]
+        routes = [r for r in routes if r["good"] == good.upper()]
         if not routes:
             return f"No routes found for {good}."
 
     # Format top 10
     lines = ["Top trade routes (from cached prices):\n"]
     for r in routes[:10]:
-        lines.append(f"  {r['good']}: buy at {r['src']} ({r['buy']}/unit) -> sell at {r['snk']} ({r['sell']}/unit)")
+        lines.append(
+            f"  {r['good']}: buy at {r['src']} ({r['buy']}/unit) -> sell at {r['snk']} ({r['sell']}/unit)"
+        )
         detail = f"    Profit: {r['profit']}/unit | Volume: {r['volume']}"
         if r.get("dist"):
             detail += f" | Dist: {r['dist']:.1f} from {ship_symbol}"
@@ -2992,6 +3359,7 @@ def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) 
 # ──────────────────────────────────────────────
 #  Planning tool
 # ──────────────────────────────────────────────
+
 
 @tool
 def update_plan(plan: str) -> str:
@@ -3006,9 +3374,11 @@ def update_plan(plan: str) -> str:
         mtime = plan_file.stat().st_mtime
         age_seconds = time.time() - mtime
         if age_seconds < 60:
-            return (f"ERROR: Plan was updated {int(age_seconds)}s ago! "
-                    f"STOP PLANNING and START EXECUTING the existing plan. "
-                    f"Read [Current Plan] and take the next action.")
+            return (
+                f"ERROR: Plan was updated {int(age_seconds)}s ago! "
+                f"STOP PLANNING and START EXECUTING the existing plan. "
+                f"Read [Current Plan] and take the next action."
+            )
 
     plan_file.write_text(plan, encoding="utf-8")
     return f"Plan updated ({len(plan)} chars). NOW EXECUTE IT - do not plan again!"
@@ -3081,7 +3451,9 @@ def cancel_behavior(ship_symbol: str) -> str:
 
 
 @tool
-def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", start_step: int = 0) -> str:
+def assign_mining_loop(
+    ship_symbol: str, asteroid_wp: str, ore_types: str = "", start_step: int = 0
+) -> str:
     """[STATE: behavior] Convenience: assign a mine-sell loop. Builds a step sequence internally.
 
     Args:
@@ -3089,7 +3461,9 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", 
         asteroid_wp: Asteroid waypoint to mine at.
         ore_types: Comma-separated ore symbols to KEEP (e.g. "IRON_ORE,COPPER_ORE").
     """
-    ore_list = [s.strip() for s in ore_types.split(",") if s.strip()] if ore_types else []
+    ore_list = (
+        [s.strip() for s in ore_types.split(",") if s.strip()] if ore_types else []
+    )
     ore_str = " ".join(ore_list) if ore_list else ""
     mine_part = f"mine {asteroid_wp} {ore_str}".strip()
     # Simple mine loop: mine until full, then alert for LLM to handle selling
@@ -3098,8 +3472,15 @@ def assign_mining_loop(ship_symbol: str, asteroid_wp: str, ore_types: str = "", 
 
 
 @tool
-def assign_trade_route(ship_symbol: str, buy_waypoint: str, buy_good: str, sell_waypoint: str, sell_good: str = None, 
-                       end_step: str = "stop", start_step: int = 0) -> str:
+def assign_trade_route(
+    ship_symbol: str,
+    buy_waypoint: str,
+    buy_good: str,
+    sell_waypoint: str,
+    sell_good: str = None,
+    end_step: str = "stop",
+    start_step: int = 0,
+) -> str:
     """[STATE: behavior] Assign a buying and selling route.
     The ship will:
     1. Go to buy_waypoint
@@ -3169,7 +3550,7 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
         # Determine system from first ship
         first_ship = client.get_ship(ships[0])
         if isinstance(first_ship, dict) and "error" not in first_ship:
-            system_symbol = first_ship['nav']['systemSymbol']
+            system_symbol = first_ship["nav"]["systemSymbol"]
             cache = load_market_cache()
 
             # Filter cache keys for this system
@@ -3194,7 +3575,8 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
     # Calculate offsets to spread ships out
     m = len(markets)
     already_placed = sum(
-        1 for cfg in engine.behaviors.values()
+        1
+        for cfg in engine.behaviors.values()
         if cfg.steps_str == steps_str and cfg.ship_symbol not in ships
     )
 
@@ -3221,6 +3603,7 @@ def assign_auto_trade(ship_symbol: str) -> str:
     """
     return get_engine().assign(ship_symbol, "autotrade")
 
+
 @tool
 def assign_contract_duty(ship_symbol: str) -> str:
     """[STATE: behavior] Assign ship to contract duty: Goto HQ, negotiate/accept contracts, and automatically fulfill them.
@@ -3230,6 +3613,7 @@ def assign_contract_duty(ship_symbol: str) -> str:
     # If no contract -> goto HQ, negotiate. If contract exists -> fulfill it.
     return get_engine().assign(ship_symbol, "negotiate")
 
+
 # ──────────────────────────────────────────────
 #  Tool registry
 # ──────────────────────────────────────────────
@@ -3237,63 +3621,133 @@ def assign_contract_duty(ship_symbol: str) -> str:
 # Tier 1: Essential tools
 TIER_1_TOOLS = [
     # Navigation & planning
-    navigate_ship, plan_route,
+    navigate_ship,
+    plan_route,
     # Trading & cargo
-    buy_cargo, sell_cargo, transfer_cargo, jettison_cargo,
+    buy_cargo,
+    sell_cargo,
+    transfer_cargo,
+    jettison_cargo,
     # Contracts
-    accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
+    accept_contract,
+    deliver_contract,
+    fulfill_contract,
+    negotiate_contract,
     # Info
-    view_market, view_ships, view_contracts, find_trades,
+    view_market,
+    view_ships,
+    view_contracts,
+    find_trades,
     # Locator
     find_waypoints,
     # Planning
     update_plan,
     # Behavior control
-    resume_behavior, skip_step, cancel_behavior, pause_behavior,
-    assign_mining_loop, assign_satellite_scout, assign_trade_route, assign_auto_trade, assign_contract_duty,
+    resume_behavior,
+    skip_step,
+    cancel_behavior,
+    pause_behavior,
+    assign_mining_loop,
+    assign_satellite_scout,
+    assign_trade_route,
+    assign_auto_trade,
+    assign_contract_duty,
     create_behavior,
 ]
 
 # All tools (tier 2)
 ALL_TOOLS = [
     # Observation
-    view_agent, view_contracts, view_ships, view_ship_details, view_cargo,
-    scan_system, view_market, view_jump_gate,
+    view_agent,
+    view_contracts,
+    view_ships,
+    view_ship_details,
+    view_cargo,
+    scan_system,
+    view_market,
+    view_jump_gate,
     # Locator
     find_waypoints,
     # Ship operations
-    orbit_ship, dock_ship, navigate_ship, refuel_ship, plan_route,
+    orbit_ship,
+    dock_ship,
+    navigate_ship,
+    refuel_ship,
+    plan_route,
     # Mining & resources
-    extract_ore, survey_asteroid,
+    extract_ore,
+    survey_asteroid,
     # Trading & cargo
-    buy_cargo, sell_cargo, jettison_cargo, transfer_cargo,
+    buy_cargo,
+    sell_cargo,
+    jettison_cargo,
+    transfer_cargo,
     # Contracts
-    accept_contract, deliver_contract, fulfill_contract, negotiate_contract,
+    accept_contract,
+    deliver_contract,
+    fulfill_contract,
+    negotiate_contract,
     # Ships & shipyard
     purchase_ship,
     # Scanning & exploration
-    scan_waypoints, scan_ships, chart_waypoint,
+    scan_waypoints,
+    scan_ships,
+    chart_waypoint,
     # Inter-system travel
-    jump_ship, warp_ship, set_flight_mode,
+    jump_ship,
+    warp_ship,
+    set_flight_mode,
     # Planning
     update_plan,
     # Analysis
     find_trades,
     # Behavior control
-    create_behavior, resume_behavior, skip_step, cancel_behavior, pause_behavior,
-    assign_mining_loop, assign_satellite_scout, assign_trade_route, assign_auto_trade, assign_contract_duty,
+    create_behavior,
+    resume_behavior,
+    skip_step,
+    cancel_behavior,
+    pause_behavior,
+    assign_mining_loop,
+    assign_satellite_scout,
+    assign_trade_route,
+    assign_auto_trade,
+    assign_contract_duty,
 ]
 
 # Tools that are "significant" actions worth narrating
 SIGNIFICANT_TOOLS = {
-    "extract_ore", "survey_asteroid", "navigate_ship", "buy_cargo", "sell_cargo", "jettison_cargo",
-    "transfer_cargo", "accept_contract", "fulfill_contract", "negotiate_contract",
-    "purchase_ship", "refuel_ship", "dock_ship", "orbit_ship", "deliver_contract",
-    "scan_waypoints", "scan_ships", "chart_waypoint", "jump_ship", "warp_ship",
+    "extract_ore",
+    "survey_asteroid",
+    "navigate_ship",
+    "buy_cargo",
+    "sell_cargo",
+    "jettison_cargo",
+    "transfer_cargo",
+    "accept_contract",
+    "fulfill_contract",
+    "negotiate_contract",
+    "purchase_ship",
+    "refuel_ship",
+    "dock_ship",
+    "orbit_ship",
+    "deliver_contract",
+    "scan_waypoints",
+    "scan_ships",
+    "chart_waypoint",
+    "jump_ship",
+    "warp_ship",
 }
 
 # Tools that have wait/cooldown times (for parallel narrative)
-WAITING_TOOLS = {"navigate_ship", "extract_ore", "survey_asteroid", "scan_waypoints", "scan_ships", "jump_ship", "warp_ship"}
+WAITING_TOOLS = {
+    "navigate_ship",
+    "extract_ore",
+    "survey_asteroid",
+    "scan_waypoints",
+    "scan_ships",
+    "jump_ship",
+    "warp_ship",
+}
 
 
 def get_tool_by_name(name: str):

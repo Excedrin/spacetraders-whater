@@ -11,6 +11,7 @@ Usage:
 
     tools = generate_all_tools(agent)
 """
+
 import inspect
 import json
 from functools import wraps
@@ -19,10 +20,10 @@ from typing import Any, Callable, Optional
 
 from langchain_core.tools import tool
 
-
 # ──────────────────────────────────────────────
 #  OpenAPI Spec Parser
 # ──────────────────────────────────────────────
+
 
 def load_openapi_spec(path: str = "st.json") -> dict:
     """Load the SpaceTraders OpenAPI spec."""
@@ -85,7 +86,10 @@ def print_api_coverage(spec_path: str = "st.json"):
 #  Tool Generation from snisp
 # ──────────────────────────────────────────────
 
-def make_ship_tool(method_name: str, method: Callable, ship_getter: Callable) -> Callable:
+
+def make_ship_tool(
+    method_name: str, method: Callable, ship_getter: Callable
+) -> Callable:
     """
     Create a LangChain tool from a Ship method.
 
@@ -112,7 +116,9 @@ def make_ship_tool(method_name: str, method: Callable, ship_getter: Callable) ->
 
     # Update the tool's name and docstring
     ship_tool.__name__ = method_name
-    ship_tool.__doc__ = f"{doc}\n\nArgs:\n  ship_symbol: The ship to use (e.g., 'WHATER-1')"
+    ship_tool.__doc__ = (
+        f"{doc}\n\nArgs:\n  ship_symbol: The ship to use (e.g., 'WHATER-1')"
+    )
 
     return ship_tool
 
@@ -175,7 +181,6 @@ SHIP_TOOL_CONFIGS = [
         "description": "Warp ship to a waypoint in another system (uses antimatter).",
         "params": {"waypoint": "Target waypoint symbol"},
     },
-
     # Mining & Resources
     {
         "name": "ship_extract",
@@ -201,25 +206,34 @@ SHIP_TOOL_CONFIGS = [
         "description": "Refine raw ore or gas into refined materials.",
         "params": {"produce": "What to produce (e.g., 'IRON', 'FUEL')"},
     },
-
     # Trading
     {
         "name": "ship_sell",
         "method": "sell",
         "description": "Sell cargo at the current market. Ship must be docked.",
-        "params": {"item": "Trade symbol (e.g., 'IRON_ORE')", "units": "Number of units to sell"},
+        "params": {
+            "item": "Trade symbol (e.g., 'IRON_ORE')",
+            "units": "Number of units to sell",
+        },
     },
     {
         "name": "ship_purchase",
         "method": "purchase",
         "description": "Purchase cargo from the current market. Ship must be docked.",
-        "params": {"item": "Trade symbol (e.g., 'FUEL')", "units": "Number of units to buy"},
+        "params": {
+            "item": "Trade symbol (e.g., 'FUEL')",
+            "units": "Number of units to buy",
+        },
     },
     {
         "name": "ship_transfer",
         "method": "transfer",
         "description": "Transfer cargo to another ship at the same waypoint.",
-        "params": {"item": "Trade symbol", "units": "Number of units", "to_ship": "Target ship symbol"},
+        "params": {
+            "item": "Trade symbol",
+            "units": "Number of units",
+            "to_ship": "Target ship symbol",
+        },
     },
     {
         "name": "ship_jettison",
@@ -227,7 +241,6 @@ SHIP_TOOL_CONFIGS = [
         "description": "Jettison cargo into space. Use to make room.",
         "params": {"item": "Trade symbol", "units": "Number of units to discard"},
     },
-
     # Ship Management
     {
         "name": "ship_refuel",
@@ -316,6 +329,7 @@ def generate_snisp_tools(agent) -> list:
                     lines.append(f"    - {item.symbol}: {item.units}")
             lines.append("")
         return "\n".join(lines) if lines else "No ships in fleet"
+
     tools.append(list_ships)
 
     @tool
@@ -325,14 +339,23 @@ def generate_snisp_tools(agent) -> list:
         for contract in agent.contracts:
             lines.append(f"Contract: {contract.id}")
             lines.append(f"  Type: {contract.type}")
-            lines.append(f"  Accepted: {contract.accepted}, Fulfilled: {contract.fulfilled}")
+            lines.append(
+                f"  Accepted: {contract.accepted}, Fulfilled: {contract.fulfilled}"
+            )
             terms = contract.terms
-            lines.append(f"  Payment: {terms.payment.on_accepted} on accept, {terms.payment.on_fulfilled} on fulfill")
+            lines.append(
+                f"  Payment: {terms.payment.on_accepted} on accept, {terms.payment.on_fulfilled} on fulfill"
+            )
             for deliver in terms.deliver:
-                lines.append(f"  Deliver: {deliver.units_required} {deliver.trade_symbol} to {deliver.destination_symbol}")
-                lines.append(f"           ({deliver.units_fulfilled}/{deliver.units_required} done)")
+                lines.append(
+                    f"  Deliver: {deliver.units_required} {deliver.trade_symbol} to {deliver.destination_symbol}"
+                )
+                lines.append(
+                    f"           ({deliver.units_fulfilled}/{deliver.units_required} done)"
+                )
             lines.append("")
         return "\n".join(lines) if lines else "No contracts"
+
     tools.append(list_contracts)
 
     @tool
@@ -344,6 +367,7 @@ def generate_snisp_tools(agent) -> list:
             f"Headquarters: {agent.headquarters}\n"
             f"Ship count: {agent.ship_count}"
         )
+
     tools.append(agent_status)
 
     return tools
@@ -369,7 +393,9 @@ def create_ship_tool(config: dict, get_ship: Callable):
                 return f"Error: {e}"
 
         ship_method.__name__ = tool_name
-        ship_method.__doc__ = f"{description}\n\nArgs:\n  ship_symbol: Ship to use (e.g., 'WHATER-1')"
+        ship_method.__doc__ = (
+            f"{description}\n\nArgs:\n  ship_symbol: Ship to use (e.g., 'WHATER-1')"
+        )
         return ship_method
 
     elif len(params) == 1:
@@ -386,7 +412,9 @@ def create_ship_tool(config: dict, get_ship: Callable):
                 return f"Error: {e}"
 
         ship_method_1arg.__name__ = tool_name
-        ship_method_1arg.__doc__ = f"{description}\n\nArgs:\n  ship_symbol: Ship to use\n  arg1: {param_desc}"
+        ship_method_1arg.__doc__ = (
+            f"{description}\n\nArgs:\n  ship_symbol: Ship to use\n  arg1: {param_desc}"
+        )
         return ship_method_1arg
 
     elif len(params) == 2:
