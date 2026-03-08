@@ -605,37 +605,6 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     return result, cd_secs
 
 
-def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
-    """Find cheapest/best market for a good in the system using cache."""
-    cache = load_market_cache()
-    candidates = []
-    for wp, mdata in cache.items():
-        if not wp.startswith(ship_system):
-            continue
-        # Check if good is sold here (Purchase Price or Export/Exchange)
-        price = float("inf")
-        found = False
-        for tg in mdata.get("trade_goods", []):
-            if tg["symbol"] == trade_symbol:
-                pp = tg.get("purchasePrice")
-                if pp:
-                    price = pp
-                    found = True
-                break
-        if not found:
-            if trade_symbol in mdata.get("exports", []) or trade_symbol in mdata.get(
-                "exchange", []
-            ):
-                found = True
-                price = 1000000  # Penalty for unknown price
-        if found:
-            candidates.append((price, wp))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
-
 def _sell_cargo_logic(
     ship_symbol: str,
     trade_symbol: str,
@@ -709,9 +678,10 @@ def _sell_cargo_logic(
         if min_price and sell_count > 0:
             price_per_unit = tx.get("pricePerUnit", 0)
             if price_per_unit < min_price:
-                raise PriceFloorHit(
-                    trade_symbol, price_per_unit, min_price, total_sold, total_revenue
-                )
+                break
+                # raise PriceFloorHit(
+                #    trade_symbol, price_per_unit, min_price, total_sold, total_revenue
+                # )
 
     cargo = data.get("cargo", {})
     if sell_count > 1:
@@ -827,9 +797,10 @@ def _buy_cargo_logic(
         purchase_count += 1
 
         if max_price and price_per_unit > max_price:
-            raise PriceCeilingHit(
-                trade_symbol, price_per_unit, max_price, total_purchased, total_cost
-            )
+            break
+            # raise PriceCeilingHit(
+            #    trade_symbol, price_per_unit, max_price, total_purchased, total_cost
+            # )
 
     # Check minimum quantity requirement
     if min_qty and total_purchased < min_qty:
@@ -1086,11 +1057,6 @@ def parse_steps(steps_str: str) -> list[Step]:
     return steps
 
 
-def reconstruct_steps_str(steps: list[Step]) -> str:
-    """Reconstructs the steps string from a list of Step objects."""
-    return ", ".join(str(s) for s in steps)
-
-
 @dataclass
 class BehaviorConfig:
     ship_symbol: str
@@ -1224,52 +1190,6 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
         routes.sort(key=lambda r: r["profit"], reverse=True)
 
     return routes
-
-
-def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
-    """Helper: finds the best market to sell existing cargo."""
-    cache = load_market_cache()
-    candidates = []
-
-    ship = client.get_ship(ship_symbol)
-    if not ship or "error" in ship:
-        return None
-
-    system = ship["nav"]["systemSymbol"]
-    ship_x = ship["nav"]["route"]["destination"]["x"]
-    ship_y = ship["nav"]["route"]["destination"]["y"]
-
-    # We need system waypoints to calc distance if not in cache
-    # But usually cache keys are waypoint symbols.
-
-    for wp, mdata in cache.items():
-        if not wp.startswith(system):
-            continue
-
-        # Check if market buys this good (Imports or Exchange)
-        imports = set(mdata.get("imports", []))
-        exchange = set(mdata.get("exchange", []))
-        if good not in (imports | exchange):
-            continue
-
-        # Get price
-        price = 0
-        for tg in mdata.get("trade_goods", []):
-            if tg["symbol"] == good:
-                price = tg.get("sellPrice", 0)
-                break
-
-        # Approximate distance (if we don't have coords, assume far)
-        # For simplicity, we might rely on the tool cache or just assume 0 if unknown
-        # Ideally we fetch coords. For now, let's just use raw price.
-        candidates.append({"wp": wp, "price": price})
-
-    if not candidates:
-        return None
-
-    # Sort by price descending
-    candidates.sort(key=lambda x: x["price"], reverse=True)
-    return candidates[0]
 
 
 class BehaviorEngine:
@@ -2056,155 +1976,6 @@ def _buys_or_sells(m_data: dict, target: str):
 
 
 @tool
-def find_nearest(ship_symbol: str, target: str) -> str:
-    """
-    Find the nearest location for a specific need.
-    Target can be:
-    - A Trade Good (e.g. "FUEL", "IRON_ORE") -> Finds markets selling/buying it.
-    - A Trait (e.g. "SHIPYARD", "MARKETPLACE") -> Finds waypoints with this trait.
-    - A Type (e.g. "ASTEROID", "ENGINEERED_ASTEROID") -> Finds waypoints of this type.
-    """
-    # Get Ship Location
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        return f"Error: {ship['error']}"
-
-    system_symbol = ship["nav"]["systemSymbol"]
-    ship_x = ship["nav"]["route"]["destination"]["x"]
-    ship_y = ship["nav"]["route"]["destination"]["y"]
-
-    # 1. Fetch all waypoints in system (this is cached by the client usually, or cheap)
-    all_waypoints = client.list_waypoints(system_symbol)
-    if isinstance(all_waypoints, dict) and "error" in all_waypoints:
-        return f"Error: {all_waypoints['error']}"
-
-    candidates = []
-    target = target.upper()
-
-    # 2. Search Logic
-    market_cache = load_market_cache()  # Use your existing cache loader
-
-    for wp in all_waypoints:
-        wp_sym = wp["symbol"]
-        dist = math.sqrt((wp["x"] - ship_x) ** 2 + (wp["y"] - ship_y) ** 2)
-
-        hit = False
-        match_reason = ""
-
-        # Check Type
-        if wp["type"] == target:
-            hit = True
-            match_reason = f"Type: {target}"
-
-        # Check Traits
-        traits = [t["symbol"] for t in wp.get("traits", [])]
-        if target in traits:
-            hit = True
-            match_reason = f"Trait: {target}"
-
-        if not hit and "MARKETPLACE" in traits:
-            m_data = market_cache.get(wp_sym, {})
-            hit, match_reason = _buys_or_sells(m_data, target)
-
-        if hit:
-            candidates.append((dist, wp_sym, match_reason))
-
-    # 3. Sort and Return
-    if not candidates:
-        return f"No locations found for '{target}' in {system_symbol}."
-
-    candidates.sort(key=lambda x: x[0])  # Sort by distance
-
-    lines = [f"Found {len(candidates)} locations for '{target}' near {ship_symbol}:"]
-    for dist, sym, reason in candidates[:5]:
-        lines.append(f"- {sym}: {dist:.1f} distance ({reason})")
-
-    return "\n".join(lines)
-
-
-@tool
-def view_cargo(ship_symbol: str) -> str:
-    """[READ-ONLY] View the cargo contents of a specific ship."""
-    data = client.get_cargo(ship_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    inventory = data.get("inventory", [])
-    capacity = data.get("capacity", "?")
-    units = data.get("units", 0)
-    lines = [f"Cargo for {ship_symbol}: {units}/{capacity} units"]
-    if not inventory:
-        lines.append("  (empty)")
-    for item in inventory:
-        lines.append(f"  {item['symbol']}: {item['units']} units")
-    return "\n".join(lines)
-
-
-@tool
-def view_ship_details(ship_symbol: str) -> str:
-    """[READ-ONLY] View detailed ship info: mounts, modules, capabilities."""
-    ships = client.list_ships()
-    if isinstance(ships, dict) and "error" in ships:
-        return f"Error: {ships['error']}"
-
-    ship = None
-    for s in ships:
-        if s.get("symbol") == ship_symbol:
-            ship = s
-            break
-
-    if not ship:
-        return f"Error: Ship {ship_symbol} not found"
-
-    lines = [f"=== {ship_symbol} Details ==="]
-
-    # Basic info
-    reg = ship.get("registration", {})
-    lines.append(f"Role: {reg.get('role', '?')}")
-    lines.append(f"Faction: {reg.get('factionSymbol', '?')}")
-
-    # Frame
-    frame = ship.get("frame", {})
-    lines.append(f"\nFrame: {frame.get('name', '?')} ({frame.get('symbol', '?')})")
-    lines.append(
-        f"  Module slots: {frame.get('moduleSlots', '?')}, Mounting points: {frame.get('mountingPoints', '?')}"
-    )
-
-    # Engine
-    engine = ship.get("engine", {})
-    lines.append(
-        f"\nEngine: {engine.get('name', '?')} (speed: {engine.get('speed', '?')})"
-    )
-
-    # Mounts (weapons, lasers, etc.)
-    mounts = ship.get("mounts", [])
-    if mounts:
-        lines.append(f"\nMounts ({len(mounts)}):")
-        for m in mounts:
-            lines.append(f"  • {m.get('name', m.get('symbol', '?'))}")
-            if m.get("strength"):
-                lines.append(f"    Strength: {m.get('strength')}")
-    else:
-        lines.append("\nMounts: None")
-
-    # Modules
-    modules = ship.get("modules", [])
-    if modules:
-        lines.append(f"\nModules ({len(modules)}):")
-        for m in modules:
-            cap = f" (capacity: {m.get('capacity')})" if m.get("capacity") else ""
-            lines.append(f"  • {m.get('name', m.get('symbol', '?'))}{cap}")
-    else:
-        lines.append("\nModules: None")
-
-    # Capabilities summary
-    caps = _get_ship_capabilities(ship)
-    if caps:
-        lines.append(f"\nCapabilities: {', '.join(caps)}")
-
-    return "\n".join(lines)
-
-
-@tool
 def find_waypoints(
     waypoint_type: str = None,
     trait: str = None,
@@ -2240,7 +2011,7 @@ def find_waypoints(
         else:
             return "Error: system_symbol or reference_ship must be provided."
 
-    # 2. Logic Branch: Trade Symbol Search (formerly query_markets/find_nearest)
+    # 2. Logic Branch: Trade Symbol Search
     if trade_symbol:
         cache = load_market_cache()
         candidates = []
@@ -2351,6 +2122,285 @@ def find_waypoints(
 
     if len(data) > 20:
         lines.append(f"  ... {len(data)-20} more ...")
+
+    return "\n".join(lines)
+
+
+def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
+    """Helper: finds the best market to sell existing cargo."""
+    ship = client.get_ship(ship_symbol)
+    if not ship or "error" in ship:
+        return None
+
+    system = ship["nav"]["systemSymbol"]
+
+    # Use shared logic - searching for the good
+    results = _find_waypoints_logic(system_symbol=system, trade_symbol=good)
+
+    candidates = []
+    for res in results:
+        mm = res["market_match"]
+        # purchasePrice = what the market pays us (Agent Sell Price)
+        # sellPrice = what the market charges us (Agent Buy Price)
+        # For selling cargo, we want purchasePrice (what they pay us)
+        if mm["purchasePrice"]:
+            candidates.append({"wp": res["symbol"], "price": mm["purchasePrice"]})
+        elif "Import" in mm["roles"] or "Exchange" in mm["roles"]:
+            # It's an import/exchange, but we don't have price data.
+            candidates.append({"wp": res["symbol"], "price": 0})
+
+    if not candidates:
+        return None
+
+    # Sort by price descending (Best Sell Price)
+    candidates.sort(key=lambda x: x["price"], reverse=True)
+    return candidates[0]
+
+
+def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
+    """Find cheapest/best market for a good in the system using cache."""
+    # Use shared logic
+    results = _find_waypoints_logic(
+        system_symbol=ship_system, trade_symbol=trade_symbol
+    )
+
+    candidates = []
+    for res in results:
+        mm = res["market_match"]
+        # We want to BUY, so we look for market's sellPrice (Agent Buy Price)
+        price = float("inf")
+        valid = False
+
+        if mm["sellPrice"]:
+            price = mm["sellPrice"]
+            valid = True
+        elif "Export" in mm["roles"] or "Exchange" in mm["roles"]:
+            # It's sold here, but no price in cache. Penalty applied.
+            price = 1000000
+            valid = True
+
+        if valid:
+            candidates.append((price, res["symbol"]))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])  # Lowest price first
+    return candidates[0][1]
+
+
+def _find_waypoints_logic(
+    system_symbol: str,
+    waypoint_type: str = None,
+    trait: str = None,
+    trade_symbol: str = None,
+    ref_coords: tuple = None,
+) -> list[dict]:
+    """
+    Core logic for finding waypoints. Returns a list of dicts containing:
+    {
+        'symbol': str,
+        'distance': float (inf if no ref_coords),
+        'waypoint': dict (raw API data),
+        'market_match': dict (optional, contains price/role info for trade_symbol)
+    }
+    """
+    candidates = []
+
+    # 1. Fetch Structural Data (needed for coords and Type/Trait filtering)
+    # Note: If looking for just trade_symbol, we still need coords for distance,
+    # but we might optimize by only fetching if ref_coords are present.
+    # For safety/consistency, we fetch system waypoints.
+    all_wps = client.list_waypoints(system_symbol)
+    if isinstance(all_wps, dict) and "error" in all_wps:
+        return []  # Or raise error
+
+    wp_lut = {w["symbol"]: w for w in all_wps} if isinstance(all_wps, list) else {}
+
+    # 2. Logic Branch: Trade Symbol Search
+    if trade_symbol:
+        cache = load_market_cache()
+
+        for wp_sym, mdata in cache.items():
+            if not wp_sym.startswith(system_symbol):
+                continue
+
+            # Check if good exists here
+            goods = mdata.get("trade_goods", [])
+            exports = mdata.get("exports", [])
+            imports = mdata.get("imports", [])
+            exchange = mdata.get("exchange", [])
+
+            price_match = next((g for g in goods if g["symbol"] == trade_symbol), None)
+
+            is_import = trade_symbol in imports
+            is_export = trade_symbol in exports
+            is_exchange = trade_symbol in exchange
+
+            if price_match or is_import or is_export or is_exchange:
+                # Calculate distance
+                dist = float("inf")
+                wp_data = wp_lut.get(wp_sym, {})
+
+                if ref_coords and wp_data:
+                    wx, wy = wp_data.get("x"), wp_data.get("y")
+                    if wx is not None:
+                        dist = math.sqrt(
+                            (wx - ref_coords[0]) ** 2 + (wy - ref_coords[1]) ** 2
+                        )
+
+                candidates.append(
+                    {
+                        "symbol": wp_sym,
+                        "distance": dist,
+                        "waypoint": wp_data,
+                        "market_match": {
+                            "purchasePrice": (
+                                price_match.get("purchasePrice")
+                                if price_match
+                                else None
+                            ),
+                            "sellPrice": (
+                                price_match.get("sellPrice") if price_match else None
+                            ),
+                            "volume": (
+                                price_match.get("tradeVolume") if price_match else None
+                            ),
+                            "roles": [
+                                k
+                                for k, v in [
+                                    ("Import", is_import),
+                                    ("Export", is_export),
+                                    ("Exchange", is_exchange),
+                                ]
+                                if v
+                            ],
+                        },
+                    }
+                )
+
+    # 3. Logic Branch: Waypoint/Trait Search (only if trade_symbol is not set)
+    else:
+        # Filter the structure data directly
+        filtered_wps = []
+
+        # Handle the ASTEROID special case logic from original tool
+        target_types = [waypoint_type] if waypoint_type else []
+        if waypoint_type == "ASTEROID":
+            target_types.append("ENGINEERED_ASTEROID")
+
+        for wp in all_wps:
+            # Type Filter
+            if target_types and wp["type"] not in target_types:
+                continue
+
+            # Trait Filter
+            wp_traits = [t["symbol"] for t in wp.get("traits", [])]
+            if trait and trait not in wp_traits:
+                continue
+
+            filtered_wps.append(wp)
+
+        for wp in filtered_wps:
+            dist = float("inf")
+            if ref_coords:
+                dist = math.sqrt(
+                    (wp["x"] - ref_coords[0]) ** 2 + (wp["y"] - ref_coords[1]) ** 2
+                )
+
+            candidates.append(
+                {
+                    "symbol": wp["symbol"],
+                    "distance": dist,
+                    "waypoint": wp,
+                    "market_match": None,
+                }
+            )
+
+    # Global Sort by distance
+    candidates.sort(key=lambda x: x["distance"])
+
+    return candidates
+
+
+@tool
+def view_cargo(ship_symbol: str) -> str:
+    """[READ-ONLY] View the cargo contents of a specific ship."""
+    data = client.get_cargo(ship_symbol)
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    inventory = data.get("inventory", [])
+    capacity = data.get("capacity", "?")
+    units = data.get("units", 0)
+    lines = [f"Cargo for {ship_symbol}: {units}/{capacity} units"]
+    if not inventory:
+        lines.append("  (empty)")
+    for item in inventory:
+        lines.append(f"  {item['symbol']}: {item['units']} units")
+    return "\n".join(lines)
+
+
+@tool
+def view_ship_details(ship_symbol: str) -> str:
+    """[READ-ONLY] View detailed ship info: mounts, modules, capabilities."""
+    ships = client.list_ships()
+    if isinstance(ships, dict) and "error" in ships:
+        return f"Error: {ships['error']}"
+
+    ship = None
+    for s in ships:
+        if s.get("symbol") == ship_symbol:
+            ship = s
+            break
+
+    if not ship:
+        return f"Error: Ship {ship_symbol} not found"
+
+    lines = [f"=== {ship_symbol} Details ==="]
+
+    # Basic info
+    reg = ship.get("registration", {})
+    lines.append(f"Role: {reg.get('role', '?')}")
+    lines.append(f"Faction: {reg.get('factionSymbol', '?')}")
+
+    # Frame
+    frame = ship.get("frame", {})
+    lines.append(f"\nFrame: {frame.get('name', '?')} ({frame.get('symbol', '?')})")
+    lines.append(
+        f"  Module slots: {frame.get('moduleSlots', '?')}, Mounting points: {frame.get('mountingPoints', '?')}"
+    )
+
+    # Engine
+    engine = ship.get("engine", {})
+    lines.append(
+        f"\nEngine: {engine.get('name', '?')} (speed: {engine.get('speed', '?')})"
+    )
+
+    # Mounts (weapons, lasers, etc.)
+    mounts = ship.get("mounts", [])
+    if mounts:
+        lines.append(f"\nMounts ({len(mounts)}):")
+        for m in mounts:
+            lines.append(f"  • {m.get('name', m.get('symbol', '?'))}")
+            if m.get("strength"):
+                lines.append(f"    Strength: {m.get('strength')}")
+    else:
+        lines.append("\nMounts: None")
+
+    # Modules
+    modules = ship.get("modules", [])
+    if modules:
+        lines.append(f"\nModules ({len(modules)}):")
+        for m in modules:
+            cap = f" (capacity: {m.get('capacity')})" if m.get("capacity") else ""
+            lines.append(f"  • {m.get('name', m.get('symbol', '?'))}{cap}")
+    else:
+        lines.append("\nModules: None")
+
+    # Capabilities summary
+    caps = _get_ship_capabilities(ship)
+    if caps:
+        lines.append(f"\nCapabilities: {', '.join(caps)}")
 
     return "\n".join(lines)
 
@@ -2731,159 +2781,6 @@ def view_market(waypoint_symbol: str) -> str:
         pass
 
     return "\n".join(lines)
-
-
-@tool
-def query_markets(
-    trade_symbol: Optional[str] = None, near_waypoint: Optional[str] = None
-) -> str:
-    """[READ-ONLY] Query cached market data with flexible filters.
-
-    By default, returns all cached markets. Can filter by:
-    - trade_symbol: Find markets that buy/sell/exchange a specific good (e.g., "IRON_ORE", "FUEL")
-    - near_waypoint: Sort markets by distance from a waypoint (e.g., "X1-KD26-A1")
-
-    Args:
-        trade_symbol: Trade good to search for (e.g., "FUEL", "IRON_ORE")
-        near_waypoint: Waypoint symbol to sort results by distance from
-
-    Returns: Formatted list of matching markets with their trade goods and prices
-    """
-    import time
-
-    cache = load_market_cache()
-
-    if not cache:
-        return "Market cache is empty. Use view_market to populate it."
-
-    # Get reference point coordinates
-    ref_x, ref_y = None, None
-    # Cache waypoint lists per system to avoid redundant API calls
-    waypoint_coords: dict = {}  # symbol -> (x, y)
-
-    def get_waypoint_coords(system_symbol: str) -> dict:
-        """Fetch and cache all waypoint coords for a system."""
-        all_waypoints = client.list_waypoints(system_symbol)
-        coords = {}
-        if isinstance(all_waypoints, list):
-            for wp in all_waypoints:
-                coords[wp.get("symbol")] = (wp.get("x"), wp.get("y"))
-        return coords
-
-    if near_waypoint:
-        system_symbol = "-".join(near_waypoint.split("-")[:2])
-        waypoint_coords.update(get_waypoint_coords(system_symbol))
-        ref_x, ref_y = waypoint_coords.get(near_waypoint, (None, None))
-
-    def dist_to_ref(x, y) -> float:
-        if ref_x is None or x is None:
-            return float("inf")
-        return ((ref_x - x) ** 2 + (ref_y - y) ** 2) ** 0.5
-
-    # Process each cached market, collecting (dist, waypoint_symbol, market_data, matching_goods)
-    results = []
-    for waypoint_symbol, market_data in cache.items():
-        trade_goods = market_data.get("trade_goods", [])
-
-        # Filter by trade_symbol if specified
-        if trade_symbol:
-            matching_goods = [g for g in trade_goods if g.get("symbol") == trade_symbol]
-            if not matching_goods:
-                continue
-        else:
-            matching_goods = trade_goods
-            if not (
-                market_data.get("exports")
-                or market_data.get("imports")
-                or market_data.get("exchange")
-                or trade_goods
-            ):
-                continue
-
-        # Get coordinates for distance sorting
-        dist = float("inf")
-        if ref_x is not None:
-            sys_sym = "-".join(waypoint_symbol.split("-")[:2])
-            if sys_sym not in {"-".join(k.split("-")[:2]) for k in waypoint_coords}:
-                waypoint_coords.update(get_waypoint_coords(sys_sym))
-            x, y = waypoint_coords.get(waypoint_symbol, (None, None))
-            dist = dist_to_ref(x, y)
-
-        results.append((dist, waypoint_symbol, market_data, matching_goods))
-
-    if not results:
-        filters = []
-        if trade_symbol:
-            filters.append(f"trade_symbol={trade_symbol}")
-        if near_waypoint:
-            filters.append(f"near_waypoint={near_waypoint}")
-        filter_str = " with filters: " + ", ".join(filters) if filters else ""
-        return f"No markets found{filter_str}."
-
-    # Sort by distance if reference point was given
-    if ref_x is not None:
-        results.sort(key=lambda r: r[0])
-
-    def format_staleness(timestamp: int) -> str:
-        now = int(time.time())
-        age = now - timestamp
-        if age < 60:
-            return f"{age}s ago"
-        elif age < 3600:
-            return f"{age // 60}m ago"
-        elif age < 86400:
-            return f"{age // 3600}h ago"
-        else:
-            return f"{age // 86400}d ago"
-
-    # Format results
-    lines = []
-    for dist, waypoint_symbol, market_data, goods in results:
-        # Build header annotations
-        annotations = []
-        if dist != float("inf"):
-            annotations.append(f"dist:{dist:.0f}")
-        if market_data.get("last_updated") and any(
-            g.get("purchasePrice") or g.get("sellPrice") for g in goods
-        ):
-            annotations.append(format_staleness(market_data["last_updated"]))
-        header = waypoint_symbol
-        if annotations:
-            header += f" ({', '.join(annotations)})"
-        lines.append(f"\n{header}:")
-
-        # Show market structure (exports/imports/exchange) when not filtering by good
-        if not trade_symbol:
-            exports = market_data.get("exports", [])
-            imports = market_data.get("imports", [])
-            exchange = market_data.get("exchange", [])
-            if exports:
-                lines.append(f"  exports:  {', '.join(exports)}")
-            if imports:
-                lines.append(f"  imports:  {', '.join(imports)}")
-            if exchange:
-                lines.append(f"  exchange: {', '.join(exchange)}")
-
-        # Show live prices if available
-        priced_goods = [
-            g for g in goods if g.get("purchasePrice") or g.get("sellPrice")
-        ]
-        if priced_goods:
-            lines.append("  prices:")
-            for g in priced_goods:
-                symbol = g.get("symbol", "?")
-                buy_price = g.get("purchasePrice")
-                sell_price = g.get("sellPrice")
-                volume = g.get("tradeVolume")
-                parts = []
-                if buy_price:
-                    parts.append(f"buy {buy_price}")
-                if sell_price:
-                    parts.append(f"sell {sell_price}")
-                vol_str = f" vol:{volume}" if volume else ""
-                lines.append(f"    {symbol}: {' / '.join(parts)}{vol_str}")
-
-    return "\n".join(lines) if lines else "No market data available"
 
 
 # ──────────────────────────────────────────────
@@ -3275,15 +3172,6 @@ def view_jump_gate(waypoint_symbol: str) -> str:
 
 
 @tool
-def set_flight_mode(ship_symbol: str, mode: str) -> str:
-    """[STATE: flight_mode] Set ship flight mode: CRUISE, BURN (2x fuel), DRIFT (1 fuel), STEALTH."""
-    data = client.set_flight_mode(ship_symbol, mode.upper())
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    return f"{ship_symbol} flight mode set to {mode.upper()}"
-
-
-@tool
 def deliver_contract(
     contract_id: str, ship_symbol: str, trade_symbol: str, units: int = None
 ) -> str:
@@ -3313,6 +3201,94 @@ def fulfill_contract(contract_id: str) -> str:
         f"Contract {contract_id} fulfilled!\n"
         f"Credits now: {agent.get('credits', '?')}"
     )
+
+
+@tool
+def find_waypoints(
+    waypoint_type: str = None,
+    trait: str = None,
+    trade_symbol: str = None,
+    system_symbol: str = None,
+    reference_ship: str = None,
+) -> str:
+    """Find locations of interest. Merges functionality of finding waypoints, markets, and nearest resources.
+
+    Args:
+        waypoint_type: Filter by type (e.g., ASTEROID, PLANET, GAS_GIANT).
+        trait: Filter by trait (e.g., MARKETPLACE, SHIPYARD, COMMON_METAL_DEPOSITS).
+        trade_symbol: Find markets buying/selling this good (e.g., FUEL, IRON_ORE). Uses cached data.
+        system_symbol: System to search. Defaults to reference_ship's system or agent's HQ system.
+        reference_ship: Sort results by distance from this ship.
+    """
+    # 1. Determine System
+    ref_coords = None
+    if reference_ship:
+        ship = client.get_ship(reference_ship)
+        if isinstance(ship, dict) and "error" not in ship:
+            system_symbol = ship["nav"]["systemSymbol"]
+            ref_coords = (
+                ship["nav"]["route"]["destination"]["x"],
+                ship["nav"]["route"]["destination"]["y"],
+            )
+
+    if not system_symbol:
+        # Fallback to agent HQ system
+        agent = client.get_agent()
+        if "headquarters" in agent:
+            system_symbol = "-".join(agent["headquarters"].split("-")[:2])
+        else:
+            return "Error: system_symbol or reference_ship must be provided."
+
+    # 2. Call Logic
+    results = _find_waypoints_logic(
+        system_symbol=system_symbol,
+        waypoint_type=waypoint_type,
+        trait=trait,
+        trade_symbol=trade_symbol,
+        ref_coords=ref_coords,
+    )
+
+    if not results:
+        if trade_symbol:
+            return f"No known markets for {trade_symbol} in {system_symbol}. (Note: Only checks cached data)."
+        return f"No waypoints found in {system_symbol} matching your criteria."
+
+    # 3. Format Output
+    lines = []
+    if trade_symbol:
+        lines.append(f"Markets for {trade_symbol} in {system_symbol}:")
+        for res in results:
+            dist = res["distance"]
+            sym = res["symbol"]
+            mm = res["market_match"]
+
+            d_str = f" ({dist:.1f} dist)" if dist != float("inf") else ""
+
+            details = []
+            if mm["purchasePrice"]:
+                details.append(f"BUY: {mm['purchasePrice']}")
+            if mm["sellPrice"]:
+                details.append(f"SELL: {mm['sellPrice']}")
+            if not details:  # Fallback to roles if no price
+                details = mm["roles"]
+
+            lines.append(f"  {sym}{d_str}: {', '.join(details)}")
+
+    else:
+        lines.append(f"Waypoints in {system_symbol}:")
+        for res in results[:20]:  # Limit output
+            wp = res["waypoint"]
+            dist = res["distance"]
+            d_str = f" ({dist:.1f} dist)" if dist != float("inf") else ""
+            t_list = [t["symbol"] for t in wp.get("traits", [])]
+            lines.append(
+                f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}"
+            )
+
+        if len(results) > 20:
+            lines.append(f"  ... {len(results)-20} more ...")
+
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
@@ -3696,7 +3672,6 @@ ALL_TOOLS = [
     # Inter-system travel
     jump_ship,
     warp_ship,
-    set_flight_mode,
     # Planning
     update_plan,
     # Analysis
@@ -3756,12 +3731,3 @@ def get_tool_by_name(name: str):
         if t.name == name:
             return t
     return None
-
-
-def get_last_wait(tool_name: str) -> float:
-    """Get the last wait time from a waiting tool."""
-    if tool_name == "navigate_ship":
-        return getattr(navigate_ship, "_last_wait", 0.0)
-    elif tool_name == "extract_ore":
-        return getattr(extract_ore, "_last_wait", 0.0)
-    return 0.0
