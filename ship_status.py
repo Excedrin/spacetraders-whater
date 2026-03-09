@@ -4,8 +4,8 @@ ship_status.py — Track ship cooldowns and availability.
 Maintains local state about which ships are busy (on cooldown, in transit)
 so the bot can make decisions about which ships to use without waiting.
 """
-
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -73,12 +73,14 @@ class FleetTracker:
     def __init__(self):
         self.ships: dict[str, ShipStatus] = {}
         self._state_file = Path("fleet_state.json")
+        self.last_persist = 0
         self._load()
 
     def _load(self):
         """Load persisted fleet state."""
         if self._state_file.exists():
             try:
+                self.last_persist = os.stat(self._state_file).st_mtime
                 data = json.loads(self._state_file.read_text())
                 for ship_data in data.get("ships", []):
                     ship = ShipStatus(
@@ -96,6 +98,11 @@ class FleetTracker:
                     self.ships[ship.symbol] = ship
             except (json.JSONDecodeError, KeyError):
                 pass
+
+    def _check_reload(self):
+        stat_result = os.stat(self._state_file)
+        if self.last_persist < stat_result.st_mtime:
+            self._load()
 
     def persist(self):
         """Save fleet state."""
@@ -117,6 +124,7 @@ class FleetTracker:
             ]
         }
         self._state_file.write_text(json.dumps(data, indent=2))
+        self.last_persist = time.time()
 
     def update_from_api(self, ships_data: list[dict]):
         """Update fleet status from API response (list_ships)."""
@@ -165,12 +173,14 @@ class FleetTracker:
 
     def set_extraction_cooldown(self, ship_symbol: str, seconds: float):
         """Mark a ship as on extraction cooldown."""
+        self._check_reload()
         if ship_symbol in self.ships:
             self.ships[ship_symbol].set_cooldown(seconds, "extraction_cooldown")
             self.persist()
 
     def set_transit(self, ship_symbol: str, seconds: float):
         """Mark a ship as in transit."""
+        self._check_reload()
         if ship_symbol in self.ships:
             self.ships[ship_symbol].set_cooldown(seconds, "in_transit")
             self.ships[ship_symbol].nav_status = "IN_TRANSIT"
@@ -178,24 +188,29 @@ class FleetTracker:
 
     def mark_available(self, ship_symbol: str):
         """Mark a ship as available."""
+        self._check_reload()
         if ship_symbol in self.ships:
             self.ships[ship_symbol].clear_cooldown()
             self.persist()
 
     def get_available_ships(self) -> list[ShipStatus]:
         """Get list of ships that are currently available."""
+        self._check_reload()
         return [s for s in self.ships.values() if s.is_available()]
 
     def get_busy_ships(self) -> list[ShipStatus]:
         """Get list of ships that are currently busy."""
+        self._check_reload()
         return [s for s in self.ships.values() if not s.is_available()]
 
     def get_ship(self, symbol: str) -> Optional[ShipStatus]:
         """Get status for a specific ship."""
+        self._check_reload()
         return self.ships.get(symbol)
 
     def fleet_summary(self) -> str:
         """Get a summary of the entire fleet for narrative context."""
+        self._check_reload()
         if not self.ships:
             return "(No ships tracked yet)"
 
@@ -206,6 +221,7 @@ class FleetTracker:
 
     def available_summary(self) -> str:
         """Get summary of available ships only."""
+        self._check_reload()
         available = self.get_available_ships()
         if not available:
             busy = self.get_busy_ships()
