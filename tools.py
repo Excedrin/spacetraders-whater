@@ -661,6 +661,9 @@ def _sell_cargo_logic(
     total_revenue = 0
     sell_count = 0
 
+    # Track the previous price to predict the curve
+    previous_price_per_unit = None
+
     while total_sold < target_units:
         units_to_sell = min(max_per_transaction, target_units - total_sold)
 
@@ -671,17 +674,36 @@ def _sell_cargo_logic(
             break  # Partial success — stop and report what we sold
 
         tx = data.get("transaction", {})
-        total_sold += tx.get("units", units_to_sell)
+        units_sold = tx.get("units", units_to_sell)
+        price_per_unit = tx.get("pricePerUnit", 0)  # The TRUE marginal price!
+
+        total_sold += units_sold
         total_revenue += tx.get("totalPrice", 0)
         sell_count += 1
 
-        if min_price and sell_count > 0:
-            price_per_unit = tx.get("pricePerUnit", 0)
-            if price_per_unit < min_price:
+        # Fix the log! Now it prints the true marginal price, not the cumulative average
+        print(f"sold: {units_sold} {trade_symbol} for {price_per_unit} total {total_revenue}")
+
+        # 1. Did the price drop below our floor on THIS transaction?
+        if min_price and price_per_unit < min_price:
+            break
+
+        # 2. The 23% Curve Prediction!
+        if min_price and previous_price_per_unit is not None:
+            # Calculate how much the price plummeted on this exact batch
+            price_delta = previous_price_per_unit - price_per_unit
+
+            # Predict the NEXT drop (using 1.25x to be safe)
+            predicted_next_delta = price_delta * 1.25
+            predicted_next_price = price_per_unit - predicted_next_delta
+
+            # If the predicted next price drops below our margin, abort before the loop repeats
+            if predicted_next_price < min_price:
+                print(f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) falls below min_price of {min_price}.")
                 break
-                # raise PriceFloorHit(
-                #    trade_symbol, price_per_unit, min_price, total_sold, total_revenue
-                # )
+
+        # Save the current price for the next loop's calculation
+        previous_price_per_unit = price_per_unit
 
     cargo = data.get("cargo", {})
     if sell_count > 1:
@@ -766,6 +788,9 @@ def _buy_cargo_logic(
     purchase_count = 0
     stop_reason = ""
 
+    # Track the previous price to predict the curve
+    previous_price_per_unit = None
+
     while total_purchased < target_units:
         # Refresh cargo to check current space
         cargo_data = client.get_cargo(ship_symbol)
@@ -792,15 +817,35 @@ def _buy_cargo_logic(
         tx = data.get("transaction", {})
         units_bought = tx.get("units", units_to_buy)
         price_per_unit = tx.get("pricePerUnit", 0)
+
         total_purchased += units_bought
         total_cost += tx.get("totalPrice", 0)
         purchase_count += 1
 
+        print(f"purchased: {units_bought} {trade_symbol} for {price_per_unit} total {total_cost}")
+
+        # 1. Did we accidentally overpay on THIS transaction?
         if max_price and price_per_unit > max_price:
+            stop_reason = f"Max price exceeded ({price_per_unit} > {max_price})"
             break
-            # raise PriceCeilingHit(
-            #    trade_symbol, price_per_unit, max_price, total_purchased, total_cost
-            # )
+
+        # 2. The 23% Curve Prediction!
+        if max_price and previous_price_per_unit is not None:
+            # Calculate how much the price jumped on this exact batch
+            price_delta = price_per_unit - previous_price_per_unit
+
+            # Predict the NEXT jump (using 1.25x to be safe)
+            predicted_next_delta = price_delta * 1.25
+            predicted_next_price = price_per_unit + predicted_next_delta
+
+            # If the predicted next price breaks our margin, abort before the loop repeats
+            if predicted_next_price > max_price:
+                print(f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) exceeds max_price of {max_price}.")
+                stop_reason = "Predicted to exceed max price"
+                break
+
+        # Save the current price for the next loop's calculation
+        previous_price_per_unit = price_per_unit
 
     # Check minimum quantity requirement
     if min_qty and total_purchased < min_qty:
