@@ -29,6 +29,15 @@ def set_fleet(f):
     _fleet = f
 
 
+# Alert queue — injected by the server via set_alert_queue()
+_alert_queue = []
+
+
+def set_alert_queue(q):
+    global _alert_queue
+    _alert_queue = q
+
+
 MARKET_CACHE_FILE = Path("market_cache.json")
 BEHAVIORS_FILE = Path("behaviors.json")
 log = logging.getLogger(__name__)
@@ -1049,6 +1058,7 @@ class StepType(Enum):
     REFUEL = "refuel"
     SCOUT = "scout"
     TRANSFER = "transfer"
+    SUPPLY = "supply"
     ALERT = "alert"
     REPEAT = "repeat"
     STOP = "stop"
@@ -1413,6 +1423,8 @@ class BehaviorEngine:
                 result = self._step_deliver(cfg, step, ship, fleet)
             elif step.step_type == StepType.TRANSFER:
                 result = self._step_transfer(cfg, step, ship, fleet)
+            elif step.step_type == StepType.SUPPLY:
+                result = self._step_supply(cfg, step, ship, fleet)
             elif step.step_type == StepType.SCOUT:
                 result = self._step_scout(cfg, step, ship, fleet)
             elif step.step_type == StepType.REPEAT:
@@ -1676,6 +1688,35 @@ class BehaviorEngine:
         self._advance(cfg)
         return None
 
+    def _step_supply(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Supply a construction project. Usage: supply WAYPOINT SYMBOL UNITS
+
+        WAYPOINT: construction site waypoint (e.g., X1-ABC-123A)
+        SYMBOL: construction symbol to supply (e.g., OUTPOST, PLANETARY_INSTITUTE)
+        UNITS: how many units to supply (e.g., 100)
+        """
+        if len(step.args) < 3:
+            raise Exception(
+                "supply step requires waypoint, symbol, and units (e.g., 'supply X1-ABC-123A OUTPOST 100')"
+            )
+
+        waypoint = step.args[0]
+        symbol = step.args[1]
+        units = int(step.args[2])
+
+        # Extract system from waypoint (e.g., "X1-ABC-123A" -> "X1-ABC")
+        system = "-".join(waypoint.split("-")[:2])
+
+        try:
+            result = client.supply_construction(system, waypoint, cfg.ship_symbol, symbol, units)
+            if isinstance(result, dict) and "error" in result:
+                raise Exception(f"Supply failed: {result['error']}")
+        except Exception as e:
+            raise e
+
+        self._advance(cfg)
+        return None
+
     def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
         if not ship.location:
             raise Exception("No location")
@@ -1879,6 +1920,28 @@ class BehaviorEngine:
 # ──────────────────────────────────────────────
 #  Observation tools
 # ──────────────────────────────────────────────
+
+
+@tool
+def list_alerts() -> str:
+    """[READ-ONLY] List all active alerts from the behavior engine."""
+    if not _alert_queue:
+        return "No active alerts."
+
+    lines = ["Active Alerts:"]
+    for i, alert in enumerate(_alert_queue):
+        lines.append(f"  [{i}] {alert}")
+    return "\n".join(lines)
+
+
+@tool
+def clear_alert(index: int) -> str:
+    """[STATE: alerts] Clear an alert by its index number. Use list_alerts to see index numbers."""
+    try:
+        msg = _alert_queue.pop(index)
+        return f"Cleared alert {index}: {msg}"
+    except IndexError:
+        return f"Error: No alert found at index {index}. Run list_alerts to see valid indices."
 
 
 @tool
@@ -2859,6 +2922,11 @@ def purchase_ship(ship_type: str, waypoint_symbol: str) -> str:
         return f"Error: {data['error']}"
     agent = data.get("agent", {})
     ship = data.get("ship", {})
+
+    # Instantly add the new ship to fleet tracker
+    if _fleet and ship:
+        _fleet.update_from_api([ship])
+
     return (
         f"Purchased {ship.get('symbol', '?')} ({ship_type})!\n"
         f"Credits remaining: {agent.get('credits', '?')}"
@@ -3213,6 +3281,56 @@ def view_jump_gate(waypoint_symbol: str) -> str:
         lines.append(f"  → {conn}")
     if len(connections) > 20:
         lines.append(f"  ... and {len(connections) - 20} more")
+    return "\n".join(lines)
+
+
+@tool
+def view_construction(waypoint_symbol: str) -> str:
+    """[READ-ONLY] View construction project details at a waypoint. Shows progress, materials needed, and requirements.
+
+    Args:
+        waypoint_symbol: Waypoint with construction (e.g., 'X1-ABC-123A')
+    """
+    # Extract system from waypoint (e.g., 'X1-ABC-123A' -> 'X1-ABC')
+    system_symbol = "-".join(waypoint_symbol.split("-")[:2])
+
+    data = client.get_construction(system_symbol, waypoint_symbol)
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+
+    lines = [f"Construction at {waypoint_symbol}:"]
+
+    # Project symbol
+    symbol = data.get("symbol", "?")
+    lines.append(f"  Symbol: {symbol}")
+
+    # Progress
+    progress = data.get("progress", 0)
+    required = data.get("required", 0)
+    if required > 0:
+        pct = (progress / required * 100) if required > 0 else 0
+        lines.append(f"  Progress: {progress}/{required} ({pct:.1f}%)")
+    else:
+        lines.append(f"  Progress: {progress}")
+
+    # Materials
+    materials = data.get("materials", [])
+    if materials:
+        lines.append("  Materials needed:")
+        for mat in materials:
+            trade_symbol = mat.get("tradeSymbol", "?")
+            required_amount = mat.get("required", 0)
+            fulfilled_amount = mat.get("fulfilled", 0)
+            pct = (fulfilled_amount / required_amount * 100) if required_amount > 0 else 0
+            lines.append(
+                f"    {trade_symbol}: {fulfilled_amount}/{required_amount} ({pct:.1f}%)"
+            )
+
+    # Deadline
+    deadline = data.get("deadline", None)
+    if deadline:
+        lines.append(f"  Deadline: {deadline}")
+
     return "\n".join(lines)
 
 
@@ -3663,6 +3781,8 @@ TIER_1_TOOLS = [
     find_waypoints,
     # Planning
     update_plan,
+    list_alerts,
+    clear_alert,
     # Behavior control
     resume_behavior,
     skip_step,
@@ -3687,6 +3807,7 @@ ALL_TOOLS = [
     scan_system,
     view_market,
     view_jump_gate,
+    view_construction,
     # Locator
     find_waypoints,
     # Ship operations
@@ -3721,6 +3842,8 @@ ALL_TOOLS = [
     update_plan,
     # Analysis
     find_trades,
+    list_alerts,
+    clear_alert,
     # Behavior control
     create_behavior,
     resume_behavior,

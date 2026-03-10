@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 
 from ship_status import FleetTracker
-from tools import get_engine, ALL_TOOLS, client, set_fleet, WAITING_TOOLS, STATE_CHANGING_TOOLS
+from tools import get_engine, ALL_TOOLS, client, set_fleet, set_alert_queue, WAITING_TOOLS, STATE_CHANGING_TOOLS
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +21,7 @@ set_fleet(fleet)
 
 behavior_engine = get_engine()
 alert_queue: List[str] = []
+set_alert_queue(alert_queue)  # Give tools.py access to alerts
 state_lock = Lock()  # Ensures thread-safe ticks & API calls
 TICK_INTERVAL = 10  # seconds
 
@@ -64,9 +65,20 @@ action_queue = ActionQueue()
 # Background Tick Loop
 # -------------------------
 def tick_loop():
+    ticks = 0
     while True:
         with state_lock:
             behavior_engine.sync_state()
+
+            # Sync all ships from API every ~60 seconds (ticks % 6 == 0, 6 * 10s = 60s)
+            if ticks % 6 == 0:
+                try:
+                    ships_data = client.list_ships()
+                    if isinstance(ships_data, list):
+                        fleet.update_from_api(ships_data)
+                except Exception as e:
+                    log.error(f"Background fleet sync failed: {e}")
+            ticks += 1
 
             # 1. Process Action Queue for available ships
             for ship_symbol in list(fleet.ships):
