@@ -2,10 +2,11 @@ import inspect
 import readline
 import shlex
 import traceback
+import requests
 
-from bot import gather_game_state
-from ship_status import FleetTracker
-from tools import ALL_TOOLS, get_engine, set_fleet
+from tools import ALL_TOOLS
+
+API_BASE = "http://localhost:8000/api"
 
 
 def get_arg_type_hints(func):
@@ -95,20 +96,43 @@ def configure_readline(tools_map):
     readline.parse_and_bind("tab: complete")
 
 
-def print_hud(fleet):
-    """Prints the Gather Game State output with behavior status."""
+def print_hud():
+    """Prints the game state and behaviors directly from the API."""
     try:
-        output = gather_game_state(fleet)
+        resp = requests.get(f"{API_BASE}/state")
+        resp.raise_for_status()
+        data = resp.json()
 
-        # Add behavior status from the behavior engine
-        engine = get_engine()
-        behavior_status = engine.summary()
-        if behavior_status:
-            output += f"\n\n[Behavior Status]\n{behavior_status}"
+        print("\n=== FLEET STATUS ===")
+        fleet = data.get("fleet", {})
+        if not fleet:
+            print("(No ships found)")
+        for sym, ship in fleet.items():
+            status = f"{sym} ({ship.get('role')}) @ {ship.get('location')} [{ship.get('nav_status')}]"
+            status += f" Fuel:{ship.get('fuel_current')}/{ship.get('fuel_capacity')}"
+            status += f" Cargo:{ship.get('cargo_units')}/{ship.get('cargo_capacity')}"
+            if ship.get("busy_reason"):
+                status += f" [BUSY: {ship.get('busy_reason')}]"
+            print(f"• {status}")
 
-        print("\n" + output + "\n")
+        print("\n=== BEHAVIOR STATUS ===")
+        behaviors = data.get("behaviors", {})
+        if not behaviors:
+            print("(all ships idle)")
+        for sym, b in behaviors.items():
+            state = "PAUSED" if b.get("paused") else b.get("step_phase")
+            if b.get("error_message"):
+                state = f"ERROR: {b.get('error_message')}"
+            print(f"  {sym}: step {b.get('current_step_index')} ({state}) -> {b.get('last_action')}")
+
+        alerts = data.get("alerts", [])
+        if alerts:
+            print("\n=== ALERTS ===")
+            for a in alerts:
+                print(f"  ! {a}")
+        print()
     except Exception as e:
-        print(f"Error gathering state: {e}")
+        print(f"Error gathering state from API: {e}")
 
 
 def main_loop(tools_list):
@@ -118,14 +142,8 @@ def main_loop(tools_list):
     print("\n🚀 SPACETRADERS ENHANCED CLI")
     print("Type 'help', 'hud', or a command.")
 
-    fleet = FleetTracker()
-    set_fleet(fleet)
-    engine = get_engine()
-
     while True:
         try:
-            engine.sync_state()
-
             user_input = input("❯ ").strip()
             if not user_input:
                 continue
@@ -142,7 +160,7 @@ def main_loop(tools_list):
                 print("\033[H\033[J", end="")  # ANSI clear
                 continue
             if cmd in ["hud", "state", "status"]:
-                print_hud(fleet)
+                print_hud()
                 continue
 
             if cmd == "help":
@@ -238,9 +256,15 @@ def main_loop(tools_list):
                             continue
                         converted_args[k] = _coerce(v, param_map[k].annotation)
 
-                    print(f"⏳ Executing {cmd}...")
-                    result = tool.invoke(input=converted_args)
-                    print(f"✅ Result:\n{result}")
+                    # --- CHANGED: EXECUTE VIA API ---
+                    print(f"⏳ Executing {cmd} via API...")
+                    resp = requests.post(f"{API_BASE}/tools/{cmd}", json=converted_args)
+
+                    if resp.status_code == 200:
+                        result = resp.json().get("result", "OK")
+                        print(f"✅ Result:\n{result}")
+                    else:
+                        print(f"❌ API Error {resp.status_code}: {resp.text}")
 
                 except Exception as e:
                     print(f"❌ Error: {e}")

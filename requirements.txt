@@ -1,7 +1,11 @@
+dotenv
+fastapi
+langchain
 langchain
 langchain-ollama
+ollama
+pydantic
 python-dotenv
 requests
 rich
-ollama
-dotenv
+uvicorn

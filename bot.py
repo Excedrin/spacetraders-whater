@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import requests
 from pathlib import Path
 from typing import Optional
 
@@ -35,10 +36,9 @@ from narrative import (
     generate_narrative,
     generate_strategic_reflection,
 )
-from ship_status import FleetTracker
-from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, WAITING_TOOLS, STATE_CHANGING_TOOLS, client
-from tools import get_engine as get_behavior_engine
-from tools import get_tool_by_name, load_market_cache, set_fleet
+from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, client, load_market_cache
+
+API_BASE = "http://localhost:8000/api"
 
 load_dotenv()
 
@@ -61,41 +61,6 @@ STRATEGY_INTERVAL = 600  # 10 minutes — periodic strategic review
 # Context management
 MAX_RECENT_TURNS = 6  # Keep last N full turns (AIMessage + ToolMessages)
 MAX_TOKENS_ESTIMATE = 8000  # Target max tokens (rough estimate)
-
-# Action queue
-MAX_QUEUED_ACTIONS = 3  # Max queued actions per ship
-
-
-class ActionQueue:
-    """Ephemeral per-ship action queue for serializing operations on busy ships."""
-
-    def __init__(self):
-        self.queues: dict[str, list[tuple[str, dict]]] = (
-            {}
-        )  # ship -> [(tool_name, args)]
-
-    def enqueue(self, ship_symbol: str, tool_name: str, args: dict) -> str:
-        if ship_symbol not in self.queues:
-            self.queues[ship_symbol] = []
-        q = self.queues[ship_symbol]
-        if len(q) >= MAX_QUEUED_ACTIONS:
-            return f"Error: Queue full for {ship_symbol} ({MAX_QUEUED_ACTIONS} pending). Wait for current actions to complete."
-        q.append((tool_name, args))
-        return f"Queued: {tool_name} for {ship_symbol} (will execute after ship is available, {len(q)} in queue)"
-
-    def get_ready(self, ship_symbol: str) -> tuple[str, dict] | None:
-        """Pop and return the next queued action if any."""
-        q = self.queues.get(ship_symbol, [])
-        if q:
-            return q.pop(0)
-        return None
-
-    def has_queued(self, ship_symbol: str) -> bool:
-        return bool(self.queues.get(ship_symbol))
-
-    def clear(self, ship_symbol: str):
-        self.queues.pop(ship_symbol, None)
-
 
 # Tools whose successful results are already captured in game state and can be compressed
 REDUNDANT_RESULT_TOOLS = {
@@ -873,20 +838,17 @@ def display_strategic_reflection(segment: NarrativeSegment, context: NarrativeCo
 def _run_llm_cycle(
     messages: list,
     context: NarrativeContext,
-    fleet: FleetTracker,
-    behavior_engine,
     llm_with_tools,
     active_tools: list,
     alert_text: str,
     iteration: int,
     debug: bool,
-    action_queue: ActionQueue = None,
 ) -> Optional[list]:
     """
     Run one LLM decision-execute-narrate cycle.
 
     Returns the updated messages list, or None if the mission is complete.
-    Mutates fleet and context as side effects.
+    Fetches state from server API and executes tools via API.
     """
     # Prune old messages to keep context manageable
     old_count = len(messages)
@@ -906,11 +868,16 @@ def _run_llm_cycle(
         )
     ]
 
-    # Build fresh game state, appending behavior status and any alerts
-    game_state = gather_game_state(fleet, context)
-    game_state += f"\n\n[Behavior Status]\n{behavior_engine.summary()}"
+    # CHANGED: Fetch fresh game state from server
+    try:
+        resp = requests.get(f"{API_BASE}/game_state")
+        game_state = resp.json().get("state", "Error fetching state from API.")
+    except Exception as e:
+        game_state = f"API Connection Error: {e}"
+
     if alert_text:
         game_state += f"\n\n[ALERTS]\n{alert_text}"
+
     messages.append(SystemMessage(content=game_state))
 
     display_thinking(messages)
@@ -1015,7 +982,7 @@ def _run_llm_cycle(
             )
         return messages
 
-    # EXECUTE — run each tool
+    # EXECUTE — run each tool via API
     tool_results: list[tuple[str, str, bool]] = []
     has_significant_action = False
 
@@ -1025,44 +992,17 @@ def _run_llm_cycle(
 
         display_tool_call(tool_name, tool_args)
 
-        ship_symbol = tool_args.get("ship_symbol") or tool_args.get("from_ship", "")
-        ship_blocked = False
-        if ship_symbol and tool_name in (WAITING_TOOLS | STATE_CHANGING_TOOLS):
-            ship_status = fleet.get_ship(ship_symbol)
-            if ship_status and not ship_status.is_available():
-                # Ship is busy — check if it has a behavior
-                has_behavior = ship_symbol in behavior_engine.behaviors
-                if has_behavior:
-                    secs = ship_status.seconds_until_available()
-                    result = (
-                        f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining) "
-                        f"and has an active behavior. cancel_behavior first to operate manually."
-                    )
-                    is_error = True
-                    ship_blocked = True
-                elif action_queue and tool_name in STATE_CHANGING_TOOLS:
-                    # Queue the action instead of erroring
-                    result = action_queue.enqueue(ship_symbol, tool_name, tool_args)
-                    is_error = False
-                    ship_blocked = True
-                else:
-                    secs = ship_status.seconds_until_available()
-                    result = f"Error: {ship_symbol} is busy ({ship_status.busy_reason}, {secs:.0f}s remaining). Try another ship."
-                    is_error = True
-                    ship_blocked = True
-
-        if not ship_blocked:
-            tool_func = get_tool_by_name(tool_name)
-            if tool_func is None:
-                result = f"Error: Unknown tool '{tool_name}'"
-                is_error = True
+        try:
+            resp = requests.post(f"{API_BASE}/tools/{tool_name}", json=tool_args)
+            if resp.status_code == 200:
+                result = resp.json().get("result", "OK")
+                is_error = "Error:" in result
             else:
-                try:
-                    result = tool_func.invoke(tool_args)
-                    is_error = "Error:" in result
-                except Exception as e:
-                    result = f"Error: {e}"
-                    is_error = True
+                result = f"API Error {resp.status_code}: {resp.json().get('detail', resp.text)}"
+                is_error = True
+        except Exception as e:
+            result = f"Request Error: {e}"
+            is_error = True
 
         display_tool_result(tool_name, result, is_error)
 
@@ -1101,17 +1041,19 @@ def _run_llm_cycle(
                 and "=== CURRENT GAME STATE ===" in msg.content
             )
         ]
-        console.print("  [dim]Refreshing game state after actions...[/dim]")
-        fresh_state = gather_game_state(fleet, context)
-        fresh_state += f"\n\n[Behavior Status]\n{behavior_engine.summary()}"
-        if fresh_state:
-            messages.append(SystemMessage(content=fresh_state))
+        console.print("  [dim]Refreshing game state from API...[/dim]")
+        try:
+            resp = requests.get(f"{API_BASE}/game_state")
+            fresh_state = resp.json().get("state", "")
+            if fresh_state:
+                messages.append(SystemMessage(content=fresh_state))
+        except Exception:
+            pass
 
     # NARRATE (optional)
     narrative_tool_results = [
         (name, result) for name, result, is_err in tool_results if not is_err
     ]
-    fleet_state = fleet.fleet_summary() if has_significant_action else ""
 
     if (
         ENABLE_PER_ACTION_NARRATIVE
@@ -1120,7 +1062,7 @@ def _run_llm_cycle(
     ):
         console.print("  [dim]📝 Generating log entry...[/dim]")
         segment = generate_narrative(
-            narrative_tool_results, context, MODEL, fleet_state
+            narrative_tool_results, context, MODEL, ""
         )
         if segment:
             context.add_segment(segment)
@@ -1149,9 +1091,6 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
     llm_with_tools = llm.bind_tools(active_tools)
 
     context = NarrativeContext.load()
-    fleet = FleetTracker()
-    set_fleet(fleet)
-    behavior_engine = get_behavior_engine()
 
     display_title()
 
@@ -1183,64 +1122,11 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
             # Always prepend the latest SYSTEM_PROMPT
             messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
 
-            # Fetch and inject FRESH game state on resume
-            fresh_state = gather_game_state(fleet, context)
-            if fresh_state:
-                console.print(f"  [dim]Injected fresh game state[/dim]")
-                messages.append(SystemMessage(content=fresh_state))
-
-            # Discover all marketplace waypoints in all known systems
-            console.print(
-                "  [dim]Discovering all marketplaces in known systems...[/dim]"
-            )
-            discover_all_markets(fleet)
-            auto_discover_markets()
-
-            # Re-gather game state to include newly discovered markets
-            fresh_state = gather_game_state(fleet, context)
-            if fresh_state:
-                # Replace the previous game state with updated one
-                messages = [
-                    msg
-                    for msg in messages
-                    if not (
-                        isinstance(msg, SystemMessage)
-                        and "=== CURRENT GAME STATE ===" in msg.content
-                    )
-                ]
-                messages.append(SystemMessage(content=fresh_state))
-            console.print()
-
     # Build initial messages if not resuming
     if messages is None:
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
         ]
-
-        # Gather and inject full game state upfront
-        console.print("  [dim]Gathering game state...[/dim]")
-        fresh_state = gather_game_state(fleet, context)
-        if fresh_state:
-            messages.append(SystemMessage(content=fresh_state))
-
-        # Discover all marketplace waypoints in all known systems
-        console.print("  [dim]Discovering all marketplaces in known systems...[/dim]")
-        discover_all_markets(fleet)
-        auto_discover_markets()
-
-        # Re-gather game state to include newly discovered markets
-        fresh_state = gather_game_state(fleet, context)
-        if fresh_state:
-            # Replace the previous game state with updated one
-            messages = [
-                msg
-                for msg in messages
-                if not (
-                    isinstance(msg, SystemMessage)
-                    and "=== CURRENT GAME STATE ===" in msg.content
-                )
-            ]
-            messages.append(SystemMessage(content=fresh_state))
 
         messages.append(
             HumanMessage(
@@ -1253,7 +1139,12 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
         console.print(
             "\n  [yellow]🔮 No plan found - running strategic reflection...[/yellow]"
         )
-        game_state = gather_game_state(fleet, context)
+        try:
+            resp = requests.get(f"{API_BASE}/game_state")
+            game_state = resp.json().get("state", "")
+        except Exception as e:
+            game_state = f"Error fetching game state: {e}"
+
         reflection_segment, reflection_data = generate_strategic_reflection(
             context, game_state, MODEL
         )
@@ -1269,107 +1160,71 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
                 if recommended_plan:
                     from tools import update_plan
 
-                    result = update_plan.invoke({"plan": recommended_plan})
+                    result = update_plan(recommended_plan)
                     console.print(
                         f"  [dim green]📋 Initial plan created: {result}[/dim green]"
                     )
 
     iteration = start_iteration
-    alert_queue: list[str] = []
-    action_queue = ActionQueue()
     last_strategy_time = time.time()
 
     while True:
-        # ── STATE SYNC ────────────────────────────────────────────────────
-        # Check if play_cli.py modified behaviors.json and reload if needed
-        behavior_engine.sync_state()
-        # ── QUEUED ACTIONS ────────────────────────────────────────────────
-        # Execute queued actions for ships that just became available.
-        for ship_symbol in list(fleet.ships):
-            ship_status = fleet.get_ship(ship_symbol)
-            if (
-                ship_status
-                and ship_status.is_available()
-                and action_queue.has_queued(ship_symbol)
-            ):
-                action = action_queue.get_ready(ship_symbol)
-                if action:
-                    tool_name, tool_args = action
-                    console.print(
-                        f"  [dim green]Executing queued {tool_name} for {ship_symbol}[/dim green]"
-                    )
-                    tool_func = get_tool_by_name(tool_name)
-                    if tool_func:
-                        try:
-                            result = tool_func.invoke(tool_args)
-                            display_tool_result(tool_name, result, "Error:" in result)
-                        except Exception as e:
-                            console.print(
-                                f"    [red]Queued {tool_name} failed: {e}[/red]"
-                            )
+        # ── FETCH STATE FROM SERVER ───────────────────────────────────────
+        # The server handles tactical layer (behavior ticking, action queue).
+        # We just check for alerts and idle ships.
+        try:
+            resp = requests.get(f"{API_BASE}/state")
+            state_data = resp.json()
+            behaviors = state_data.get("behaviors", {})
+            alerts = state_data.get("alerts", [])
+        except Exception as e:
+            console.print(f"  [red]Error fetching state from API: {e}[/red]")
+            time.sleep(TICK_INTERVAL)
+            continue
 
-        # ── TACTICAL LAYER ────────────────────────────────────────────────
-        # Tick all ship behaviors. Fast — no LLM involved.
-        for ship_symbol in list(fleet.ships):
-            alert = behavior_engine.tick(ship_symbol, fleet, client)
-            # Log behavior step execution
-            cfg = behavior_engine.behaviors.get(ship_symbol)
-            if cfg and cfg.last_action:
-                status_color = "red" if "ERROR" in cfg.last_action else "dim green"
-                console.print(
-                    f"  [{status_color}]⚙ {ship_symbol}: {cfg.last_action}[/{status_color}]"
-                )
-            if alert and alert not in alert_queue:
-                alert_queue.append(alert)
-
-        # ── STRATEGIC LAYER ───────────────────────────────────────────────
-        # Call the LLM only when something needs attention.
-        idle_ships = behavior_engine.get_idle_ships(fleet)
+        # Identify idle ships (no behavior assigned)
+        all_ships = set(state_data.get("fleet", {}).keys())
+        ships_with_behaviors = set(behaviors.keys())
+        idle_ships = list(all_ships - ships_with_behaviors)
 
         # Check if it's time for a periodic strategic review
         time_since_strategy = time.time() - last_strategy_time
         strategic_review_needed = time_since_strategy > STRATEGY_INTERVAL
 
-        has_alerts = bool(alert_queue)
+        has_alerts = bool(alerts)
 
         # Wake up if: Alerts OR Idle Ships OR Strategic Timer
         if ENABLE_LLM and (has_alerts or idle_ships or strategic_review_needed):
+            # Build alert text for LLM
+            alert_text = "\n".join(alerts)
+
             # If waking up strictly for strategy, inject a prompt
             if strategic_review_needed and not has_alerts and not idle_ships:
                 console.print(
                     f"\n  [dim magenta]⏰ Periodic Strategic Review ({int(time_since_strategy)}s elapsed)[/dim magenta]"
                 )
-                # We add this to alert_queue so it gets passed to the LLM context
-                alert_queue.append(
-                    f"PERIODIC_STRATEGIC_REVIEW: It has been {int(time_since_strategy/60)} minutes since the last review. "
+                alert_text += (
+                    f"\nPERIODIC_STRATEGIC_REVIEW: It has been {int(time_since_strategy/60)} minutes since the last review. "
                     "Analyze fleet efficiency. Are there better trade routes? Should you update the plan?"
                 )
                 # Reset timer
                 last_strategy_time = time.time()
-                # Update flag since we modified alert_queue
-                has_alerts = True
 
             if idle_ships:
                 console.print(
                     f"  [dim]Idle ships (no behavior): {', '.join(idle_ships)}[/dim]"
                 )
 
-            alert_text = "\n".join(alert_queue)
-            alert_queue.clear()
-
             console.print(f"\n[dim]─── Cycle {iteration + 1} ───[/dim]")
 
             result = _run_llm_cycle(
                 messages=messages,
                 context=context,
-                fleet=fleet,
-                behavior_engine=behavior_engine,
                 llm_with_tools=llm_with_tools,
                 active_tools=active_tools,
                 alert_text=alert_text,
                 iteration=iteration,
                 debug=debug,
-                action_queue=action_queue,
             )
 
             if result is None:
@@ -1381,6 +1236,14 @@ def run_agent(fresh_start: bool = False, debug: bool = False):
 
             # Reset heartbeat timer if the LLM actually ran
             last_strategy_time = time.time()
+
+            # Clear alerts that were processed by the LLM (delete in reverse to avoid index shifts)
+            if alerts:
+                try:
+                    for i in range(len(alerts) - 1, -1, -1):
+                        requests.delete(f"{API_BASE}/alerts/{i}")
+                except Exception:
+                    pass
 
         time.sleep(TICK_INTERVAL)
 
