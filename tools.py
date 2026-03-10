@@ -1689,26 +1689,48 @@ class BehaviorEngine:
         return None
 
     def _step_supply(self, cfg, step, ship, fleet) -> Optional[str]:
-        """Supply a construction project. Usage: supply WAYPOINT SYMBOL UNITS
+        """Supply a construction project at current location. Usage: supply TRADE_SYMBOL [UNITS]
 
-        WAYPOINT: construction site waypoint (e.g., X1-ABC-123A)
-        SYMBOL: construction symbol to supply (e.g., OUTPOST, PLANETARY_INSTITUTE)
-        UNITS: how many units to supply (e.g., 100)
+        TRADE_SYMBOL: cargo type to supply (FAB_MATS or ADVANCED_CIRCUITRY)
+        UNITS: optional amount to supply. If omitted, supplies all cargo of that type.
+        Examples: supply FAB_MATS, supply ADVANCED_CIRCUITRY 50
         """
-        if len(step.args) < 3:
+        if len(step.args) < 1:
             raise Exception(
-                "supply step requires waypoint, symbol, and units (e.g., 'supply X1-ABC-123A OUTPOST 100')"
+                "supply step requires trade symbol (e.g., 'supply FAB_MATS' or 'supply ADVANCED_CIRCUITRY 50')"
             )
 
-        waypoint = step.args[0]
-        symbol = step.args[1]
-        units = int(step.args[2])
+        trade_symbol = step.args[0]
+        units = int(step.args[1]) if len(step.args) > 1 else None
+
+        # Ensure ship is docked
+        _ensure_dock_logic(cfg.ship_symbol)
+
+        # Use ship's current location as waypoint
+        waypoint = ship.location
+        if not waypoint:
+            raise Exception(f"{cfg.ship_symbol} has no location")
 
         # Extract system from waypoint (e.g., "X1-ABC-123A" -> "X1-ABC")
         system = "-".join(waypoint.split("-")[:2])
 
+        # If units not specified, use all cargo of that type
+        if units is None:
+            ship_data = client.get_ship(cfg.ship_symbol)
+            if isinstance(ship_data, dict) and "error" not in ship_data:
+                cargo = ship_data.get("cargo", {})
+                cargo_items = cargo.get("inventory", [])
+                for item in cargo_items:
+                    if item.get("symbol") == trade_symbol:
+                        units = item.get("units", 0)
+                        break
+                if units is None or units == 0:
+                    raise Exception(f"No cargo of type {trade_symbol} available")
+            else:
+                raise Exception(f"Could not get ship cargo data for {cfg.ship_symbol}")
+
         try:
-            result = client.supply_construction(system, waypoint, cfg.ship_symbol, symbol, units)
+            result = client.supply_construction(system, waypoint, cfg.ship_symbol, trade_symbol, units)
             if isinstance(result, dict) and "error" in result:
                 raise Exception(f"Supply failed: {result['error']}")
         except Exception as e:
