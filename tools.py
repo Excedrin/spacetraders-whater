@@ -691,7 +691,9 @@ def _sell_cargo_logic(
         sell_count += 1
 
         # Fix the log! Now it prints the true marginal price, not the cumulative average
-        print(f"sold: {units_sold} {trade_symbol} for {price_per_unit} total {total_revenue}")
+        print(
+            f"sold: {units_sold} {trade_symbol} for {price_per_unit} total {total_revenue}"
+        )
 
         # 1. Did the price drop below our floor on THIS transaction?
         if min_price and price_per_unit < min_price:
@@ -708,7 +710,9 @@ def _sell_cargo_logic(
 
             # If the predicted next price drops below our margin, abort before the loop repeats
             if predicted_next_price < min_price:
-                print(f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) falls below min_price of {min_price}.")
+                print(
+                    f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) falls below min_price of {min_price}."
+                )
                 break
 
         # Save the current price for the next loop's calculation
@@ -831,7 +835,9 @@ def _buy_cargo_logic(
         total_cost += tx.get("totalPrice", 0)
         purchase_count += 1
 
-        print(f"purchased: {units_bought} {trade_symbol} for {price_per_unit} total {total_cost}")
+        print(
+            f"purchased: {units_bought} {trade_symbol} for {price_per_unit} total {total_cost}"
+        )
 
         # 1. Did we accidentally overpay on THIS transaction?
         if max_price and price_per_unit > max_price:
@@ -849,7 +855,9 @@ def _buy_cargo_logic(
 
             # If the predicted next price breaks our margin, abort before the loop repeats
             if predicted_next_price > max_price:
-                print(f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) exceeds max_price of {max_price}.")
+                print(
+                    f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) exceeds max_price of {max_price}."
+                )
                 stop_reason = "Predicted to exceed max price"
                 break
 
@@ -1428,7 +1436,7 @@ class BehaviorEngine:
             elif step.step_type == StepType.SCOUT:
                 result = self._step_scout(cfg, step, ship, fleet)
             elif step.step_type == StepType.REPEAT:
-                result = self._step_repeat(cfg)
+                result = self._step_repeat(cfg, step)
             elif step.step_type == StepType.STOP:
                 result = self._step_stop(cfg)
             elif step.step_type == StepType.ALERT:
@@ -1730,7 +1738,9 @@ class BehaviorEngine:
                 raise Exception(f"Could not get ship cargo data for {cfg.ship_symbol}")
 
         try:
-            result = client.supply_construction(system, waypoint, cfg.ship_symbol, trade_symbol, units)
+            result = client.supply_construction(
+                system, waypoint, cfg.ship_symbol, trade_symbol, units
+            )
             if isinstance(result, dict) and "error" in result:
                 raise Exception(f"Supply failed: {result['error']}")
         except Exception as e:
@@ -1920,7 +1930,31 @@ class BehaviorEngine:
         self.assign(cfg.ship_symbol, "negotiate")  # Loop to process the new contract
         return None
 
-    def _step_repeat(self, cfg) -> Optional[str]:
+    def _step_repeat(self, cfg, step) -> Optional[str]:
+        if step.args:
+            try:
+                loops_left = int(step.args[0])
+                if loops_left > 1:
+                    # Decrement the counter
+                    step.args[0] = str(loops_left - 1)
+                    # Reconstruct the string so the new number persists to behaviors.json
+                    cfg.steps_str = ", ".join(str(s) for s in cfg.steps)
+                    cfg.current_step_index = 0
+                    cfg.step_phase = "INIT"
+                    self._save()
+                    return None
+                else:
+                    # We've finished our last repeat. Move past this step.
+                    self._advance(cfg)
+                    # If this was the final step in the sequence, stop the ship
+                    # so it doesn't implicitly wrap around to 0 infinitely.
+                    if cfg.current_step_index >= len(cfg.steps):
+                        return self._step_stop(cfg)
+                    return None
+            except ValueError:
+                pass  # Not a number, treat as infinite repeat
+
+        # Infinite repeat (no valid N provided)
         cfg.current_step_index = 0
         cfg.step_phase = "INIT"
         self._save()
@@ -3343,7 +3377,9 @@ def view_construction(waypoint_symbol: str) -> str:
             trade_symbol = mat.get("tradeSymbol", "?")
             required_amount = mat.get("required", 0)
             fulfilled_amount = mat.get("fulfilled", 0)
-            pct = (fulfilled_amount / required_amount * 100) if required_amount > 0 else 0
+            pct = (
+                (fulfilled_amount / required_amount * 100) if required_amount > 0 else 0
+            )
             lines.append(
                 f"    {trade_symbol}: {fulfilled_amount}/{required_amount} ({pct:.1f}%)"
             )
