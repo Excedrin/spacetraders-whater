@@ -2,6 +2,7 @@ import inspect
 import readline
 import shlex
 import traceback
+
 import requests
 
 from tools import ALL_TOOLS
@@ -123,13 +124,30 @@ def print_hud():
             state = "PAUSED" if b.get("paused") else b.get("step_phase")
             if b.get("error_message"):
                 state = f"ERROR: {b.get('error_message')}"
-            print(f"  {sym}: step {b.get('current_step_index')} ({state}) -> {b.get('last_action')}")
+            print(
+                f"  {sym}: step {b.get('current_step_index')} ({state}) -> {b.get('last_action')}"
+            )
 
         alerts = data.get("alerts", [])
         if alerts:
             print("\n=== ALERTS ===")
             for a in alerts:
                 print(f"  ! {a}")
+
+        # --- ADD FINANCIAL ADVISOR ---
+        from tools import get_financial_assessment
+
+        # Try to guess current system from fleet
+        sys_sym = None
+        if fleet:
+            first_ship = list(fleet.values())[0]
+            if first_ship.get("location"):
+                sys_sym = "-".join(first_ship["location"].split("-")[:2])
+
+        print("\n=== FINANCIAL ADVISOR ===")
+        print(get_financial_assessment(sys_sym))
+        # ------------------------------
+
         print()
     except Exception as e:
         print(f"Error gathering state from API: {e}")

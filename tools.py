@@ -227,6 +227,72 @@ def _get_contract_goods() -> set[str]:
     return goods
 
 
+def get_financial_assessment(system_symbol: str = None) -> str:
+    """Calculates fleet budget requirements and recommends expansion/construction."""
+    agent = client.get_agent()
+    if isinstance(agent, dict) and "error" in agent:
+        return "Unable to fetch financial data."
+
+    credits = agent.get("credits", 0)
+    ships = client.list_ships()
+    if isinstance(ships, dict) and "error" in ships:
+        ships = []
+
+    trader_count = sum(
+        1
+        for s in ships
+        if s.get("registration", {}).get("role") in ["COMMAND", "HAULER", "FREIGHTER"]
+    )
+
+    # Assume ~100k reserve per active trading ship to afford full cargo holds of expensive goods
+    reserve_needed = max(trader_count * 100000, 100000)
+    excess = credits - reserve_needed
+
+    lines = [
+        f"Current Credits: {credits:,} cr",
+        f"Recommended Reserve: {reserve_needed:,} cr ({trader_count} traders)",
+        f"Excess Capital: {excess:,} cr",
+    ]
+
+    # Find cheapest hauler in the system
+    cache = load_market_cache()
+    hauler_price = 300000  # baseline guess
+    cheapest_shipyard = "Unknown"
+
+    if system_symbol:
+        for wp, data in cache.items():
+            if wp.startswith(system_symbol) and "ships" in data:
+                for s in data["ships"]:
+                    if s["type"] in [
+                        "SHIP_LIGHT_HAULER",
+                        "SHIP_HEAVY_FREIGHTER",
+                        "SHIP_COMMAND_FRIGATE",
+                    ]:
+                        if s.get("purchasePrice", float("inf")) < hauler_price:
+                            hauler_price = s["purchasePrice"]
+                            cheapest_shipyard = wp
+
+    lines.append("")
+    if excess > hauler_price:
+        lines.append(
+            f"🟢 EXPANSION READY: You have enough excess capital to buy a Hauler (~{hauler_price:,} cr at {cheapest_shipyard})."
+        )
+    elif excess > 50000:
+        lines.append(
+            "🟡 CONSTRUCTION READY: You have excess capital. Safe to run 'assign_jump_gate_construction'."
+        )
+    elif excess > 0:
+        lines.append(
+            "🟠 STABLE: Capital is stable, but keep saving before major purchases."
+        )
+    else:
+        lines.append(
+            "🔴 LOW CAPITAL: Do not buy ships or construction materials! Focus on autotrade/mining to build reserve."
+        )
+
+    return "\n".join(lines)
+
+
 def _calculate_travel_cost(
     ship: dict, dest_wp: dict, origin_wp: dict, mode: str = "CRUISE"
 ) -> tuple[int, int, int]:
@@ -397,28 +463,130 @@ def _navigate_ship_logic(
         return f"{ship_symbol} is already at {destination_symbol}.", 0.0
 
     # Inter-System Check
-    # Extract system from destination: X1-RV42-A1 -> X1-RV42
     dest_sys = "-".join(destination_symbol.split("-")[:2])
     target_wp_symbol = destination_symbol
-    is_inter_system = False
+    is_inter_system = current_sys != dest_sys
 
-    if current_sys != dest_sys:
-        is_inter_system = True
-        # FIX: Use type="JUMP_GATE" (not traits)
-        waypoints = client.list_waypoints(current_sys, type="JUMP_GATE")
+    if is_inter_system:
+        # Get Local Jump Gate
+        local_jgs = client.list_waypoints(current_sys, type="JUMP_GATE")
+        if not local_jgs or (isinstance(local_jgs, dict) and "error" in local_jgs):
+            raise Exception(f"No Jump Gate found in current system {current_sys}.")
 
-        if isinstance(waypoints, dict) and "error" in waypoints:
-            raise Exception(f"API Error finding jump gate: {waypoints['error']}")
+        local_jg_sym = local_jgs[0]["symbol"]
 
-        if not waypoints:
-            raise Exception(
-                f"Destination is in {dest_sys}, but no Jump Gate found in {current_sys}."
+        # ---------------------------------------------------------
+        # PLAN MODE (execute=False)
+        # ---------------------------------------------------------
+        if not execute:
+            lines = [f"Inter-System Route Plan: {current_wp} -> {destination_symbol}"]
+
+            # Leg 1: Distance to local gate
+            local_wps = client.list_waypoints(current_sys)
+            origin_obj = next((w for w in local_wps if w["symbol"] == current_wp), None)
+            local_jg_obj = next(
+                (w for w in local_wps if w["symbol"] == local_jg_sym), None
             )
+            t1, c1 = 0, 0
+            if current_wp != local_jg_sym and origin_obj and local_jg_obj:
+                _, c1, t1 = _calculate_travel_cost(ship, local_jg_obj, origin_obj, mode)
 
-        target_wp_symbol = waypoints[0]["symbol"]
+            lines.append(f"1. Nav to local gate ({local_jg_sym}): {t1}s, {c1} fuel")
 
-        if current_wp == target_wp_symbol:
-            return f"Ship is at Jump Gate. Use 'jump_ship' to jump to {dest_sys}.", 0.0
+            # Check connections
+            jg_data = client.get_jump_gate(current_sys, local_jg_sym)
+            connections = (
+                jg_data.get("connections", [])
+                if isinstance(jg_data, dict) and "error" not in jg_data
+                else []
+            )
+            connected_systems = ["-".join(cw.split("-")[:2]) for cw in connections]
+
+            if dest_sys in connected_systems:
+                lines.append(
+                    f"2. Jump directly to {dest_sys} gate: Antimatter / Cooldown"
+                )
+            else:
+                lines.append(
+                    f"2. Multi-system Jump Route to {dest_sys}: (Auto-routing via nearest connected system)"
+                )
+
+            lines.append(
+                f"3. Nav to final dest ({destination_symbol}): Calculated upon arrival in {dest_sys}"
+            )
+            return "\n".join(lines), 0.0
+
+        # ---------------------------------------------------------
+        # EXECUTE MODE (execute=True)
+        # ---------------------------------------------------------
+        if current_wp != local_jg_sym:
+            # Step 1: Navigate to the local jump gate first.
+            target_wp_symbol = local_jg_sym
+        else:
+            # Step 2: At local jump gate. Verify connection and Jump!
+            _ensure_orbit_logic(ship_symbol)
+
+            jg_data = client.get_jump_gate(current_sys, local_jg_sym)
+            if isinstance(jg_data, dict) and "error" in jg_data:
+                raise Exception(f"Failed to read jump gate: {jg_data['error']}")
+
+            connections = jg_data.get("connections", [])
+
+            # Map connections to their system symbols (sys -> exact waypoint)
+            connected_systems = {}
+            for cw in connections:
+                cs = "-".join(cw.split("-")[:2])
+                connected_systems[cs] = cw
+
+            if dest_sys in connected_systems:
+                # Directly connected! Jump to the specific waypoint linked to the destination system
+                next_jump_target = connected_systems[dest_sys]
+            else:
+                # Greedy Pathfinding: Find connected system closest to ultimate destination
+                dest_sys_data = client.get_system(dest_sys)
+                if "error" in dest_sys_data:
+                    raise Exception(
+                        f"Failed to fetch destination system {dest_sys}: {dest_sys_data['error']}"
+                    )
+
+                dx, dy = dest_sys_data.get("x", 0), dest_sys_data.get("y", 0)
+                best_dist = float("inf")
+                next_jump_target = None
+
+                for cs, cw in connected_systems.items():
+                    cs_data = client.get_system(cs)
+                    if "error" in cs_data:
+                        continue
+                    cx, cy = cs_data.get("x", 0), cs_data.get("y", 0)
+                    dist = math.sqrt((cx - dx) ** 2 + (cy - dy) ** 2)
+
+                    if dist < best_dist:
+                        best_dist = dist
+                        next_jump_target = cw
+
+                if not next_jump_target:
+                    raise Exception(
+                        "Dead end: No jump connections available to route to destination."
+                    )
+
+            # Execute jump
+            jump_res = client.jump(ship_symbol, next_jump_target)
+            if isinstance(jump_res, dict) and "error" in jump_res:
+                raise Exception(
+                    f"Jump to {next_jump_target} failed: {jump_res['error']}"
+                )
+
+            cd = jump_res.get("cooldown", {}).get("remainingSeconds", 0)
+            if _fleet and cd > 0:
+                _fleet.set_transit(
+                    ship_symbol, float(cd)
+                )  # Treat as transit so engine waits
+
+            next_sys = "-".join(next_jump_target.split("-")[:2])
+            return (
+                f"🚀 JUMPED to {next_sys} (Routing towards {dest_sys}). Cooldown: {cd}s.",
+                float(cd),
+            )
 
     # Fetch Waypoints to validate target exists and calculate stats
     waypoints = client.list_waypoints(current_sys)
@@ -517,8 +685,14 @@ def _navigate_ship_logic(
             result += (
                 f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
             )
+            result += (
+                f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+            )
         elif is_inter_system:
             result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
+            result += (
+                f"\nNote: En route to Jump Gate. Will execute system jump upon arrival."
+            )
 
         return result, wait_secs
 
@@ -1074,6 +1248,8 @@ class StepType(Enum):
     NEGOTIATE = "negotiate"
     BUY_SHIP = "buy_ship"
     AUTOTRADE = "autotrade"
+    EXPLORE = "explore"
+    CONSTRUCT = "construct"
 
 
 @dataclass
@@ -1446,6 +1622,10 @@ class BehaviorEngine:
                 result = self._step_alert(cfg, step)
             elif step.step_type == StepType.AUTOTRADE:
                 result = self._step_autotrade(cfg)
+            elif step.step_type == StepType.EXPLORE:
+                result = self._step_explore(cfg, ship)
+            elif step.step_type == StepType.CONSTRUCT:
+                result = self._step_construct(cfg, ship)
             elif step.step_type == StepType.NEGOTIATE:
                 result = self._step_negotiate(cfg)
             # Store last action for logging
@@ -1780,6 +1960,20 @@ class BehaviorEngine:
         1. Analyzes market/cargo to generate a specific trade route string.
         2. Calls self.assign() to overwrite the current behavior with the new plan.
         """
+        # --- FLEET-AWARE LOGIC ---
+        # Find goods currently being traded by OTHER ships
+        active_goods = set()
+        for other_cfg in self.behaviors.values():
+            if other_cfg.ship_symbol != cfg.ship_symbol:
+                # Naive parse: find 'buy X' in their steps
+                for part in other_cfg.steps_str.split(","):
+                    part = part.strip()
+                    if part.startswith("buy "):
+                        tokens = part.split()
+                        if len(tokens) > 1:
+                            active_goods.add(tokens[1])
+        # ----------------------------
+
         # 1. Check Cargo
         cargo_data = client.get_cargo(cfg.ship_symbol)
         inventory = cargo_data.get("inventory", [])
@@ -1806,12 +2000,16 @@ class BehaviorEngine:
         # B. Find New Trade (Buy low, sell high)
         else:
             routes = _analyze_trade_routes(cfg.ship_symbol, min_profit=50)
+
+            # --- FILTER OUT BUSY ROUTES ---
+            routes = [r for r in routes if r["good"] not in active_goods]
+
             if not routes:
                 # Pause and alert if no routes found
                 cfg.paused = True
                 cfg.alert_sent = True
                 self._save()
-                return f"{cfg.ship_symbol} ALERT: Auto-trade found no profitable routes. Scout more markets."
+                return f"{cfg.ship_symbol} ALERT: Auto-trade found no unique profitable routes. Scout more markets or expand to new systems."
 
             best = routes[0]
             max_buy = int(best["buy"] * 1.10)
@@ -1831,6 +2029,159 @@ class BehaviorEngine:
         # It completely replaces the current behavior config with the new one.
         self.assign(cfg.ship_symbol, new_plan)
 
+        return None
+
+    def _step_explore(self, cfg, ship) -> Optional[str]:
+        """Auto-Explore a system. Finds un-charted waypoints and unscouted markets/shipyards."""
+        if not ship.location:
+            raise Exception("Ship has no known location.")
+
+        sys_sym = ship.location.rsplit("-", 1)[0]
+        wps = client.list_waypoints(sys_sym)
+        if isinstance(wps, dict) and "error" in wps:
+            raise Exception(wps["error"])
+
+        cache = load_market_cache()
+        target_wp = None
+        action = None
+
+        for wp in wps:
+            wp_sym = wp["symbol"]
+            traits = [t["symbol"] for t in wp.get("traits", [])]
+
+            # Priority 1: Charting
+            if not wp.get("chart"):
+                target_wp = wp_sym
+                action = "chart"
+                break
+
+            # Priority 2: Scouting markets/shipyards
+            if "MARKETPLACE" in traits or "SHIPYARD" in traits:
+                if wp_sym not in cache or "last_updated" not in cache.get(wp_sym, {}):
+                    target_wp = wp_sym
+                    action = "scout"
+                    break
+
+        if target_wp:
+            # Inject a goto and the action, then return to exploring
+            self.assign(cfg.ship_symbol, f"goto {target_wp}, {action}, explore")
+        else:
+            # Nothing left to explore in this system!
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Exploration of {sys_sym} complete! All waypoints charted and markets scouted."
+
+        return None
+
+    def _step_construct(self, cfg, ship) -> Optional[str]:
+        """Smart construction: Check jump gate needs, check budget, buy, supply."""
+        if not ship.location:
+            raise Exception("Ship has no known location.")
+
+        sys_sym = ship.location.rsplit("-", 1)[0]
+
+        # 1. Find Jump Gate
+        wps = client.list_waypoints(sys_sym, type="JUMP_GATE")
+        if not wps:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: No jump gate found in {sys_sym}."
+        jg_sym = wps[0]["symbol"]
+
+        # 2. Check Construction Status
+        const = client.get_construction(sys_sym, jg_sym)
+        if isinstance(const, dict) and "error" in const:
+            raise Exception(const["error"])
+
+        if const.get("isComplete", False) or not const.get("materials"):
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Jump gate construction in {sys_sym} is COMPLETE!"
+
+        # 3. Find needed material
+        target_mat = None
+        needed_qty = 0
+        for mat in const.get("materials", []):
+            if mat.get("fulfilled", 0) < mat.get("required", 0):
+                target_mat = mat["tradeSymbol"]
+                needed_qty = mat["required"] - mat["fulfilled"]
+                break
+
+        if not target_mat:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return (
+                f"{cfg.ship_symbol} ALERT: All materials fulfilled. Gate is complete!"
+            )
+
+        # 4. Cargo Check (If we already have the material, go supply it!)
+        cargo = client.get_cargo(cfg.ship_symbol)
+        inv = cargo.get("inventory", [])
+        for item in inv:
+            if item["symbol"] == target_mat:
+                # We have some! Supply it.
+                self.assign(
+                    cfg.ship_symbol, f"goto {jg_sym}, supply {target_mat}, construct"
+                )
+                return None
+
+        if cargo.get("units", 0) > 0:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Has wrong cargo to construct. Empty cargo before resuming."
+
+        # 5. Budget Check & Sourcing
+        src_wp = _find_best_source(target_mat, sys_sym)
+        if not src_wp:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Cannot find a market selling {target_mat} in {sys_sym}."
+
+        # Get price
+        cache = load_market_cache()
+        price = 5000  # default fallback
+        for g in cache.get(src_wp, {}).get("trade_goods", []):
+            if g["symbol"] == target_mat:
+                price = g.get("purchasePrice", 5000)
+                break
+
+        capacity = ship.cargo_capacity
+        buy_qty = min(capacity, needed_qty)
+        cost = buy_qty * price
+
+        # Verify Budget
+        agent = client.get_agent()
+        credits = agent.get("credits", 0)
+
+        # Calculate Required Reserve (same logic as the HUD)
+        ships = client.list_ships()
+        if isinstance(ships, dict) and "error" in ships:
+            ships = []
+        trader_count = sum(
+            1
+            for s in ships
+            if s.get("registration", {}).get("role")
+            in ["COMMAND", "HAULER", "FREIGHTER"]
+        )
+        reserve_needed = max(trader_count * 100000, 100000)
+
+        if credits < (reserve_needed + cost):
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Need {cost:,}cr to buy {buy_qty} {target_mat}, but only have {credits:,}cr (keeping {reserve_needed:,}cr reserve). Paused to build capital."
+
+        # 6. Execute!
+        self.assign(
+            cfg.ship_symbol,
+            f"goto {src_wp}, buy {target_mat} {buy_qty}, goto {jg_sym}, supply {target_mat}, construct",
+        )
         return None
 
     def _step_negotiate(self, cfg) -> Optional[str]:
@@ -2027,14 +2378,28 @@ def view_agent() -> str:
 
 @tool
 def view_contracts() -> str:
-    """[READ-ONLY] List all contracts with status, terms, and delivery requirements."""
+    """[READ-ONLY] List active contracts with status, terms, and delivery requirements."""
     data = client.list_contracts()
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
     if not data:
         return "No contracts available."
+
+    # Filter out fulfilled contracts to prevent UI/LLM text spew
+    active_contracts = [c for c in data if not c.get("fulfilled")]
+    fulfilled_count = len(data) - len(active_contracts)
+
     lines = []
-    for c in data:
+    if fulfilled_count > 0:
+        lines.append(
+            f"(Hiding {fulfilled_count} historically fulfilled contracts. Showing active only.)\n"
+        )
+
+    if not active_contracts:
+        lines.append("No active unfulfilled contracts at this time.")
+        return "\n".join(lines)
+
+    for c in active_contracts:
         lines.append(f"Contract: {c['id']}")
         lines.append(
             f"  Type: {c['type']}  |  Accepted: {c['accepted']}  |  Fulfilled: {c['fulfilled']}"
@@ -2050,6 +2415,7 @@ def view_contracts() -> str:
                 f"({d['unitsFulfilled']}/{d['unitsRequired']} done)"
             )
         lines.append("")
+
     return "\n".join(lines)
 
 
@@ -2079,8 +2445,12 @@ def _get_ship_capabilities(ship: dict) -> list[str]:
 
 
 @tool
-def view_ships() -> str:
-    """[READ-ONLY] List all ships with location, fuel, status, cooldowns, and cargo."""
+def view_ships(system_symbol: str = None) -> str:
+    """[READ-ONLY] List all ships with location, fuel, status, and assigned behaviors.
+
+    Args:
+        system_symbol: Optional. Filter to only show ships in this system (e.g. 'X1-KD26').
+    """
     data = client.list_ships()
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -2088,14 +2458,20 @@ def view_ships() -> str:
     if _fleet:
         _fleet.update_from_api(data)
 
+    engine = get_engine()
     lines = []
+
     for s in data:
         symbol = s["symbol"]
         nav = s.get("nav", {})
         fuel = s.get("fuel", {})
         cargo = s.get("cargo", {})
+        sys_sym = nav.get("systemSymbol", "")
 
-        # Check extraction cooldown from fleet tracker (no extra API call)
+        if system_symbol and sys_sym != system_symbol:
+            continue
+
+        # Check extraction cooldown
         cd_text = ""
         if _fleet:
             ship_status = _fleet.get_ship(symbol)
@@ -2115,14 +2491,30 @@ def view_ships() -> str:
             if arrival_seconds > 0:
                 arrival_text = f" (Arriving in {int(arrival_seconds)}s)"
 
+        # Check Behavior Status
+        beh_text = ""
+        cfg = engine.behaviors.get(symbol)
+        if cfg:
+            state = "PAUSED" if cfg.paused else cfg.step_phase
+            if cfg.error_message:
+                state = f"ERR: {cfg.error_message}"
+            beh_text = f" | Job: {cfg.steps_str} [{state}]"
+
         lines.append(f"   {symbol} ({s.get('registration', {}).get('role', '?')})")
         lines.append(
             f"   Loc: {nav.get('waypointSymbol', '?')} ({status}){arrival_text}"
         )
         lines.append(
-            f"   Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} | Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}{cd_text}"
+            f"   Fuel: {fuel.get('current', 0)}/{fuel.get('capacity', 0)} | Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', 0)}{cd_text}{beh_text}"
         )
         lines.append("")
+
+    if not lines:
+        return (
+            f"No ships found in {system_symbol}."
+            if system_symbol
+            else "No ships found."
+        )
 
     return "\n".join(lines)
 
@@ -3511,7 +3903,7 @@ def find_waypoints(
                 f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}"
             )
 
-        #if len(results) > 20:
+        # if len(results) > 20:
         #    lines.append(f"  ... {len(results)-20} more ...")
 
     return "\n".join(lines)
@@ -3818,6 +4210,22 @@ def assign_contract_duty(ship_symbol: str) -> str:
     return get_engine().assign(ship_symbol, "negotiate")
 
 
+@tool
+def assign_system_explorer(ship_symbol: str) -> str:
+    """[STATE: behavior] Assign a probe/ship to automatically explore its current system.
+    It will automatically fly to every waypoint, chart it, and scout all markets/shipyards.
+    """
+    return get_engine().assign(ship_symbol, "explore")
+
+
+@tool
+def assign_jump_gate_construction(ship_symbol: str) -> str:
+    """[STATE: behavior] Assign a ship to automatically buy materials and construct the jump gate.
+    Smart budgeting: will pause and alert if buying materials would dip into your required trade reserves!
+    """
+    return get_engine().assign(ship_symbol, "construct")
+
+
 # ──────────────────────────────────────────────
 #  Tool registry
 # ──────────────────────────────────────────────
@@ -3858,6 +4266,8 @@ TIER_1_TOOLS = [
     assign_trade_route,
     assign_auto_trade,
     assign_contract_duty,
+    assign_system_explorer,
+    assign_jump_gate_construction,
     create_behavior,
 ]
 
@@ -3920,6 +4330,8 @@ ALL_TOOLS = [
     assign_trade_route,
     assign_auto_trade,
     assign_contract_duty,
+    assign_system_explorer,
+    assign_jump_gate_construction,
 ]
 
 # Tools that are "significant" actions worth narrating

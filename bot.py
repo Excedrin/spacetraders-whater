@@ -13,30 +13,22 @@ import json
 import os
 import sys
 import time
-import requests
 from pathlib import Path
 from typing import Optional
 
+import requests
 from dotenv import load_dotenv
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-    messages_from_dict,
-    messages_to_dict,
-)
+from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
+                                     ToolMessage, messages_from_dict,
+                                     messages_to_dict)
 from langchain_ollama import ChatOllama
 from rich.console import Console
 
 from events import write_event
-from narrative import (
-    NarrativeContext,
-    NarrativeSegment,
-    generate_narrative,
-    generate_strategic_reflection,
-)
-from tools import ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, client, load_market_cache
+from narrative import (NarrativeContext, NarrativeSegment, generate_narrative,
+                       generate_strategic_reflection)
+from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, client,
+                   load_market_cache)
 
 API_BASE = "http://localhost:8000/api"
 
@@ -130,8 +122,15 @@ Contracts are not the most profitable way to use ships, but completing them unlo
   - Use DRIFT speed if there's no other option.
 - DATA HYGIENE:
   - Market data expires. If 'find_trades' says "STALE (2h+)", do not commit a Hauler yet.
-- EXPANSION:
-  - If Credits > (Ship Price + 200k Buffer), go to a shipyard and purchase a new ship.
+- EXPANSION & CONSTRUCTION:
+  - Check [Agent & Financials] section in game state FIRST — it shows:
+    - Current credits and recommended reserve
+    - "EXCESS CAPITAL" — if 🟢 or 🟡, you can expand; if 🟠 or 🔴, delay expansion
+  - SHIP PURCHASES: Only when status is 🟢🟡 and excess > ship price + 100k buffer
+  - CONSTRUCTION: Use `assign_jump_gate_construction()` to build jump gates for system expansion
+    - Automatically sources materials and manages budget
+    - Only proceed if financial assessment shows sufficient excess capital
+  - If capital is LOW (🟠🔴): focus on income generation, not expansion
 
 === INTERVENTION PROTOCOL ===
 
@@ -468,11 +467,20 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
     try:
         agent = client.get_agent()
         if not isinstance(agent, dict) or "error" not in agent:
+            from tools import get_financial_assessment
+
+            # Extract system to fetch accurate ship prices
+            sys_sym = None
+            if "headquarters" in agent:
+                sys_sym = "-".join(agent["headquarters"].split("-")[:2])
+
+            fin_assess = get_financial_assessment(sys_sym)
+
             sections.append(
-                f"[Agent]\n"
-                f"Credits: {agent.get('credits', '?')}\n"
+                f"[Agent & Financials]\n"
                 f"Headquarters: {agent.get('headquarters', '?')}\n"
-                f"Ship count: {agent.get('shipCount', '?')}"
+                f"Ship count: {agent.get('shipCount', '?')}\n\n"
+                f"{fin_assess}"
             )
     except Exception:
         pass
@@ -1061,9 +1069,7 @@ def _run_llm_cycle(
         and narrative_tool_results
     ):
         console.print("  [dim]📝 Generating log entry...[/dim]")
-        segment = generate_narrative(
-            narrative_tool_results, context, MODEL, ""
-        )
+        segment = generate_narrative(narrative_tool_results, context, MODEL, "")
         if segment:
             context.add_segment(segment)
             context.persist()

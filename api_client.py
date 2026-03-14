@@ -100,7 +100,23 @@ class SpaceTradersClient:
 
             body = resp.json()
             if "error" in body:
-                return {"error": body["error"].get("message", str(body["error"]))}
+                err_obj = body["error"]
+                err_code = err_obj.get("code", "UNKNOWN")
+                err_msg = err_obj.get("message", str(err_obj))
+                err_data = err_obj.get("data", {})
+
+                detailed_err = f"API Error {err_code}: {err_msg}"
+                if err_data:
+                    detailed_err += f" | Details: {err_data}"
+
+                print(f"\n" + "=" * 50, file=sys.stderr)
+                print(f"🚨 PAGINATION API ERROR", file=sys.stderr)
+                print(f"Request: GET {endpoint}", file=sys.stderr)
+                print(f"Query Params: {params_with_page}", file=sys.stderr)
+                print(f"Response: {detailed_err}", file=sys.stderr)
+                print("=" * 50 + "\n", file=sys.stderr)
+
+                return {"error": detailed_err}
 
             data = body.get("data", [])
             if not data:
@@ -182,7 +198,28 @@ class SpaceTradersClient:
 
             body = resp.json()
             if "error" in body:
-                return {"error": body["error"].get("message", str(body["error"]))}
+                err_obj = body["error"]
+                err_code = err_obj.get("code", "UNKNOWN")
+                err_msg = err_obj.get("message", str(err_obj))
+                err_data = err_obj.get("data", {})
+
+                # Build a detailed error string for the UI / LLM
+                detailed_err = f"API Error {err_code}: {err_msg}"
+                if err_data:
+                    detailed_err += f" | Details: {err_data}"
+
+                # Print a massive debug block to the server console
+                print(f"\n" + "=" * 50, file=sys.stderr)
+                print(f"🚨 API ERROR DETECTED", file=sys.stderr)
+                print(f"Request: {method} {path}", file=sys.stderr)
+                if "json" in kwargs and kwargs["json"]:
+                    print(f"Payload: {kwargs['json']}", file=sys.stderr)
+                elif "params" in kwargs and kwargs["params"]:
+                    print(f"Query Params: {kwargs['params']}", file=sys.stderr)
+                print(f"Response: {detailed_err}", file=sys.stderr)
+                print("=" * 50 + "\n", file=sys.stderr)
+
+                return {"error": detailed_err}
 
             data = body.get("data", body)
 
@@ -204,8 +241,66 @@ class SpaceTradersClient:
     def get_contract(self, contract_id: str) -> dict:
         return self._request("GET", f"/my/contracts/{contract_id}")
 
-    def list_contracts(self) -> dict:
-        return self._paginate_request("/my/contracts")
+    def list_contracts(self) -> list | dict:
+        """Fetch only the most recent contracts (last 2 pages) to save API calls and avoid infinite pagination bloat."""
+        import math
+
+        limit = 20
+        self._limiter.acquire()
+
+        try:
+            # 1. Fetch page 1 just to get the 'meta.total' count
+            resp = self.session.request(
+                "GET",
+                f"{BASE_URL}/my/contracts",
+                params={"page": 1, "limit": limit},
+                timeout=30,
+            )
+            if resp.status_code == 204 or not resp.content:
+                return []
+
+            body = resp.json()
+            if "error" in body:
+                err_obj = body["error"]
+                err_code = err_obj.get("code", "UNKNOWN")
+                err_msg = err_obj.get("message", str(err_obj))
+                err_data = err_obj.get("data", {})
+
+                detailed_err = f"API Error {err_code}: {err_msg}"
+                if err_data:
+                    detailed_err += f" | Details: {err_data}"
+
+                return {"error": detailed_err}
+
+            meta = body.get("meta", {})
+            total = meta.get("total", 0)
+            data = body.get("data", [])
+
+            # If we have 20 or fewer contracts, we already have all of them.
+            if total <= limit:
+                return data
+
+            # 2. If we have > 20, the NEWEST contracts are on the LAST pages.
+            # Calculate total pages and grab up to the last 2 pages (max 40 recent contracts)
+            total_pages = math.ceil(total / limit)
+            start_page = max(2, total_pages - 1)
+
+            recent_contracts = []
+            for page in range(start_page, total_pages + 1):
+                self._limiter.acquire()
+                page_resp = self.session.request(
+                    "GET",
+                    f"{BASE_URL}/my/contracts",
+                    params={"page": page, "limit": limit},
+                    timeout=30,
+                )
+                if page_resp.status_code == 200:
+                    recent_contracts.extend(page_resp.json().get("data", []))
+
+            return recent_contracts
+
+        except Exception as e:
+            return {"error": str(e)}
 
     def accept_contract(self, contract_id: str) -> dict:
         return self._request("POST", f"/my/contracts/{contract_id}/accept")
@@ -227,6 +322,9 @@ class SpaceTradersClient:
         return self._request("POST", f"/my/contracts/{contract_id}/fulfill")
 
     # --- Systems / Waypoints ---
+
+    def get_system(self, system: str) -> dict:
+        return self._request("GET", f"/systems/{system}")
 
     def list_waypoints(self, system: str, **params) -> list:
         """List waypoints with automatic pagination to get ALL results."""
