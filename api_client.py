@@ -162,6 +162,8 @@ class SpaceTradersClient:
                     time.sleep(1 + attempt)
                 continue
             except requests.exceptions.RequestException as e:
+                print(f"[API] error: {resp.text}", file=sys.stderr)
+                print(f"[API] error: {str(e)}", file=sys.stderr)
                 return {"error": str(e)}
 
             # Handle 429 specifically provided by server
@@ -345,12 +347,12 @@ class SpaceTradersClient:
     def scan_systems(self, ship: str) -> dict:
         return self._request("POST", f"/my/ships/{ship}/scan/systems")
 
-    def jump(self, ship: str, system: str) -> dict:
+    def jump(self, ship: str, waypoint: str) -> dict:
         return self._request(
             "POST",
             f"/my/ships/{ship}/jump",
             json={
-                "systemSymbol": system,
+                "waypointSymbol": waypoint,
             },
         )
 

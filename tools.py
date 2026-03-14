@@ -1065,6 +1065,7 @@ class StepType(Enum):
     DELIVER = "deliver"
     REFUEL = "refuel"
     SCOUT = "scout"
+    CHART = "chart"
     TRANSFER = "transfer"
     SUPPLY = "supply"
     ALERT = "alert"
@@ -1433,6 +1434,8 @@ class BehaviorEngine:
                 result = self._step_transfer(cfg, step, ship, fleet)
             elif step.step_type == StepType.SUPPLY:
                 result = self._step_supply(cfg, step, ship, fleet)
+            elif step.step_type == StepType.CHART:
+                result = self._step_chart(cfg, step, ship, fleet)
             elif step.step_type == StepType.SCOUT:
                 result = self._step_scout(cfg, step, ship, fleet)
             elif step.step_type == StepType.REPEAT:
@@ -1753,6 +1756,13 @@ class BehaviorEngine:
         if not ship.location:
             raise Exception("No location")
         _refresh_waypoint_data(ship.location)
+        self._advance(cfg)
+        return None
+
+    def _step_chart(self, cfg, step, ship, fleet) -> Optional[str]:
+        if not ship.location:
+            raise Exception("No location")
+        _ = client.chart(cfg.ship_symbol)
         self._advance(cfg)
         return None
 
@@ -2273,7 +2283,7 @@ def find_waypoints(
         data.sort(key=get_dist)
 
     lines = [f"Waypoints in {system_symbol}:"]
-    for wp in data[:20]:  # Limit output
+    for wp in data:
         d_str = ""
         if ref_coords:
             d = math.sqrt(
@@ -2283,9 +2293,6 @@ def find_waypoints(
 
         t_list = [t["symbol"] for t in wp.get("traits", [])]
         lines.append(f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}")
-
-    if len(data) > 20:
-        lines.append(f"  ... {len(data)-20} more ...")
 
     return "\n".join(lines)
 
@@ -3228,11 +3235,9 @@ def scan_waypoints(ship_symbol: str) -> str:
     lines = [
         f"Found {len(waypoints)} waypoints. Cooldown: {cooldown.get('remainingSeconds', 0)}s"
     ]
-    for wp in waypoints[:15]:  # Limit output
+    for wp in waypoints:
         traits = ", ".join(t.get("symbol", "") for t in wp.get("traits", [])[:3])
         lines.append(f"  {wp.get('symbol', '?')} ({wp.get('type', '?')}) - {traits}")
-    if len(waypoints) > 15:
-        lines.append(f"  ... and {len(waypoints) - 15} more")
     return "\n".join(lines)
 
 
@@ -3256,15 +3261,16 @@ def scan_ships(ship_symbol: str) -> str:
 
 
 @tool
-def jump_ship(ship_symbol: str, system_symbol: str) -> str:
+def jump_ship(ship_symbol: str, waypoint_symbol: str) -> str:
     """[STATE: position, cooldown] Jump to another star system via jump gate. Requires antimatter."""
-    data = client.jump(ship_symbol, system_symbol)
+    _ensure_orbit_logic(ship_symbol)
+    data = client.jump(ship_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
     nav = data.get("nav", {})
     cooldown = data.get("cooldown", {})
     return (
-        f"{ship_symbol} jumped to system {system_symbol}.\n"
+        f"{ship_symbol} jumped to system {waypoint_symbol}.\n"
         f"Now at: {nav.get('waypointSymbol', '?')}\n"
         f"Cooldown: {cooldown.get('remainingSeconds', 0)}s"
     )
@@ -3273,6 +3279,7 @@ def jump_ship(ship_symbol: str, system_symbol: str) -> str:
 @tool
 def warp_ship(ship_symbol: str, waypoint_symbol: str) -> str:
     """[STATE: position, fuel] Warp to a waypoint in another system. Uses antimatter."""
+    _ensure_orbit_logic(ship_symbol)
     data = client.warp(ship_symbol, waypoint_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -3333,10 +3340,8 @@ def view_jump_gate(waypoint_symbol: str) -> str:
         return f"Error: {data['error']}"
     connections = data.get("connections", [])
     lines = [f"Jump gate at {waypoint_symbol} connects to {len(connections)} systems:"]
-    for conn in connections[:20]:
+    for conn in connections:
         lines.append(f"  → {conn}")
-    if len(connections) > 20:
-        lines.append(f"  ... and {len(connections) - 20} more")
     return "\n".join(lines)
 
 
@@ -3497,7 +3502,7 @@ def find_waypoints(
 
     else:
         lines.append(f"Waypoints in {system_symbol}:")
-        for res in results[:20]:  # Limit output
+        for res in results:
             wp = res["waypoint"]
             dist = res["distance"]
             d_str = f" ({dist:.1f} dist)" if dist != float("inf") else ""
@@ -3506,8 +3511,8 @@ def find_waypoints(
                 f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}"
             )
 
-        if len(results) > 20:
-            lines.append(f"  ... {len(results)-20} more ...")
+        #if len(results) > 20:
+        #    lines.append(f"  ... {len(results)-20} more ...")
 
     return "\n".join(lines)
 
@@ -3596,12 +3601,14 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
       mine WAYPOINT [ORE1 ORE2]  - Navigate to asteroid, mine until cargo full, jettison non-targets
       goto WAYPOINT              - Navigate to waypoint, wait for arrival
       buy ITEM [UNITS] [max:PRICE] [min_qty:N] - Buy cargo from current market (fills remaining space by default).
+
                                max:PRICE stops and alerts if price per unit exceeds limit.
                                min_qty:N alerts if fewer than N units could be purchased.
       sell ITEM [min:PRICE]       - Sell cargo at current market (skips contract goods). min:PRICE sets a price floor — stops selling if price drops below
       deliver CONTRACT ITEM [N]  - Deliver cargo for contract (smart: auto-caps at contract remaining + cargo available)
       refuel                     - Refuel at current market
       scout                      - View market prices at current location
+      chart                      - Chart the current location
       alert MESSAGE              - Pause and alert you
       repeat                     - Restart from step 1
       stop                       - End behavior, return ship to IDLE (manual control)
