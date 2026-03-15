@@ -126,4 +126,31 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - Behaviors can raise alerts to wake the LLM (e.g., "cargo full, unable to find buyer").
 - LLM can acknowledge/clear alerts via `DELETE /api/alerts/{index}`.
 
-This design successfully separates the "Game Engine" (autonomous server tick loop) from the "Brain" (occasional LLM strategic intervention), making the system robust and scalable.
+**HQ Fleet Director (v1.4+):**
+- **Toggleable Autonomy:** `toggle_hq` tool enables/disables automated fleet management (in-memory flag, no persistence needed).
+- **DRY Strategy Engine:** `evaluate_fleet_strategy()` — Single source of truth for game phase, budget, and fleet scaling decisions.
+- **Four-Phase Progression:**
+  1. **BOOTSTRAP** (<2 traders): Get first Hauler, basic autotrade
+  2. **BUILDUP** (<3 traders): Buy second Hauler, saturate local market
+  3. **GATE CONSTRUCTION** (3+ traders, gate incomplete): Slow-mode gate funding (1/3 of haulers) + autotrade
+  4. **EXPANSION** (gate complete): Multi-system exploration, expand to 15 traders
+- **Smart Satellite Routing:** `_get_probe_plan()` three-tier priority:
+  1. Chart uncharted waypoints (triggers explore)
+  2. Refresh oldest markets (local scouting)
+  3. Jump to unexplored systems (Phase 4 only, when local markets <30min old)
+- **Shipyard Squatting:** When fleet can expand, satellites automatically park at cheapest shipyard until purchase completes.
+- **Improved Fleet Distribution:** `assign_idle_ships()` with reality checks:
+  - Only gate construction when gate exists AND needs materials AND excess > 150k
+  - Consistent hash assignment (same ships always do construction duty)
+  - Haulers default to autotrade when no construction work
+- **Adaptive Exploration:** `_step_explore()` now auto-jumps between systems:
+  - When system fully charted/scouted, checks jump gate for unexplored connections
+  - Automatically chains `goto GATE, jump WAYPOINT, explore` for continuous exploration
+  - Stops exploring only when all connected space is fully mapped
+
+**Advisor Status in Server State:**
+- `GET /api/state` now includes `"advisor"` field with current financial assessment.
+- Eliminates need for separate tool calls; atomic consistency across bot/CLI.
+- `play_cli.py` reads advisor from state instead of calling tool directly.
+
+This design successfully separates the "Game Engine" (autonomous server tick loop) from the "Brain" (occasional LLM strategic intervention), making the system robust and scalable. The HQ Director extends this by adding a third layer: **Autonomous Task Distribution** that intelligently assigns idle ships based on game phase, without requiring LLM intervention.
