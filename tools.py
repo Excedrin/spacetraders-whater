@@ -38,26 +38,108 @@ def set_alert_queue(q):
     _alert_queue = q
 
 
-MARKET_CACHE_FILE = Path("market_cache.json")
+WAYPOINT_CACHE_FILE = Path("waypoint_cache.json")
+MARKET_CACHE_FILE = WAYPOINT_CACHE_FILE  # Alias for existing code
 BEHAVIORS_FILE = Path("behaviors.json")
 log = logging.getLogger(__name__)
 
 
-def load_market_cache() -> dict:
-    if MARKET_CACHE_FILE.exists():
+def load_waypoint_cache() -> dict:
+    """Load unified waypoint cache, with automatic migration from old market_cache.json."""
+    if WAYPOINT_CACHE_FILE.exists():
         try:
-            return json.loads(MARKET_CACHE_FILE.read_text(encoding="utf-8"))
+            return json.loads(WAYPOINT_CACHE_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-    return {}
+
+    old_file = Path("market_cache.json")
+    if old_file.exists():
+        try:
+            data = json.loads(old_file.read_text(encoding="utf-8"))
+            WAYPOINT_CACHE_FILE.write_text(json.dumps(data, indent=2))
+            return data
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return {"_systems_fetched": []}
+
+
+# Alias for backwards compatibility with existing code
+load_market_cache = load_waypoint_cache
+
+
+def _save_cache(cache: dict):
+    """Persist unified waypoint cache to disk."""
+    WAYPOINT_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+def _ingest_waypoints(waypoints: list[dict]):
+    """Ingest raw API waypoint objects into the unified cache.
+
+    Merges all raw API data and determines traits like has_market, has_shipyard, is_charted.
+    """
+    cache = load_waypoint_cache()
+    modified = False
+    for wp in waypoints:
+        sym = wp.get("symbol")
+        if not sym:
+            continue
+        entry = cache.setdefault(sym, {})
+        entry.update(wp)  # Merge all raw API data
+
+        # Determine traits and flags
+        traits = [t.get("symbol", t) if isinstance(t, dict) else t for t in wp.get("traits", [])]
+        entry["is_charted"] = "UNCHARTED" not in traits or wp.get("chart") is not None
+        entry["has_market"] = "MARKETPLACE" in traits
+        entry["has_shipyard"] = "SHIPYARD" in traits
+        modified = True
+
+    if modified:
+        _save_cache(cache)
+
+
+def get_system_waypoints(system_symbol: str, waypoint_type: str = None, trait: str = None) -> list[dict]:
+    """Get waypoints for a system, using cache if fully fetched, else API.
+
+    On first call for a system, fetches all waypoints from API and caches them.
+    Subsequent calls return cached data without API calls.
+
+    Args:
+        system_symbol: The system to fetch waypoints for
+        waypoint_type: Optional filter by type (e.g., "JUMP_GATE", "ASTEROID")
+        trait: Optional filter by trait (e.g., "MARKETPLACE", "SHIPYARD")
+    """
+    cache = load_waypoint_cache()
+    fetched_systems = cache.setdefault("_systems_fetched", [])
+
+    if system_symbol not in fetched_systems:
+        wps = client.list_waypoints(system_symbol)
+        if isinstance(wps, list) and wps:
+            _ingest_waypoints(wps)
+            cache = load_waypoint_cache()  # Reload with new data
+            cache.setdefault("_systems_fetched", []).append(system_symbol)
+            _save_cache(cache)
+        else:
+            return []  # Handle error gracefully
+
+    # Return list from cache (exclude metadata)
+    result = [v for k, v in cache.items() if k != "_systems_fetched" and k.startswith(system_symbol + "-")]
+
+    # Apply filters if requested
+    if waypoint_type:
+        result = [w for w in result if w.get("type") == waypoint_type]
+    if trait:
+        result = [w for w in result if trait in [t.get("symbol", t) if isinstance(t, dict) else t for t in w.get("traits", [])]]
+
+    return result
 
 
 def _save_market_to_cache(waypoint_symbol: str, data: dict):
-    """Save market data to cache."""
+    """Save market data to cache. Uses unified _save_cache() helper."""
     import time
 
-    cache = load_market_cache()
-    entry = cache.get(waypoint_symbol, {})
+    cache = load_waypoint_cache()
+    entry = cache.setdefault(waypoint_symbol, {})
 
     # Structural data (imports/exports/exchange)
     # Handle API variations where items might be dicts or strings
@@ -74,6 +156,7 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     trait_symbols = [t.get("symbol") if isinstance(t, dict) else str(t) for t in traits]
     if "MARKETPLACE" in trait_symbols:
         entry["is_market"] = True  # Marker flag
+        entry["has_market"] = True  # Unified flag
 
     # Price data
     trade_goods = data.get("tradeGoods", [])
@@ -92,13 +175,13 @@ def _save_market_to_cache(waypoint_symbol: str, data: dict):
     # Save if we have any relevant data
     if entry:
         cache[waypoint_symbol] = entry
-        MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        _save_cache(cache)
 
 
 def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
-    """Save shipyard pricing data to cache."""
-    cache = load_market_cache()
-    entry = cache.get(waypoint_symbol, {})
+    """Save shipyard pricing data to cache. Uses unified _save_cache() helper."""
+    cache = load_waypoint_cache()
+    entry = cache.setdefault(waypoint_symbol, {})
 
     ships = data.get("ships", data.get("shipTypes", []))
     if ships:
@@ -118,7 +201,42 @@ def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
 
     if entry:
         cache[waypoint_symbol] = entry
-        MARKET_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        _save_cache(cache)
+
+
+# ──────────────────────────────────────────────
+#  Payload Interceptors (State Synchronization)
+# ──────────────────────────────────────────────
+
+
+def _get_local_ship(ship_symbol: str):
+    """Get ship from local tracker, eliminating GET /my/ships requests.
+
+    Checks FleetTracker first for instant state. Only falls back to API
+    if ship is not yet tracked.
+    """
+    if _fleet:
+        ship = _fleet.get_ship(ship_symbol)
+        if ship:
+            return ship
+
+    # Absolute fallback if ship is not in tracker
+    raw = client.get_ship(ship_symbol)
+    if isinstance(raw, dict) and "error" not in raw:
+        if _fleet:
+            _fleet.update_from_api([raw])
+        return _fleet.get_ship(ship_symbol)
+    raise Exception(f"Ship {ship_symbol} not found.")
+
+
+def _intercept(ship_symbol: str, data: dict):
+    """Pipes action payloads directly into the local fleet tracker.
+
+    Called after any action (dock, orbit, navigate, buy, sell, extract, etc.)
+    to update local state without polling the API.
+    """
+    if _fleet and isinstance(data, dict) and "error" not in data:
+        _fleet.update_ship_partial(ship_symbol, data)
 
 
 # ──────────────────────────────────────────────
@@ -130,20 +248,18 @@ def _save_shipyard_to_cache(waypoint_symbol: str, data: dict):
 
 def _ensure_orbit_logic(ship_symbol: str) -> None:
     """Raises Exception if fails."""
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
+    ship = _get_local_ship(ship_symbol)
 
-    status = ship.get("nav", {}).get("status", "")
-    if status == "IN_ORBIT":
+    if ship.nav_status == "IN_ORBIT":
         return
-    if status == "DOCKED":
-        result = client.orbit(ship_symbol)
-        if isinstance(result, dict) and "error" in result:
-            raise Exception(f"Could not orbit {ship_symbol}: {result['error']}")
-        return
-    if status == "IN_TRANSIT":
+    if ship.nav_status == "IN_TRANSIT":
         raise Exception(f"{ship_symbol} is currently in transit")
+
+    result = client.orbit(ship_symbol)
+    if isinstance(result, dict) and "error" in result:
+        raise Exception(f"Could not orbit {ship_symbol}: {result['error']}")
+
+    _intercept(ship_symbol, result)
 
 
 class PriceFloorHit(Exception):
@@ -189,20 +305,18 @@ class MinQtyNotMet(Exception):
 
 def _ensure_dock_logic(ship_symbol: str) -> None:
     """Raises Exception if fails."""
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        raise Exception(f"Ship {ship_symbol} not found: {ship['error']}")
+    ship = _get_local_ship(ship_symbol)
 
-    status = ship.get("nav", {}).get("status", "")
-    if status == "DOCKED":
+    if ship.nav_status == "DOCKED":
         return
-    if status == "IN_ORBIT":
-        result = client.dock(ship_symbol)
-        if isinstance(result, dict) and "error" in result:
-            raise Exception(f"Could not dock {ship_symbol}: {result['error']}")
-        return
-    if status == "IN_TRANSIT":
+    if ship.nav_status == "IN_TRANSIT":
         raise Exception(f"{ship_symbol} is currently in transit")
+
+    result = client.dock(ship_symbol)
+    if isinstance(result, dict) and "error" in result:
+        raise Exception(f"Could not dock {ship_symbol}: {result['error']}")
+
+    _intercept(ship_symbol, result)
 
 
 def _parse_arrival(nav: dict) -> float:
@@ -261,6 +375,8 @@ def get_financial_assessment(system_symbol: str = None) -> str:
 
     if system_symbol:
         for wp, data in cache.items():
+            if not isinstance(data, dict):
+                continue
             if wp.startswith(system_symbol) and "ships" in data:
                 for s in data["ships"]:
                     if s["type"] in [
@@ -469,7 +585,7 @@ def _navigate_ship_logic(
 
     if is_inter_system:
         # Get Local Jump Gate
-        local_jgs = client.list_waypoints(current_sys, type="JUMP_GATE")
+        local_jgs = get_system_waypoints(current_sys, waypoint_type="JUMP_GATE")
         if not local_jgs or (isinstance(local_jgs, dict) and "error" in local_jgs):
             raise Exception(f"No Jump Gate found in current system {current_sys}.")
 
@@ -482,7 +598,7 @@ def _navigate_ship_logic(
             lines = [f"Inter-System Route Plan: {current_wp} -> {destination_symbol}"]
 
             # Leg 1: Distance to local gate
-            local_wps = client.list_waypoints(current_sys)
+            local_wps = get_system_waypoints(current_sys)
             origin_obj = next((w for w in local_wps if w["symbol"] == current_wp), None)
             local_jg_obj = next(
                 (w for w in local_wps if w["symbol"] == local_jg_sym), None
@@ -571,6 +687,7 @@ def _navigate_ship_logic(
 
             # Execute jump
             jump_res = client.jump(ship_symbol, next_jump_target)
+            _intercept(ship_symbol, jump_res)
             if isinstance(jump_res, dict) and "error" in jump_res:
                 raise Exception(
                     f"Jump to {next_jump_target} failed: {jump_res['error']}"
@@ -589,7 +706,7 @@ def _navigate_ship_logic(
             )
 
     # Fetch Waypoints to validate target exists and calculate stats
-    waypoints = client.list_waypoints(current_sys)
+    waypoints = get_system_waypoints(current_sys)
     if isinstance(waypoints, dict) and "error" in waypoints:
         raise Exception(waypoints["error"])
 
@@ -666,6 +783,7 @@ def _navigate_ship_logic(
             client.set_flight_mode(ship_symbol, mode)
 
         data = client.navigate(ship_symbol, next_hop)
+        _intercept(ship_symbol, data)
         if isinstance(data, dict) and "error" in data:
             raise Exception(f"Error navigating: {data['error']}")
 
@@ -753,6 +871,7 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
 
     _ensure_orbit_logic(ship_symbol)
     data = client.extract(ship_symbol)
+    _intercept(ship_symbol, data)
     print(data)
 
     if isinstance(data, dict) and "error" in data:
@@ -803,20 +922,12 @@ def _sell_cargo_logic(
                 f"{trade_symbol} is required by an active contract. Use force=True to override."
             )
 
-    # 2. Get ship location and cargo state
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        raise Exception(f"Error fetching ship: {ship['error']}")
-    waypoint = ship.get("nav", {}).get("waypointSymbol")
+    # 2. Get ship state from local tracker (0 API calls)
+    ship = _get_local_ship(ship_symbol)
+    waypoint = ship.location
 
-    cargo_data = client.get_cargo(ship_symbol)
-    if isinstance(cargo_data, dict) and "error" in cargo_data:
-        raise Exception(f"Error checking cargo: {cargo_data['error']}")
-
-    inventory = cargo_data.get("inventory", [])
-    capacity = cargo_data.get("capacity", 0)
     available = 0
-    for item in inventory:
+    for item in ship.cargo_inventory:
         if item.get("symbol") == trade_symbol:
             available = item.get("units", 0)
             break
@@ -829,9 +940,9 @@ def _sell_cargo_logic(
     # 3. Look up max transaction volume from market cache
     max_per_transaction = target_units
     if waypoint:
-        market_cache = load_market_cache()
-        if waypoint in market_cache:
-            for good in market_cache[waypoint].get("trade_goods", []):
+        cache = load_waypoint_cache()
+        if waypoint in cache:
+            for good in cache[waypoint].get("trade_goods", []):
                 if good.get("symbol") == trade_symbol:
                     vol = good.get("tradeVolume")
                     if vol and vol > 0:
@@ -843,14 +954,13 @@ def _sell_cargo_logic(
     total_sold = 0
     total_revenue = 0
     sell_count = 0
-
-    # Track the previous price to predict the curve
     previous_price_per_unit = None
 
     while total_sold < target_units:
         units_to_sell = min(max_per_transaction, target_units - total_sold)
 
         data = client.sell_cargo(ship_symbol, trade_symbol, units_to_sell)
+        _intercept(ship_symbol, data)
         if isinstance(data, dict) and "error" in data:
             if sell_count == 0:
                 raise Exception(data["error"])
@@ -858,45 +968,32 @@ def _sell_cargo_logic(
 
         tx = data.get("transaction", {})
         units_sold = tx.get("units", units_to_sell)
-        price_per_unit = tx.get("pricePerUnit", 0)  # The TRUE marginal price!
+        price_per_unit = tx.get("pricePerUnit", 0)
 
         total_sold += units_sold
         total_revenue += tx.get("totalPrice", 0)
         sell_count += 1
 
-        # Fix the log! Now it prints the true marginal price, not the cumulative average
-        print(
-            f"sold: {units_sold} {trade_symbol} for {price_per_unit} total {total_revenue}"
-        )
-
         # 1. Did the price drop below our floor on THIS transaction?
         if min_price and price_per_unit < min_price:
             break
 
-        # 2. The 23% Curve Prediction!
+        # 2. The 1.25x Curve Prediction!
         if min_price and previous_price_per_unit is not None:
-            # Calculate how much the price plummeted on this exact batch
             price_delta = previous_price_per_unit - price_per_unit
-
-            # Predict the NEXT drop (using 1.25x to be safe)
             predicted_next_delta = price_delta * 1.25
             predicted_next_price = price_per_unit - predicted_next_delta
 
-            # If the predicted next price drops below our margin, abort before the loop repeats
             if predicted_next_price < min_price:
-                print(
-                    f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) falls below min_price of {min_price}."
-                )
                 break
 
-        # Save the current price for the next loop's calculation
         previous_price_per_unit = price_per_unit
 
     cargo = data.get("cargo", {})
     if sell_count > 1:
-        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr ({sell_count} transactions). Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
+        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr ({sell_count} transactions). Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
     else:
-        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity', capacity)}."
+        return f"Sold {total_sold} {trade_symbol} for {total_revenue} cr. Cargo: {cargo.get('units')}/{cargo.get('capacity')}."
 
 
 def _buy_cargo_logic(
@@ -909,22 +1006,16 @@ def _buy_cargo_logic(
     """Buy cargo from the current market. Splits purchases across multiple transactions if needed.
 
     Respects cargo capacity, credits available, market transaction limits, and optional price/quantity guards.
+    Uses local FleetTracker state to avoid GET /my/ships calls.
     """
-    # Get ship location and initial cargo state
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        raise Exception(f"Error fetching ship: {ship['error']}")
-
-    waypoint = ship.get("nav", {}).get("waypointSymbol")
+    # Get ship state from local tracker (0 API calls)
+    ship = _get_local_ship(ship_symbol)
+    waypoint = ship.location
     if not waypoint:
         raise Exception(f"Cannot determine ship location")
 
-    cargo_data = client.get_cargo(ship_symbol)
-    if isinstance(cargo_data, dict) and "error" in cargo_data:
-        raise Exception(f"Error checking cargo: {cargo_data['error']}")
-
-    capacity = cargo_data.get("capacity", 0)
-    current_units = cargo_data.get("units", 0)
+    capacity = ship.cargo_capacity
+    current_units = ship.cargo_units
     available_space = capacity - current_units
 
     if available_space <= 0:
@@ -936,11 +1027,11 @@ def _buy_cargo_logic(
     target_units = available_space if units is None else min(units, available_space)
 
     # Look up cached price + trade volume for this good
-    market_cache = load_market_cache()
+    cache = load_waypoint_cache()
     max_per_transaction = target_units  # Default: try to buy full amount
     cached_price = None
-    if waypoint in market_cache:
-        for good in market_cache[waypoint].get("trade_goods", []):
+    if waypoint in cache:
+        for good in cache[waypoint].get("trade_goods", []):
             if good.get("symbol") == trade_symbol:
                 vol = good.get("tradeVolume")
                 if vol and vol > 0:
@@ -974,17 +1065,12 @@ def _buy_cargo_logic(
     total_cost = 0
     purchase_count = 0
     stop_reason = ""
-
-    # Track the previous price to predict the curve
     previous_price_per_unit = None
 
     while total_purchased < target_units:
-        # Refresh cargo to check current space
-        cargo_data = client.get_cargo(ship_symbol)
-        if isinstance(cargo_data, dict) and "error" in cargo_data:
-            break
-        current_units = cargo_data.get("units", 0)
-        available_space = capacity - current_units
+        # Refresh local ship state implicitly via the interceptor!
+        # The loop will see the updated cargo from the previous purchase.
+        available_space = ship.cargo_capacity - ship.cargo_units
 
         if available_space <= 0:
             break  # Cargo full
@@ -994,6 +1080,7 @@ def _buy_cargo_logic(
         )
 
         data = client.buy_cargo(ship_symbol, trade_symbol, units_to_buy)
+        _intercept(ship_symbol, data)
 
         if isinstance(data, dict) and "error" in data:
             if purchase_count == 0:
@@ -1009,33 +1096,21 @@ def _buy_cargo_logic(
         total_cost += tx.get("totalPrice", 0)
         purchase_count += 1
 
-        print(
-            f"purchased: {units_bought} {trade_symbol} for {price_per_unit} total {total_cost}"
-        )
-
         # 1. Did we accidentally overpay on THIS transaction?
         if max_price and price_per_unit > max_price:
             stop_reason = f"Max price exceeded ({price_per_unit} > {max_price})"
             break
 
-        # 2. The 23% Curve Prediction!
+        # 2. The 1.25x Curve Prediction!
         if max_price and previous_price_per_unit is not None:
-            # Calculate how much the price jumped on this exact batch
             price_delta = price_per_unit - previous_price_per_unit
-
-            # Predict the NEXT jump (using 1.25x to be safe)
             predicted_next_delta = price_delta * 1.25
             predicted_next_price = price_per_unit + predicted_next_delta
 
-            # If the predicted next price breaks our margin, abort before the loop repeats
             if predicted_next_price > max_price:
-                print(
-                    f"  ↳ Stopping: Predicted next price (~{int(predicted_next_price)} cr) exceeds max_price of {max_price}."
-                )
                 stop_reason = "Predicted to exceed max price"
                 break
 
-        # Save the current price for the next loop's calculation
         previous_price_per_unit = price_per_unit
 
     # Check minimum quantity requirement
@@ -1046,18 +1121,8 @@ def _buy_cargo_logic(
         )
         raise MinQtyNotMet(trade_symbol, total_purchased, min_qty, reason)
 
-    # Get final cargo state
-    cargo_data = client.get_cargo(ship_symbol)
-    final_cargo = (
-        cargo_data.get("units", 0)
-        if isinstance(cargo_data, dict) and "error" not in cargo_data
-        else "?"
-    )
-
-    if purchase_count > 1:
-        return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr ({purchase_count} transactions). Cargo: {final_cargo}/{capacity}."
-    else:
-        return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr. Cargo: {final_cargo}/{capacity}."
+    # Final cargo state comes from local tracker (updated by interceptor)
+    return f"Purchased {total_purchased} {trade_symbol} for {total_cost} cr. Cargo: {ship.cargo_units}/{ship.cargo_capacity}."
 
 
 def _deliver_contract_logic(
@@ -1143,6 +1208,7 @@ def _deliver_contract_logic(
 def _refuel_ship_logic(ship_symbol: str) -> str:
     _ensure_dock_logic(ship_symbol)
     data = client.refuel(ship_symbol)
+    _intercept(ship_symbol, data)
     if isinstance(data, dict) and "error" in data:
         raise Exception(data["error"])
 
@@ -1264,21 +1330,41 @@ class Step:
 
 
 def _refresh_waypoint_data(waypoint: str) -> None:
-    """Fetch live market AND shipyard data for a waypoint and update the cache. Silent on error."""
+    """Fetch live market AND shipyard data for a waypoint, checking traits first. Silent on error."""
     system = "-".join(waypoint.split("-")[:2])
-    try:
-        data = client.get_market(system, waypoint)
-        if data and isinstance(data, dict) and "error" not in data:
-            _save_market_to_cache(waypoint, data)
-    except Exception:
-        pass
+    cache = load_waypoint_cache()
+    entry = cache.get(waypoint)
 
-    try:
-        data = client.get_shipyard(system, waypoint)
-        if data and isinstance(data, dict) and "error" not in data:
-            _save_shipyard_to_cache(waypoint, data)
-    except Exception:
-        pass
+    # 1. If we don't know the traits, fetch the single waypoint first
+    if not entry or "traits" not in entry:
+        try:
+            wp_data = client.get_waypoint(system, waypoint)
+            if wp_data and isinstance(wp_data, dict) and "error" not in wp_data:
+                _ingest_waypoints([wp_data])
+                cache = load_waypoint_cache()
+                entry = cache.get(waypoint, {})
+            else:
+                return  # Can't resolve waypoint
+        except Exception:
+            return
+
+    # 2. Only fetch market if we know it has one
+    if entry.get("has_market"):
+        try:
+            data = client.get_market(system, waypoint)
+            if data and isinstance(data, dict) and "error" not in data:
+                _save_market_to_cache(waypoint, data)
+        except Exception:
+            pass
+
+    # 3. Only fetch shipyard if we know it has one
+    if entry.get("has_shipyard"):
+        try:
+            data = client.get_shipyard(system, waypoint)
+            if data and isinstance(data, dict) and "error" not in data:
+                _save_shipyard_to_cache(waypoint, data)
+        except Exception:
+            pass
 
 
 def parse_steps(steps_str: str) -> list[Step]:
@@ -1333,6 +1419,8 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     sinks = {}  # good -> [(market_wp, sell_revenue, volume)]
 
     for wp, mdata in cache.items():
+        if not isinstance(mdata, dict):
+            continue
         trade_goods = mdata.get("trade_goods")
         if not trade_goods:
             continue
@@ -1371,7 +1459,7 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
             nav = ship.get("nav", {})
             ship_wp = nav.get("waypointSymbol", "")
             system_symbol = nav.get("systemSymbol", "")
-            waypoints = client.list_waypoints(system_symbol)
+            waypoints = get_system_waypoints(system_symbol)
             if isinstance(waypoints, list):
                 for wp in waypoints:
                     wp_coords[wp["symbol"]] = (wp.get("x", 0), wp.get("y", 0))
@@ -1942,7 +2030,34 @@ class BehaviorEngine:
     def _step_chart(self, cfg, step, ship, fleet) -> Optional[str]:
         if not ship.location:
             raise Exception("No location")
-        _ = client.chart(cfg.ship_symbol)
+
+        # 1. Check unified cache to prevent double-charting
+        cache = load_waypoint_cache()
+        entry = cache.get(ship.location, {})
+
+        if entry.get("is_charted"):
+            self._advance(cfg)
+            return None
+
+        # 2. Call API
+        result = client.chart(cfg.ship_symbol)
+
+        # 3. Handle errors (specifically 4230: Already Charted)
+        if isinstance(result, dict) and "error" in result:
+            err = result.get("error")
+            if "already charted" in str(err).lower() or (isinstance(err, dict) and err.get("code") == 4230):
+                if ship.location in cache:
+                    cache[ship.location]["is_charted"] = True
+                    _save_cache(cache)
+                self._advance(cfg)
+                return None
+            raise Exception(f"Chart error: {err}")
+
+        # 4. Success - Ingest the newly charted waypoint data
+        wp_data = result.get("waypoint")
+        if wp_data:
+            _ingest_waypoints([wp_data])
+
         self._advance(cfg)
         return None
 
@@ -2037,7 +2152,7 @@ class BehaviorEngine:
             raise Exception("Ship has no known location.")
 
         sys_sym = ship.location.rsplit("-", 1)[0]
-        wps = client.list_waypoints(sys_sym)
+        wps = get_system_waypoints(sys_sym)
         if isinstance(wps, dict) and "error" in wps:
             raise Exception(wps["error"])
 
@@ -2082,7 +2197,7 @@ class BehaviorEngine:
         sys_sym = ship.location.rsplit("-", 1)[0]
 
         # 1. Find Jump Gate
-        wps = client.list_waypoints(sys_sym, type="JUMP_GATE")
+        wps = get_system_waypoints(sys_sym, waypoint_type="JUMP_GATE")
         if not wps:
             cfg.paused = True
             cfg.alert_sent = True
@@ -2583,7 +2698,7 @@ def find_waypoints(
         candidates = []
 
         # We need waypoint coordinates for the whole system to calculate distance
-        all_wps = client.list_waypoints(system_symbol)
+        all_wps = get_system_waypoints(system_symbol)
         wp_lut = (
             {w["symbol"]: (w["x"], w["y"]) for w in all_wps}
             if isinstance(all_wps, list)
@@ -2591,6 +2706,8 @@ def find_waypoints(
         )
 
         for wp_sym, mdata in cache.items():
+            if not isinstance(mdata, dict):
+                continue
             # Check if this market is in the target system
             if not wp_sym.startswith(system_symbol):
                 continue
@@ -2651,11 +2768,11 @@ def find_waypoints(
     if trait:
         params["traits"] = trait
 
-    data = client.list_waypoints(system_symbol, **params)
+    data = get_system_waypoints(system_symbol, waypoint_type=params.get("type"), trait=params.get("trait"))
 
     # Special case: ASTEROID should also fetch ENGINEERED_ASTEROID
     if waypoint_type == "ASTEROID" and isinstance(data, list):
-        eng = client.list_waypoints(system_symbol, type="ENGINEERED_ASTEROID")
+        eng = get_system_waypoints(system_symbol, waypoint_type="ENGINEERED_ASTEROID")
         if isinstance(eng, list):
             data.extend(eng)
 
@@ -2774,7 +2891,7 @@ def _find_waypoints_logic(
     # Note: If looking for just trade_symbol, we still need coords for distance,
     # but we might optimize by only fetching if ref_coords are present.
     # For safety/consistency, we fetch system waypoints.
-    all_wps = client.list_waypoints(system_symbol)
+    all_wps = get_system_waypoints(system_symbol)
     if isinstance(all_wps, dict) and "error" in all_wps:
         return []  # Or raise error
 
@@ -2785,6 +2902,8 @@ def _find_waypoints_logic(
         cache = load_market_cache()
 
         for wp_sym, mdata in cache.items():
+            if not isinstance(mdata, dict):
+                continue
             if not wp_sym.startswith(system_symbol):
                 continue
 
@@ -2999,7 +3118,7 @@ def scan_system(
         system_symbol = f"{parts[0]}-{parts[1]}"
 
     # Get all waypoints in the system
-    waypoints = client.list_waypoints(system_symbol)
+    waypoints = get_system_waypoints(system_symbol)
     if isinstance(waypoints, dict) and "error" in waypoints:
         return f"Error: {waypoints['error']}"
     if not waypoints:
@@ -3426,7 +3545,7 @@ def navigate_ship(
 
         # Fetch route details without executing to check distance/hops
         # We assume standard CRUISE for calculation if mode not specified
-        waypoints = client.list_waypoints(nav.get("systemSymbol"))
+        waypoints = get_system_waypoints(nav.get("systemSymbol"))
         origin_obj = next((w for w in waypoints if w["symbol"] == current_wp), None)
         target_obj = next(
             (w for w in waypoints if w["symbol"] == destination_symbol), None
@@ -3548,13 +3667,15 @@ def jettison_cargo(
                 f"Call jettison_cargo with force=True to jettison anyway."
             )
 
-    safe_units = None
-    cargo_data = client.get_cargo(ship_symbol)
-    if isinstance(cargo_data, dict) and "error" in cargo_data:
-        return f"Error checking cargo for {ship_symbol}: {cargo_data['error']}"
+    # Use local tracker to check inventory (0 API calls)
+    try:
+        ship = _get_local_ship(ship_symbol)
+    except Exception as e:
+        return f"Error: {e}"
 
-    inventory = cargo_data.get("inventory", [])
+    inventory = ship.cargo_inventory
     available = 0
+
     for item in inventory:
         if item.get("symbol") == trade_symbol:
             available = item.get("units", 0)
@@ -3563,12 +3684,10 @@ def jettison_cargo(
     if available == 0:
         return f"Error: Ship {ship_symbol} has no {trade_symbol} available."
 
-    if units is None:
-        safe_units = available
-    else:
-        safe_units = min(units, available)
+    safe_units = available if units is None else min(units, available)
 
     data = client.jettison(ship_symbol, trade_symbol, safe_units)
+    _intercept(ship_symbol, data)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
 

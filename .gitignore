@@ -8,3 +8,8 @@ session_state.json
 story.jsonl
 plan.txt
 __pycache__
+.claude/*
+system-prompts
+GEMINI_PROMPT.md
+*.json
+repomix*

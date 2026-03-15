@@ -330,6 +330,10 @@ class SpaceTradersClient:
         """List waypoints with automatic pagination to get ALL results."""
         return self._paginate_request(f"/systems/{system}/waypoints", **params)
 
+    def get_waypoint(self, system: str, waypoint: str) -> dict:
+        """Fetch a specific waypoint to check traits and chart status."""
+        return self._request("GET", f"/systems/{system}/waypoints/{waypoint}")
+
     def get_shipyard(self, system: str, waypoint: str) -> dict:
         return self._request("GET", f"/systems/{system}/waypoints/{waypoint}/shipyard")
 

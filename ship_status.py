@@ -26,6 +26,8 @@ class ShipStatus:
     fuel_capacity: int = 0
     cargo_units: int = 0
     cargo_capacity: int = 0
+    cargo_inventory: list = field(default_factory=list)  # List of {symbol, units}
+    engine_speed: int = 30  # Ship engine speed for travel calculations
 
     # Cooldown/transit tracking
     available_at: float = 0.0  # Unix timestamp when ship becomes available
@@ -93,6 +95,8 @@ class FleetTracker:
                         fuel_capacity=ship_data.get("fuel_capacity", 0),
                         cargo_units=ship_data.get("cargo_units", 0),
                         cargo_capacity=ship_data.get("cargo_capacity", 0),
+                        cargo_inventory=ship_data.get("cargo_inventory", []),
+                        engine_speed=ship_data.get("engine_speed", 30),
                         available_at=ship_data.get("available_at", 0.0),
                         busy_reason=ship_data.get("busy_reason", ""),
                     )
@@ -118,6 +122,8 @@ class FleetTracker:
                     "fuel_capacity": s.fuel_capacity,
                     "cargo_units": s.cargo_units,
                     "cargo_capacity": s.cargo_capacity,
+                    "cargo_inventory": s.cargo_inventory,
+                    "engine_speed": s.engine_speed,
                     "available_at": s.available_at,
                     "busy_reason": s.busy_reason,
                 }
@@ -138,6 +144,7 @@ class FleetTracker:
             fuel = ship_data.get("fuel", {})
             cargo = ship_data.get("cargo", {})
             reg = ship_data.get("registration", {})
+            engine = ship_data.get("engine", {})
 
             if symbol in self.ships:
                 ship = self.ships[symbol]
@@ -152,6 +159,8 @@ class FleetTracker:
             ship.fuel_capacity = fuel.get("capacity", 0)
             ship.cargo_units = cargo.get("units", 0)
             ship.cargo_capacity = cargo.get("capacity", 0)
+            ship.cargo_inventory = cargo.get("inventory", [])
+            ship.engine_speed = engine.get("speed", 30)
 
             # Check if ship is in transit
             if ship.nav_status == "IN_TRANSIT":
@@ -169,6 +178,36 @@ class FleetTracker:
                             ship.set_cooldown(remaining, "in_transit")
                     except ValueError:
                         pass
+
+        self.persist()
+
+    def update_ship_partial(self, symbol: str, data: dict):
+        """Intercepts action payloads to keep local state perfectly synced.
+
+        Pipes data from dock, orbit, navigate, buy, sell, extract, etc. directly
+        into the tracker without needing GET /my/ships/{symbol} calls.
+        """
+        self._check_reload()
+        if symbol not in self.ships:
+            return  # Skip if we don't track this ship yet
+
+        ship = self.ships[symbol]
+
+        if "nav" in data:
+            ship.location = data["nav"].get("waypointSymbol", ship.location)
+            ship.nav_status = data["nav"].get("status", ship.nav_status)
+        if "fuel" in data:
+            ship.fuel_current = data["fuel"].get("current", ship.fuel_current)
+            ship.fuel_capacity = data["fuel"].get("capacity", ship.fuel_capacity)
+        if "cargo" in data:
+            ship.cargo_units = data["cargo"].get("units", ship.cargo_units)
+            ship.cargo_capacity = data["cargo"].get("capacity", ship.cargo_capacity)
+            if "inventory" in data["cargo"]:
+                ship.cargo_inventory = data["cargo"]["inventory"]
+        if "cooldown" in data:
+            cd = data["cooldown"].get("remainingSeconds", 0)
+            if cd > 0:
+                ship.set_cooldown(cd, "api_cooldown")
 
         self.persist()
 
