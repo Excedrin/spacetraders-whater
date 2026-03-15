@@ -38,6 +38,19 @@ def set_alert_queue(q):
     _alert_queue = q
 
 
+# HQ Director Toggle
+_hq_enabled = False
+
+
+def set_hq_enabled(enabled: bool):
+    global _hq_enabled
+    _hq_enabled = enabled
+
+
+def get_hq_enabled() -> bool:
+    return _hq_enabled
+
+
 WAYPOINT_CACHE_FILE = Path("waypoint_cache.json")
 MARKET_CACHE_FILE = WAYPOINT_CACHE_FILE  # Alias for existing code
 BEHAVIORS_FILE = Path("behaviors.json")
@@ -341,70 +354,127 @@ def _get_contract_goods() -> set[str]:
     return goods
 
 
-def get_financial_assessment(system_symbol: str = None) -> str:
-    """Calculates fleet budget requirements and recommends expansion/construction."""
+def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
+    """Core logic for game phase, budget, and fleet needs. Single source of truth."""
     agent = client.get_agent()
-    if isinstance(agent, dict) and "error" in agent:
-        return "Unable to fetch financial data."
+    credits = agent.get("credits", 0) if isinstance(agent, dict) and "error" not in agent else 0
 
-    credits = agent.get("credits", 0)
     ships = client.list_ships()
     if isinstance(ships, dict) and "error" in ships:
         ships = []
 
+    total_ships = len(ships)
     trader_count = sum(
-        1
-        for s in ships
+        1 for s in ships
         if s.get("registration", {}).get("role") in ["COMMAND", "HAULER", "FREIGHTER"]
     )
 
-    # Assume ~100k reserve per active trading ship to afford full cargo holds of expensive goods
-    reserve_needed = max(trader_count * 100000, 100000)
+    reserve_needed = max(trader_count * 200000, 200000)
     excess = credits - reserve_needed
 
-    lines = [
-        f"Current Credits: {credits:,} cr",
-        f"Recommended Reserve: {reserve_needed:,} cr ({trader_count} traders)",
-        f"Excess Capital: {excess:,} cr",
-    ]
+    search_sys = system_symbol
+    if not search_sys and ships:
+        search_sys = ships[0].get("nav", {}).get("systemSymbol")
 
-    # Find cheapest hauler in the system
+    # --- NEW: Check Jump Gate Status ---
+    gate_built = False
+    if search_sys:
+        jgs = get_system_waypoints(search_sys, waypoint_type="JUMP_GATE")
+        if jgs:
+            jg_sym = jgs[0]["symbol"]
+            const = client.get_construction(search_sys, jg_sym)
+            if isinstance(const, dict) and "error" not in const:
+                gate_built = const.get("isComplete", False)
+
+    # --- UPDATED: Phase Logic ---
+    if trader_count < 2:
+        phase = 1
+        phase_name = "PHASE 1: BOOTSTRAP (Goal: Accumulate credits for first Hauler)"
+    elif trader_count < 3:
+        phase = 2
+        phase_name = "PHASE 2: BUILDUP (Goal: Buy second Hauler to maximize local trade)"
+    elif not gate_built:
+        phase = 3
+        phase_name = "PHASE 3: GATE CONSTRUCTION (Goal: Slowly fund and supply jump gate materials)"
+    else:
+        phase = 4
+        phase_name = "PHASE 4: EXPANSION (Goal: Chart new systems, build massive fleet)"
+
+    # Shipyard Info
     cache = load_market_cache()
-    hauler_price = 300000  # baseline guess
+    hauler_price = 300000
     cheapest_shipyard = "Unknown"
 
-    if system_symbol:
+    if search_sys:
         for wp, data in cache.items():
             if not isinstance(data, dict):
                 continue
-            if wp.startswith(system_symbol) and "ships" in data:
+            if wp.startswith(search_sys) and "ships" in data:
                 for s in data["ships"]:
-                    if s["type"] in [
-                        "SHIP_LIGHT_HAULER",
-                        "SHIP_HEAVY_FREIGHTER",
-                        "SHIP_COMMAND_FRIGATE",
-                    ]:
+                    if s["type"] in ["SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_COMMAND_FRIGATE"]:
                         if s.get("purchasePrice", float("inf")) < hauler_price:
                             hauler_price = s["purchasePrice"]
                             cheapest_shipyard = wp
 
-    lines.append("")
-    if excess > hauler_price:
+    ship_at_shipyard = False
+    if cheapest_shipyard != "Unknown":
+        ship_at_shipyard = any(s.get("nav", {}).get("waypointSymbol") == cheapest_shipyard for s in ships)
+
+    # --- UPDATED: Allow fleet expansion post-gate ---
+    # Max 3 traders before gate, max 15 traders after gate.
+    max_traders = 15 if gate_built else 3
+    can_buy_ship = excess > hauler_price and trader_count < max_traders
+
+    return {
+        "phase": phase,
+        "phase_name": phase_name,
+        "credits": credits,
+        "reserve_needed": reserve_needed,
+        "excess": excess,
+        "trader_count": trader_count,
+        "hauler_price": hauler_price,
+        "cheapest_shipyard": cheapest_shipyard,
+        "ship_at_shipyard": ship_at_shipyard,
+        "can_buy_ship": can_buy_ship,
+    }
+
+
+def get_financial_assessment(system_symbol: str = None) -> str:
+    """Calculates fleet budget requirements and recommends expansion/construction using the DRY strategy engine."""
+    strat = evaluate_fleet_strategy(system_symbol)
+
+    lines = [
+        f"=== FLEET STRATEGY ===",
+        f"{strat['phase_name']}",
+        f"Current Credits: {strat['credits']:,} cr",
+        f"Recommended Reserve: {strat['reserve_needed']:,} cr ({strat['trader_count']} traders)",
+        f"Excess Capital: {strat['excess']:,} cr",
+        ""
+    ]
+
+    if strat['excess'] > 3_000_000:
+        lines.append(f"🟣 MASSIVE WEALTH: You have >3M credits. Focus entirely on Jump Gate construction.")
+    elif strat['can_buy_ship']:
         lines.append(
-            f"🟢 EXPANSION READY: You have enough excess capital to buy a Hauler (~{hauler_price:,} cr at {cheapest_shipyard})."
+            f"🟢 EXPANSION READY: You have enough excess capital to buy a Hauler (~{strat['hauler_price']:,} cr at {strat['cheapest_shipyard']})."
         )
-    elif excess > 50000:
+        if not strat['ship_at_shipyard']:
+            lines.append(f"   ⚠️ ACTION REQUIRED: Send a ship to {strat['cheapest_shipyard']} to make the purchase.")
+    elif strat['excess'] > 0 and strat['trader_count'] >= 3:
         lines.append(
-            "🟡 CONSTRUCTION READY: You have excess capital. Safe to run 'assign_jump_gate_construction'."
+            f"🔵 FLEET CAPPED: Local market is saturated ({strat['trader_count']} traders). Excess funds will auto-route to Jump Gate Construction."
         )
-    elif excess > 0:
+    elif strat['excess'] > 0:
         lines.append(
-            "🟠 STABLE: Capital is stable, but keep saving before major purchases."
+            f"🟡 ACCUMULATING: Keep trading. Next goal: Hauler (~{strat['hauler_price']:,} cr)."
         )
     else:
         lines.append(
-            "🔴 LOW CAPITAL: Do not buy ships or construction materials! Focus on autotrade/mining to build reserve."
+            f"🔴 LOW CAPITAL: Do not buy ships or materials! Focus on autotrade to build reserve."
         )
+
+    hq_status = "ENABLED" if get_hq_enabled() else "DISABLED"
+    lines.append(f"\n[HQ Fleet Director: {hq_status}]")
 
     return "\n".join(lines)
 
@@ -1537,6 +1607,122 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     return routes
 
 
+def _get_probe_plan(ship_location: str, phase: int) -> str:
+    """Determines if a probe should chart local waypoints, refresh market prices, or jump to a new system."""
+    import time
+    system = ship_location.rsplit("-", 1)[0]
+    cache = load_waypoint_cache()
+
+    system_wps = [v for k, v in cache.items() if k.startswith(system + "-") and isinstance(v, dict)]
+
+    # Priority 1: Charting
+    # If we know of waypoints in this system that aren't charted, explore them!
+    uncharted = [wp for wp in system_wps if not wp.get("is_charted")]
+    if uncharted:
+        return "explore"
+
+    # Priority 2: Market Refresh
+    now = time.time()
+    markets = []
+    for wp in system_wps:
+        if wp.get("has_market"):
+            age = now - wp.get("last_updated", 0)
+
+            # Calculate distance to prioritize nearby markets
+            sx, sy = cache.get(ship_location, {}).get("x", 0), cache.get(ship_location, {}).get("y", 0)
+            wx, wy = wp.get("x", 0), wp.get("y", 0)
+            dist = max(1.0, math.sqrt((wx - sx)**2 + (wy - sy)**2))
+
+            score = (age + 60) / dist
+            markets.append((score, wp["symbol"], age))
+
+    if markets:
+        markets.sort(key=lambda x: x[0], reverse=True)
+        best_score, target_wp, oldest_age = markets[0]
+
+        # Priority 3: Inter-System Expansion
+        # If the oldest market is reasonably fresh (< 30 mins) and we are in Phase 4, leave the system!
+        if phase >= 4 and oldest_age < 1800:
+            return "explore"  # _step_explore will now handle jumping through the gate
+
+        return f"goto {target_wp}, scout, stop"
+
+    # Failsafe
+    return "explore"
+
+
+def assign_idle_ships(fleet, engine):
+    """The HQ Fleet Director. Automatically gives IDLE ships their next task."""
+    if not get_hq_enabled():
+        return
+
+    idle_ships = engine.get_idle_ships(fleet)
+    if not idle_ships:
+        return
+
+    strat = evaluate_fleet_strategy()
+
+    # Get available Jump Gate info for Phase 3
+    needs_gate_materials = False
+    if strat["phase"] == 3:
+        ships_data = client.list_ships()
+        if isinstance(ships_data, list) and ships_data:
+            sys_sym = ships_data[0]["nav"]["systemSymbol"]
+            jgs = get_system_waypoints(sys_sym, waypoint_type="JUMP_GATE")
+            if jgs:
+                jg_sym = jgs[0]["symbol"]
+                const = client.get_construction(sys_sym, jg_sym)
+                if isinstance(const, dict) and "error" not in const and not const.get("isComplete"):
+                    needs_gate_materials = True
+
+    for ship_symbol in idle_ships:
+        ship_status = fleet.get_ship(ship_symbol)
+        if not ship_status or not ship_status.is_available():
+            continue
+
+        role = ship_status.role
+
+        # --- PROBES & SATELLITES ---
+        if role == "SATELLITE":
+            # Priority 1: Shipyard Squatter
+            if strat["can_buy_ship"] and not strat["ship_at_shipyard"] and strat["cheapest_shipyard"] != "Unknown":
+                if ship_status.location != strat["cheapest_shipyard"]:
+                    log.info(f"👔 [HQ] Dispatching {ship_symbol} to Shipyard at {strat['cheapest_shipyard']} for impending purchase.")
+                    engine.assign(ship_symbol, f"goto {strat['cheapest_shipyard']}, stop")
+                    strat["ship_at_shipyard"] = True  # Claimed it, so other probes don't also go
+                else:
+                    log.info(f"👔 [HQ] {ship_symbol} is holding position at shipyard. Ready to buy.")
+                continue
+
+            # Priority 2: Smart Scout (Refresh oldest market prices or expand)
+            plan = _get_probe_plan(ship_status.location, strat["phase"])
+            log.info(f"👔 [HQ] Dispatching {ship_symbol} to Scout: {plan}")
+            engine.assign(ship_symbol, plan)
+            continue
+
+        # --- HAULERS & COMMAND ---
+        if role in ["HAULER", "COMMAND", "FREIGHTER"]:
+            # Phase 3: "Slow Mode" Gate Construction
+            if strat["phase"] == 3 and needs_gate_materials:
+                # Only pull funds for construction if we have a safe buffer above our reserve
+                if strat["excess"] > 150_000:
+                    # Consistent hash assignment: ~1 in 3 ships will do construction duties
+                    # This ensures the same ship usually hauls mats, while others focus on trading.
+                    try:
+                        ship_num = int(ship_symbol.split("-")[-1], 16)
+                    except ValueError:
+                        ship_num = sum(ord(c) for c in ship_symbol)
+
+                    if ship_num % 3 == 0:
+                        log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction (Slow Mode).")
+                        engine.assign(ship_symbol, "construct")
+                        continue
+
+            # Default: Autotrade
+            log.info(f"👔 [HQ] Assigned {ship_symbol} to Autotrade.")
+            engine.assign(ship_symbol, "autotrade")
+
+
 class BehaviorEngine:
     """
     Manages autonomous ship behaviors.
@@ -1720,7 +1906,7 @@ class BehaviorEngine:
             elif step.step_type == StepType.SCOUT:
                 result = self._step_scout(cfg, step, ship, fleet)
             elif step.step_type == StepType.REPEAT:
-                result = self._step_repeat(cfg, step)
+                result = self._step_repeat(cfg, step, ship, fleet)
             elif step.step_type == StepType.STOP:
                 result = self._step_stop(cfg)
             elif step.step_type == StepType.ALERT:
@@ -1757,7 +1943,7 @@ class BehaviorEngine:
         # 1. Check if we have arrived at the FINAL destination
         # We assume ship.location is accurate if we just refreshed (handled in WAITING phase)
         if ship.location == dest_wp and ship.nav_status != "IN_TRANSIT":
-            self._advance(cfg)
+            self._advance(cfg, ship, fleet)
             return None
 
         # 2. INIT Phase: Prepare to move
@@ -1793,7 +1979,7 @@ class BehaviorEngine:
                     # We have finished the transit.
                     if ship.location == dest_wp:
                         # Arrived at final destination
-                        self._advance(cfg)
+                        self._advance(cfg, ship, fleet)
                     else:
                         # Arrived at intermediate stop (or drift finished).
                         # Loop back to INIT to refuel and calculate next hop.
@@ -1891,7 +2077,7 @@ class BehaviorEngine:
                     if target != "*":
                         raise e
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_buy(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -1932,13 +2118,13 @@ class BehaviorEngine:
             self._save()
             return f"{cfg.ship_symbol} ALERT: {e}"
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_refuel(self, cfg, step, ship, fleet) -> Optional[str]:
         if ship.fuel_capacity > 0:
             _refuel_ship_logic(cfg.ship_symbol)
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_deliver(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -1957,7 +2143,7 @@ class BehaviorEngine:
         except Exception as e:
             raise e
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_transfer(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -1982,7 +2168,7 @@ class BehaviorEngine:
         except Exception as e:
             raise e
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_supply(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -2035,14 +2221,14 @@ class BehaviorEngine:
         except Exception as e:
             raise e
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_scout(self, cfg, step, ship, fleet) -> Optional[str]:
         if not ship.location:
             raise Exception("No location")
         _refresh_waypoint_data(ship.location)
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_chart(self, cfg, step, ship, fleet) -> Optional[str]:
@@ -2054,7 +2240,7 @@ class BehaviorEngine:
         entry = cache.get(ship.location, {})
 
         if entry.get("is_charted"):
-            self._advance(cfg)
+            self._advance(cfg, ship, fleet)
             return None
 
         # 2. Call API
@@ -2067,7 +2253,7 @@ class BehaviorEngine:
                 if ship.location in cache:
                     cache[ship.location]["is_charted"] = True
                     _save_cache(cache)
-                self._advance(cfg)
+                self._advance(cfg, ship, fleet)
                 return None
             raise Exception(f"Chart error: {err}")
 
@@ -2076,7 +2262,7 @@ class BehaviorEngine:
         if wp_data:
             _ingest_waypoints([wp_data])
 
-        self._advance(cfg)
+        self._advance(cfg, ship, fleet)
         return None
 
     def _step_alert(self, cfg, step) -> Optional[str]:
@@ -2136,8 +2322,8 @@ class BehaviorEngine:
 
             best_market = _find_best_sell_market(cfg.ship_symbol, symbol)
             if best_market:
-                # Plan: Goto -> Sell -> Autotrade (loop)
-                new_plan = f"goto {best_market['wp']}, sell {symbol}, autotrade"
+                # Plan: Goto -> Sell -> Stop (wait for LLM to assign next task)
+                new_plan = f"goto {best_market['wp']}, sell {symbol}, stop"
             else:
                 # Pause and alert if we can't sell what we have
                 cfg.paused = True
@@ -2163,13 +2349,13 @@ class BehaviorEngine:
             max_buy = int(best["buy"] * 1.10)
             min_sell = int(best["sell"] * 0.90)
 
-            # Plan: Goto Src -> Buy -> Goto Snk -> Sell -> Autotrade (loop)
+            # Plan: Goto Src -> Buy -> Goto Snk -> Sell -> Stop (wait for LLM to assign next task)
             new_plan = (
                 f"goto {best['src']}, "
                 f"buy {best['good']} max:{max_buy}, "
                 f"goto {best['snk']}, "
                 f"sell {best['good']} min:{min_sell}, "
-                f"autotrade"
+                f"stop"
             )
 
         # 2. Delegate to assign()
@@ -2213,14 +2399,39 @@ class BehaviorEngine:
         if target_wp:
             # Inject a goto and the action, then return to exploring
             self.assign(cfg.ship_symbol, f"goto {target_wp}, {action}, explore")
-        else:
-            # Nothing left to explore in this system!
-            cfg.paused = True
-            cfg.alert_sent = True
-            self._save()
-            return f"{cfg.ship_symbol} ALERT: Exploration of {sys_sym} complete! All waypoints charted and markets scouted."
+            return None
 
-        return None
+        # --- NEW: SYSTEM IS FULLY EXPLORED ---
+        # Priority 3: Jump to a new uncharted system
+        jgs = [wp for wp in wps if wp.get("type") == "JUMP_GATE"]
+        if jgs:
+            jg_sym = jgs[0]["symbol"]
+            jg_data = client.get_jump_gate(sys_sym, jg_sym)
+
+            if isinstance(jg_data, dict) and "error" not in jg_data:
+                connections = jg_data.get("connections", [])
+
+                # Find a connected system we haven't fully explored
+                cache = load_waypoint_cache()
+                fetched = cache.get("_systems_fetched", [])
+
+                unfetched_systems = []
+                for conn in connections:
+                    conn_sys = conn.rsplit("-", 1)[0]
+                    if conn_sys not in fetched:
+                        unfetched_systems.append(conn)
+
+                if unfetched_systems:
+                    target_gate = unfetched_systems[0]
+                    # We inject jumping into the behavior, and then immediately explore the new system
+                    self.assign(cfg.ship_symbol, f"goto {jg_sym}, jump {target_gate}, explore")
+                    return None
+
+        # If no jump gate, or all connected systems are fully explored:
+        cfg.paused = True
+        cfg.alert_sent = True
+        self._save()
+        return f"{cfg.ship_symbol} ALERT: Exploration of {sys_sym} complete! All waypoints charted and connected systems fetched."
 
     def _find_closest_incomplete_jump_gate(self, ship_location: str) -> Optional[str]:
         """Find the closest incomplete JUMP_GATE from waypoint cache.
@@ -2508,7 +2719,7 @@ class BehaviorEngine:
         self.assign(cfg.ship_symbol, "negotiate")  # Loop to process the new contract
         return None
 
-    def _step_repeat(self, cfg, step) -> Optional[str]:
+    def _step_repeat(self, cfg, step, ship, fleet) -> Optional[str]:
         if step.args:
             try:
                 loops_left = int(step.args[0])
@@ -2523,7 +2734,7 @@ class BehaviorEngine:
                     return None
                 else:
                     # We've finished our last repeat. Move past this step.
-                    self._advance(cfg)
+                    self._advance(cfg, ship, fleet)
                     # If this was the final step in the sequence, stop the ship
                     # so it doesn't implicitly wrap around to 0 infinitely.
                     if cfg.current_step_index >= len(cfg.steps):
@@ -2543,7 +2754,130 @@ class BehaviorEngine:
         self.cancel(cfg.ship_symbol)
         return None
 
-    def _advance(self, cfg):
+    def _evaluate_hq_opportunities(self, cfg, ship, fleet):
+        """
+        HQ JIT Planner Hook: Evaluate dynamic multi-cargo opportunities before advancing.
+
+        This hook runs when a step completes and checks if the next step is a GOTO.
+        If so, it calculates spare cargo capacity and dynamically inserts profitable
+        secondary cargo trades (profit > 15/unit) between current step and destination.
+        """
+        # Check if the next step exists and is a GOTO
+        next_idx = cfg.current_step_index + 1
+        if next_idx >= len(cfg.steps):
+            return  # No next step or behavior will loop
+
+        next_step = cfg.steps[next_idx]
+        if next_step.step_type != StepType.GOTO:
+            return  # Not a navigation step
+
+        dest_waypoint = next_step.args[0] if next_step.args else None
+        if not dest_waypoint or not ship.location:
+            return  # Can't determine route
+
+        if ship.location == dest_waypoint:
+            return  # Already at destination
+
+        # Calculate spare cargo capacity
+        spare_capacity = ship.cargo_capacity - ship.cargo_units
+        if spare_capacity <= 0:
+            return  # No room for additional cargo
+
+        # Load market cache for both current and destination waypoints
+        cache = load_waypoint_cache()
+        current_entry = cache.get(ship.location, {})
+        dest_entry = cache.get(dest_waypoint, {})
+
+        if not current_entry.get("has_market") or not dest_entry.get("has_market"):
+            return  # Can't trade without markets at both locations
+
+        # Get market data for current and destination waypoints
+        current_market = current_entry.get("market", {})
+        dest_market = dest_entry.get("market", {})
+
+        if not current_market or not dest_market:
+            return  # No market data cached
+
+        # Extract current and destination price lists
+        current_exchange = {item["symbol"]: item for item in current_market.get("exchange", [])}
+        dest_exchange = {item["symbol"]: item for item in dest_market.get("exchange", [])}
+
+        # Build set of goods already in the behavior sequence
+        goods_in_sequence = set()
+        for step in cfg.steps:
+            if step.step_type == StepType.BUY and step.args:
+                goods_in_sequence.add(step.args[0])
+            elif step.step_type == StepType.SELL and step.args:
+                goods_in_sequence.add(step.args[0])
+
+        # Find profitable secondary cargo trades
+        profitable_trades = []
+        for symbol, item in current_exchange.items():
+            if symbol in goods_in_sequence:
+                continue  # Skip goods already in sequence
+
+            buy_price = item.get("purchasePrice", 0)
+            if symbol not in dest_exchange:
+                continue  # Can't sell at destination
+
+            sell_price = dest_exchange[symbol].get("sellPrice", 0)
+            profit_per_unit = sell_price - buy_price
+
+            if profit_per_unit > 15:  # Profit threshold: > 15 credits per unit
+                profitable_trades.append({
+                    "symbol": symbol,
+                    "buy_price": buy_price,
+                    "sell_price": sell_price,
+                    "profit_per_unit": profit_per_unit,
+                    "max_units": min(spare_capacity, item.get("tradeVolume", 0)),
+                })
+
+        if not profitable_trades:
+            return  # No profitable opportunities
+
+        # Sort by profit per unit (descending)
+        profitable_trades.sort(key=lambda x: x["profit_per_unit"], reverse=True)
+
+        # Dynamically insert buy/sell steps with price safety bounds
+        # Insert in reverse order so indices stay valid
+        new_steps = []
+        for trade in profitable_trades:
+            symbol = trade["symbol"]
+            buy_price = trade["buy_price"]
+            sell_price = trade["sell_price"]
+            units = trade["max_units"]
+
+            # Set safety margin: buy 2% below current price, sell 2% above
+            max_buy = int(buy_price * 1.02)
+            min_sell = int(sell_price * 0.98)
+
+            # Create BUY and SELL steps
+            buy_step = Step(StepType.BUY, [symbol, str(units), f"max:{max_buy}"])
+            sell_step = Step(StepType.SELL, [symbol, f"min:{min_sell}"])
+            new_steps.append((buy_step, sell_step))
+
+        # Insert steps before the GOTO (at current_step_index + 1)
+        insert_pos = next_idx
+        for buy_step, sell_step in new_steps:
+            cfg.steps.insert(insert_pos, sell_step)
+            cfg.steps.insert(insert_pos, buy_step)
+            insert_pos += 2
+
+        # Rebuild steps_str to persist changes
+        cfg.steps_str = ", ".join(str(s) for s in cfg.steps)
+        self._save()
+
+        # Console message when HQ JIT Planner is triggered
+        print(f"[HQ JIT Planner] {cfg.ship_symbol}: Inserted {len(new_steps)} dynamic cargo trades (spare capacity: {spare_capacity})")
+
+    def _advance(self, cfg, ship, fleet):
+        """
+        Advance to the next step in the behavior sequence.
+        Also evaluates HQ JIT opportunities for dynamic multi-cargo packing.
+        """
+        # HQ JIT Planner Hook: Check for dynamic cargo opportunities before advancing
+        self._evaluate_hq_opportunities(cfg, ship, fleet)
+
         cfg.current_step_index += 1
         cfg.step_phase = "INIT"
         cfg.error_message = ""
@@ -2591,6 +2925,13 @@ def view_agent() -> str:
         f"Ship count: {data['shipCount']}\n"
         f"Starting faction: {data['startingFaction']}"
     )
+
+
+@tool
+def view_advisor(system_symbol: str = "") -> str:
+    """[READ-ONLY] View the Fleet Strategy, Budget, and HQ Director status."""
+    sys_sym = system_symbol if system_symbol else None
+    return get_financial_assessment(sys_sym)
 
 
 @tool
@@ -4424,65 +4765,39 @@ def assign_trade_route(
 
 @tool
 def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str:
-    """[STATE: behavior] Convenience: assign scouting to satellites.
+    """[STATE: behavior] Assign smart scouting to satellites.
     Args:
         ship_symbols: Comma-separated satellite ship symbols.
-        market_waypoints: Comma-separated waypoints to scout.
-                          IF OMITTED, uses ALL known marketplaces in the ship's system (from cache).
+        market_waypoints: Optional comma-separated waypoints. If omitted, ships will dynamically pick the best target based on distance and cache staleness.
     """
     ships = [s.strip() for s in ship_symbols.split(",") if s.strip()]
     if not ships:
         return "Error: no ship symbols provided."
 
     engine = get_engine()
-    markets = []
-
-    # Case 1: User provided specific list
-    if market_waypoints:
-        markets = [m.strip() for m in market_waypoints.split(",") if m.strip()]
-
-    # Case 2: Use Cache (Filtered by System)
-    else:
-        # Determine system from first ship
-        first_ship = client.get_ship(ships[0])
-        if isinstance(first_ship, dict) and "error" not in first_ship:
-            system_symbol = first_ship["nav"]["systemSymbol"]
-            cache = load_market_cache()
-
-            # Filter cache keys for this system
-            markets = [wp for wp in cache.keys() if wp.startswith(system_symbol)]
-            markets.sort()
-
-            if not markets:
-                return f"Error: No markets found in cache for system {system_symbol}. Run scan_system first to populate cache."
-
-    if not markets:
-        return "Error: no markets found to scout."
-
-    # Build one shared sequence: goto M1, scout, goto M2, scout, ..., repeat
-    parts = []
-    for mkt in markets:
-        parts.append(f"goto {mkt}")
-        parts.append("scout")
-    parts.append("repeat")
-
-    steps_str = ", ".join(parts)
-
-    # Calculate offsets to spread ships out
-    m = len(markets)
-    already_placed = sum(
-        1
-        for cfg in engine.behaviors.values()
-        if cfg.steps_str == steps_str and cfg.ship_symbol not in ships
-    )
-
-    total = already_placed + len(ships)
     results = []
-    for j, ship in enumerate(ships):
-        slot = already_placed + j
-        market_offset = (slot * m) // total
-        start_step = market_offset * 2
-        result = engine.assign(ship, steps_str, start_step=start_step)
+
+    for ship_sym in ships:
+        if market_waypoints:
+            # If a specific list is provided, just visit them and stop.
+            markets = [m.strip() for m in market_waypoints.split(",") if m.strip()]
+            parts = []
+            for mkt in markets:
+                parts.append(f"goto {mkt}")
+                parts.append("scout")
+            parts.append("stop")
+            plan = ", ".join(parts)
+        else:
+            # Use the new JIT Probe Plan (phase-aware)
+            ship_data = client.get_ship(ship_sym)
+            if isinstance(ship_data, dict) and "error" not in ship_data:
+                loc = ship_data["nav"]["waypointSymbol"]
+                strat = evaluate_fleet_strategy()
+                plan = _get_probe_plan(loc, strat["phase"])
+            else:
+                plan = "explore"
+
+        result = engine.assign(ship_sym, plan)
         results.append(result)
 
     return "\n".join(results)
@@ -4526,6 +4841,17 @@ def assign_jump_gate_construction(ship_symbol: str) -> str:
     return get_engine().assign(ship_symbol, "construct")
 
 
+@tool
+def toggle_hq(enabled: bool) -> str:
+    """[STATE: hq] Enable or disable the automated HQ Fleet Director.
+    If True, HQ will automatically assign tasks to idle ships based on game phase.
+    If False, idle ships will remain idle until you command them.
+    """
+    set_hq_enabled(enabled)
+    status = "ENABLED (Ships will be auto-assigned)" if enabled else "DISABLED (Manual control only)"
+    return f"HQ Fleet Director is now {status}."
+
+
 # ──────────────────────────────────────────────
 #  Tool registry
 # ──────────────────────────────────────────────
@@ -4546,6 +4872,7 @@ TIER_1_TOOLS = [
     fulfill_contract,
     negotiate_contract,
     # Info
+    view_advisor,
     view_market,
     view_ships,
     view_contracts,
@@ -4569,12 +4896,14 @@ TIER_1_TOOLS = [
     assign_system_explorer,
     assign_jump_gate_construction,
     create_behavior,
+    toggle_hq,
 ]
 
 # All tools (tier 2)
 ALL_TOOLS = [
     # Observation
     view_agent,
+    view_advisor,
     view_contracts,
     view_ships,
     view_ship_details,
@@ -4633,6 +4962,7 @@ ALL_TOOLS = [
     assign_contract_duty,
     assign_system_explorer,
     assign_jump_gate_construction,
+    toggle_hq,
 ]
 
 # Tools that are "significant" actions worth narrating

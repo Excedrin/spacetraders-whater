@@ -122,6 +122,15 @@ def tick_loop():
                         alert_queue.append(alert)
                 except Exception as e:
                     log.error(f"Error ticking {ship_symbol}: {e}")
+
+            # 3. HQ Fleet Director (every 3rd tick = ~30 seconds)
+            if ticks % 3 == 0:
+                try:
+                    from tools import assign_idle_ships
+                    assign_idle_ships(fleet, behavior_engine)
+                except Exception as e:
+                    log.error(f"HQ Director error: {e}")
+
         time.sleep(TICK_INTERVAL)
 
 
@@ -135,6 +144,17 @@ Thread(target=tick_loop, daemon=True).start()
 @app.get("/api/state")
 def get_state():
     with state_lock:
+        # Get advisor status
+        from tools import get_financial_assessment
+
+        sys_sym = None
+        if fleet.ships:
+            first_ship = next(iter(fleet.ships.values()))
+            if first_ship.location:
+                sys_sym = first_ship.location.rsplit("-", 1)[0]
+
+        advisor_status = get_financial_assessment(sys_sym)
+
         return {
             "fleet": {
                 s_name: {
@@ -165,6 +185,7 @@ def get_state():
                 for k, v in behavior_engine.behaviors.items()
             },
             "alerts": list(alert_queue),
+            "advisor": advisor_status,
         }
 
 

@@ -135,17 +135,10 @@ def print_hud():
                 print(f"  ! {a}")
 
         # --- ADD FINANCIAL ADVISOR ---
-        from tools import get_financial_assessment
-
-        # Try to guess current system from fleet
-        sys_sym = None
-        if fleet:
-            first_ship = list(fleet.values())[0]
-            if first_ship.get("location"):
-                sys_sym = "-".join(first_ship["location"].split("-")[:2])
-
-        print("\n=== FINANCIAL ADVISOR ===")
-        print(get_financial_assessment(sys_sym))
+        # Get advisor status from server state
+        if "advisor" in data:
+            print()  # Add a newline for spacing
+            print(data["advisor"])
         # ------------------------------
 
         print()
