@@ -2875,8 +2875,11 @@ class BehaviorEngine:
         Advance to the next step in the behavior sequence.
         Also evaluates HQ JIT opportunities for dynamic multi-cargo packing.
         """
-        # HQ JIT Planner Hook: Check for dynamic cargo opportunities before advancing
-        self._evaluate_hq_opportunities(cfg, ship, fleet)
+        # HQ JIT Planner Hook: Only evaluate at decision points, not during navigation
+        # Don't evaluate if current step is goto (could be mid-flight in a multi-hop route)
+        current_step = cfg.steps[cfg.current_step_index] if cfg.current_step_index < len(cfg.steps) else None
+        if current_step and current_step.step_type != StepType.GOTO:
+            self._evaluate_hq_opportunities(cfg, ship, fleet)
 
         cfg.current_step_index += 1
         cfg.step_phase = "INIT"
