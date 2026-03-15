@@ -13,3 +13,5 @@ system-prompts
 GEMINI_PROMPT.md
 *.json
 repomix*
+resets/*
+REPOMIX.md
