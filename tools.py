@@ -746,9 +746,9 @@ def _navigate_ship_logic(
                     data = client.refuel(ship_symbol)
                     # Sync refuel response to fleet tracker
                     _intercept(ship_symbol, data)
-                    # Update local reference with synced data
-                    ship = _get_local_ship(ship_symbol)
-                    fuel = {"current": ship.fuel_current, "capacity": ship.fuel_capacity}
+                    # Update fuel from response (keep ship as dict for _find_refuel_path)
+                    fuel = {"current": data.get("fuel", {}).get("current", current_fuel),
+                            "capacity": data.get("fuel", {}).get("capacity", capacity_fuel)}
                 except Exception:
                     pass
 
@@ -809,7 +809,6 @@ def _navigate_ship_logic(
                 f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
             )
         elif is_inter_system:
-            result += f"\nNote: Arriving at Jump Gate. Use 'jump_ship' next."
             result += (
                 f"\nNote: En route to Jump Gate. Will execute system jump upon arrival."
             )
