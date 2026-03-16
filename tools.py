@@ -406,7 +406,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     if not search_sys and ships:
         search_sys = ships[0].get("nav", {}).get("systemSymbol")
 
-    # --- Check Jump Gate Status (from waypoint cache, no API call) ---
+    # --- Check Jump Gate Status (from waypoint cache, fetch if missing) ---
     gate_built = False
     needs_gate_materials = False
     if search_sys:
@@ -415,6 +415,10 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
             if not isinstance(wp_data, dict) or not wp_sym.startswith(search_sys + "-"):
                 continue
             if wp_data.get("type") == "JUMP_GATE":
+                if "construction" not in wp_data:
+                    _fetch_and_cache_construction(wp_sym)
+                    cache = load_waypoint_cache()
+                    wp_data = cache.get(wp_sym, {})
                 const = wp_data.get("construction", {})
                 gate_built = const.get("isComplete", False)
                 if not gate_built:
@@ -1772,6 +1776,13 @@ def assign_idle_ships(fleet, engine):
                     probe_targets.add(step.args[0])
 
     buyer_assigned = False
+    constructor_assigned = False
+
+    # Check if any ship is already doing construction
+    for sym, cfg in engine.behaviors.items():
+        if any(s.step_type == StepType.CONSTRUCT for s in cfg.steps):
+            constructor_assigned = True
+            break
 
     log.info(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
              f"Credits: {strat['credits']:,} | Excess: {strat['excess']:,} | "
@@ -1829,19 +1840,13 @@ def assign_idle_ships(fleet, engine):
 
         # --- HAULERS & COMMAND ---
         if role in ["HAULER", "COMMAND", "FREIGHTER"]:
-            # FEATURE 1: Supply closest Jump Gate with needed materials (like FAB_MATS)
-            if needs_gate_materials and strat["excess"] > 150_000:
-                # Consistent hash assignment: ~1 in 3 ships will do construction duties
-                # This ensures the same ship usually hauls mats, while others focus on trading.
-                try:
-                    ship_num = int(ship_symbol.split("-")[-1], 16)
-                except ValueError:
-                    ship_num = sum(ord(c) for c in ship_symbol)
-
-                if ship_num % 3 == 0:
-                    log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction.")
-                    engine.assign(ship_symbol, "construct")
-                    continue
+            # FEATURE 1: Supply closest Jump Gate with needed materials
+            # Assign first idle trader to construction; rest autotrade.
+            if needs_gate_materials and strat["excess"] > 150_000 and not constructor_assigned:
+                log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction.")
+                engine.assign(ship_symbol, "construct")
+                constructor_assigned = True
+                continue
 
             # Default: Autotrade
             log.info(f"👔 [HQ] Assigned {ship_symbol} to Autotrade.")
