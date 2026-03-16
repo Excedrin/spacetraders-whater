@@ -39,7 +39,7 @@ def set_alert_queue(q):
 
 
 # HQ Director Toggle
-_hq_enabled = False
+_hq_enabled = True
 
 
 def set_hq_enabled(enabled: bool):
@@ -636,14 +636,17 @@ def _navigate_ship_logic(
             f"Invalid destination format '{destination_symbol}'. Expected Waypoint Symbol (SECTOR-SYSTEM-WAYPOINT)."
         )
 
-    ship = client.get_ship(ship_symbol)
-    if isinstance(ship, dict) and "error" in ship:
-        raise Exception(ship["error"])
+    ship_status = _get_local_ship(ship_symbol)
+    current_wp = ship_status.location or ""
+    current_sys = current_wp.rsplit("-", 1)[0] if current_wp else ""
+    fuel_current = ship_status.fuel_current
+    fuel_capacity = ship_status.fuel_capacity
+    engine_speed = ship_status.engine_speed
 
-    nav = ship.get("nav", {})
-    fuel = ship.get("fuel", {})
-    current_sys = nav.get("systemSymbol", "")
-    current_wp = nav.get("waypointSymbol", "")
+    ship_dict = {
+        "fuel": {"current": fuel_current, "capacity": fuel_capacity},
+        "engine": {"speed": engine_speed},
+    }
 
     if current_wp == destination_symbol:
         return f"{ship_symbol} is already at {destination_symbol}.", 0.0
@@ -675,7 +678,7 @@ def _navigate_ship_logic(
             )
             t1, c1 = 0, 0
             if current_wp != local_jg_sym and origin_obj and local_jg_obj:
-                _, c1, t1 = _calculate_travel_cost(ship, local_jg_obj, origin_obj, mode)
+                _, c1, t1 = _calculate_travel_cost(ship_dict, local_jg_obj, origin_obj, mode)
 
             lines.append(f"1. Nav to local gate ({local_jg_sym}): {t1}s, {c1} fuel")
 
@@ -799,41 +802,34 @@ def _navigate_ship_logic(
     if execute:
         # 1. SMART REFUEL AT DEPARTURE
         # Only refuel if the current market sells fuel AND we are not full.
-        if fuel.get("capacity", 0) > 0:
+        if fuel_capacity > 0:
             market_cache = load_market_cache()
             curr_market = market_cache.get(current_wp, {})
             has_fuel = "FUEL" in curr_market.get(
                 "exchange", []
             ) or "FUEL" in curr_market.get("exports", [])
 
-            # FIX: Added check (fuel_current < fuel_capacity) to prevent 0-unit refuel spam
-            current_fuel = fuel.get("current", 0)
-            capacity_fuel = fuel.get("capacity", 0)
-
-            if has_fuel and current_fuel < capacity_fuel:
+            if has_fuel and fuel_current < fuel_capacity:
                 try:
-                    _ensure_dock_logic(ship_symbol)
-                    data = client.refuel(ship_symbol)
-                    # Sync refuel response to fleet tracker
-                    _intercept(ship_symbol, data)
-                    # Update fuel from response (keep ship as dict for _find_refuel_path)
-                    fuel = {"current": data.get("fuel", {}).get("current", current_fuel),
-                            "capacity": data.get("fuel", {}).get("capacity", capacity_fuel)}
+                    _refuel_ship_logic(ship_symbol)
+                    # Re-read from fleet tracker (synced via _intercept inside _refuel_ship_logic)
+                    ship_status = _get_local_ship(ship_symbol)
+                    fuel_current = ship_status.fuel_current
+                    fuel_capacity = ship_status.fuel_capacity
+                    ship_dict["fuel"] = {"current": fuel_current, "capacity": fuel_capacity}
                 except Exception:
                     pass
 
         _, direct_cost, direct_time = _calculate_travel_cost(
-            ship, target_obj, origin_obj, mode
+            ship_dict, target_obj, origin_obj, mode
         )
-        fuel_available = fuel.get("current", 0)
-        fuel_capacity = fuel.get("capacity", 0)
 
         # 2. Route Check
         next_hop = target_wp_symbol
         is_multi_hop = False
 
-        if fuel_capacity > 0 and direct_cost > fuel_available:
-            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+        if fuel_capacity > 0 and direct_cost > fuel_current:
+            path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode)
             if not path:
                 raise Exception(
                     f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found."
@@ -846,13 +842,14 @@ def _navigate_ship_logic(
                     (w for w in waypoints if w["symbol"] == next_hop), None
                 )
                 _, _, direct_time = _calculate_travel_cost(
-                    ship, next_hop_obj, origin_obj, mode
+                    ship_dict, next_hop_obj, origin_obj, mode
                 )
 
         # Action
         _ensure_orbit_logic(ship_symbol)
-        if nav.get("flightMode") != mode:
+        if ship_status.flight_mode != mode:
             client.set_flight_mode(ship_symbol, mode)
+            _intercept(ship_symbol, {"nav": {"flightMode": mode}})
 
         data = client.navigate(ship_symbol, next_hop)
         _intercept(ship_symbol, data)
@@ -895,22 +892,19 @@ def _navigate_ship_logic(
 
         # Check Direct
         dist, direct_cost, direct_time = _calculate_travel_cost(
-            ship, target_obj, origin_obj, "CRUISE"
+            ship_dict, target_obj, origin_obj, "CRUISE"
         )
         lines.append(f"Direct Distance: {dist}")
 
-        fuel_cap = fuel.get("capacity", 0)
-        fuel_curr = fuel.get("current", 0)
-
         lines.append("\nFlight Modes:")
         for m in ["CRUISE", "DRIFT", "BURN"]:
-            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode=m)
+            path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode=m)
 
-            _, cost, time = _calculate_travel_cost(ship, target_obj, origin_obj, m)
+            _, cost, time = _calculate_travel_cost(ship_dict, target_obj, origin_obj, m)
 
             status = ""
-            if fuel_cap > 0:
-                if cost <= fuel_curr:
+            if fuel_capacity > 0:
+                if cost <= fuel_current:
                     status = "✅ Direct"
                 elif path:
                     stops = len(path) - 2  # Exclude start/end
@@ -1536,16 +1530,17 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     ship_pos = None
     wp_coords = {}
     if ship_symbol:
-        ship = client.get_ship(ship_symbol)
-        if isinstance(ship, dict) and "error" not in ship:
-            nav = ship.get("nav", {})
-            ship_wp = nav.get("waypointSymbol", "")
-            system_symbol = nav.get("systemSymbol", "")
+        try:
+            ship_status = _get_local_ship(ship_symbol)
+            ship_wp = ship_status.location or ""
+            system_symbol = ship_wp.rsplit("-", 1)[0] if ship_wp else ""
             waypoints = get_system_waypoints(system_symbol)
             if isinstance(waypoints, list):
                 for wp in waypoints:
                     wp_coords[wp["symbol"]] = (wp.get("x", 0), wp.get("y", 0))
                 ship_pos = wp_coords.get(ship_wp)
+        except Exception:
+            pass
 
     routes = []
     now = time.time()
@@ -1607,8 +1602,9 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     return routes
 
 
-def _get_probe_plan(ship_location: str, phase: int) -> str:
-    """Determines if a probe should chart local waypoints, refresh market prices, or jump to a new system."""
+def _get_probe_plan(ship_location: str, phase: int, claimed_targets: set = None) -> str:
+    """Determines if a probe should chart local waypoints, refresh market prices, or jump to a new system.
+    claimed_targets: set of waypoint symbols already assigned to other probes this cycle."""
     import time
     system = ship_location.rsplit("-", 1)[0]
     cache = load_waypoint_cache()
@@ -1626,6 +1622,9 @@ def _get_probe_plan(ship_location: str, phase: int) -> str:
     markets = []
     for wp in system_wps:
         if wp.get("has_market"):
+            wp_sym = wp["symbol"]
+            if claimed_targets and wp_sym in claimed_targets:
+                continue  # Another probe is already headed there
             age = now - wp.get("last_updated", 0)
 
             # Calculate distance to prioritize nearby markets
@@ -1634,7 +1633,7 @@ def _get_probe_plan(ship_location: str, phase: int) -> str:
             dist = max(1.0, math.sqrt((wx - sx)**2 + (wy - sy)**2))
 
             score = (age + 60) / dist
-            markets.append((score, wp["symbol"], age))
+            markets.append((score, wp_sym, age))
 
     if markets:
         markets.sort(key=lambda x: x[0], reverse=True)
@@ -1675,6 +1674,16 @@ def assign_idle_ships(fleet, engine):
                 if isinstance(const, dict) and "error" not in const and not const.get("isComplete"):
                     needs_gate_materials = True
 
+    # Track probe destinations to avoid duplicate scouting assignments
+    # Seed with GOTO destinations of probes already running behaviors
+    probe_targets = set()
+    for sym, cfg in engine.behaviors.items():
+        ship_st = fleet.get_ship(sym)
+        if ship_st and ship_st.role == "SATELLITE" and sym not in idle_ships:
+            for step in cfg.steps:
+                if step.step_type == StepType.GOTO and step.args:
+                    probe_targets.add(step.args[0])
+
     for ship_symbol in idle_ships:
         ship_status = fleet.get_ship(ship_symbol)
         if not ship_status or not ship_status.is_available():
@@ -1695,9 +1704,13 @@ def assign_idle_ships(fleet, engine):
                 continue
 
             # Priority 2: Smart Scout (Refresh oldest market prices or expand)
-            plan = _get_probe_plan(ship_status.location, strat["phase"])
+            plan = _get_probe_plan(ship_status.location, strat["phase"], claimed_targets=probe_targets)
             log.info(f"👔 [HQ] Dispatching {ship_symbol} to Scout: {plan}")
             engine.assign(ship_symbol, plan)
+            # Extract target waypoint from plan so other probes avoid it
+            if plan.startswith("goto "):
+                target = plan.split(",")[0].replace("goto ", "").strip()
+                probe_targets.add(target)
             continue
 
         # --- HAULERS & COMMAND ---
@@ -1847,7 +1860,7 @@ class BehaviorEngine:
             return "Nothing to resume."
         cfg.paused = False
         cfg.alert_sent = False
-        cfg.current_step_index += 1
+        #cfg.current_step_index += 1
         cfg.step_phase = "INIT"
         self._save()
         return f"Resumed {ship_symbol}."
@@ -2199,18 +2212,16 @@ class BehaviorEngine:
 
         # If units not specified, use all cargo of that type
         if units is None:
-            ship_data = client.get_ship(cfg.ship_symbol)
-            if isinstance(ship_data, dict) and "error" not in ship_data:
-                cargo = ship_data.get("cargo", {})
-                cargo_items = cargo.get("inventory", [])
-                for item in cargo_items:
+            try:
+                ship_status = _get_local_ship(cfg.ship_symbol)
+                for item in ship_status.cargo_inventory:
                     if item.get("symbol") == trade_symbol:
                         units = item.get("units", 0)
                         break
                 if units is None or units == 0:
                     raise Exception(f"No cargo of type {trade_symbol} available")
-            else:
-                raise Exception(f"Could not get ship cargo data for {cfg.ship_symbol}")
+            except Exception as e:
+                raise Exception(f"Could not get ship cargo data for {cfg.ship_symbol}: {e}")
 
         try:
             result = client.supply_construction(
@@ -2676,9 +2687,9 @@ class BehaviorEngine:
                     )
                 else:
                     # Need to buy more
-                    ship = client.get_ship(cfg.ship_symbol)
-                    cargo_capacity = ship.get("cargo", {}).get("capacity", 0)
-                    units_in_cargo = cargo.get("units", 0)
+                    ship_status = _get_local_ship(cfg.ship_symbol)
+                    cargo_capacity = ship_status.cargo_capacity
+                    units_in_cargo = ship_status.cargo_units
 
                     # Cap by available cargo space
                     units_to_buy = min(units_to_buy, cargo_capacity - units_in_cargo)
@@ -2690,7 +2701,9 @@ class BehaviorEngine:
                             f"goto {dest}, deliver {c_id} {symbol}, negotiate",
                         )
                     else:
-                        src = _find_best_source(symbol, ship["nav"]["systemSymbol"])
+                        ship_wp = ship_status.location or ""
+                        sys_sym = ship_wp.rsplit("-", 1)[0] if ship_wp else ""
+                        src = _find_best_source(symbol, sys_sym)
                         if not src:
                             cfg.paused = True
                             cfg.alert_sent = True
@@ -2703,10 +2716,10 @@ class BehaviorEngine:
                 return None
 
         # 2. No Active Contract -> Go to HQ and Negotiate
-        ship = client.get_ship(cfg.ship_symbol)
+        ship_status = _get_local_ship(cfg.ship_symbol)
         hq = client.get_agent().get("headquarters")
 
-        if ship["nav"]["waypointSymbol"] != hq:
+        if ship_status.location != hq:
             self.assign(cfg.ship_symbol, f"goto {hq}, negotiate")
             return None
 
@@ -2875,11 +2888,8 @@ class BehaviorEngine:
         Advance to the next step in the behavior sequence.
         Also evaluates HQ JIT opportunities for dynamic multi-cargo packing.
         """
-        # HQ JIT Planner Hook: Only evaluate at decision points, not during navigation
-        # Don't evaluate if current step is goto (could be mid-flight in a multi-hop route)
-        current_step = cfg.steps[cfg.current_step_index] if cfg.current_step_index < len(cfg.steps) else None
-        if current_step and current_step.step_type != StepType.GOTO:
-            self._evaluate_hq_opportunities(cfg, ship, fleet)
+        # HQ JIT Planner Hook: Check for dynamic cargo opportunities before advancing
+        self._evaluate_hq_opportunities(cfg, ship, fleet)
 
         cfg.current_step_index += 1
         cfg.step_phase = "INIT"
@@ -3178,13 +3188,18 @@ def find_waypoints(
     # 1. Determine System
     ref_coords = None
     if reference_ship:
-        ship = client.get_ship(reference_ship)
-        if isinstance(ship, dict) and "error" not in ship:
-            system_symbol = ship["nav"]["systemSymbol"]
-            ref_coords = (
-                ship["nav"]["route"]["destination"]["x"],
-                ship["nav"]["route"]["destination"]["y"],
-            )
+        try:
+            ship_status = _get_local_ship(reference_ship)
+            ship_wp = ship_status.location or ""
+            if ship_wp:
+                system_symbol = ship_wp.rsplit("-", 1)[0]
+
+                # Fetch waypoints to get coords of current location
+                cache = load_waypoint_cache()
+                if ship_wp in cache:
+                    ref_coords = (cache[ship_wp].get("x", 0), cache[ship_wp].get("y", 0))
+        except Exception:
+            pass
 
     if not system_symbol:
         # Fallback to agent HQ system
@@ -3310,11 +3325,14 @@ def find_waypoints(
 
 def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
     """Helper: finds the best market to sell existing cargo."""
-    ship = client.get_ship(ship_symbol)
-    if not ship or "error" in ship:
+    try:
+        ship_status = _get_local_ship(ship_symbol)
+        ship_wp = ship_status.location or ""
+        if not ship_wp:
+            return None
+        system = ship_wp.rsplit("-", 1)[0]
+    except Exception:
         return None
-
-    system = ship["nav"]["systemSymbol"]
 
     # Use shared logic - searching for the good
     results = _find_waypoints_logic(system_symbol=system, trade_symbol=good)
@@ -3653,12 +3671,10 @@ def scan_system(
     ship_fuel_capacity = 0
 
     if reference_ship:
-        ship = client.get_ship(reference_ship)
-        if isinstance(ship, dict) and "error" not in ship:
-            nav = ship.get("nav", {})
-            fuel = ship.get("fuel", {})
-            current_wp = nav.get("waypointSymbol", "")
-            ship_fuel_capacity = fuel.get("capacity", 0)
+        try:
+            ship_status = _get_local_ship(reference_ship)
+            current_wp = ship_status.location or ""
+            ship_fuel_capacity = ship_status.fuel_capacity
 
             # Find reference ship's coordinates
             for wp in waypoints:
@@ -3666,6 +3682,8 @@ def scan_system(
                     reference_position = (wp.get("x", 0), wp.get("y", 0))
                     reference_ship_name = reference_ship
                     break
+        except Exception:
+            pass
 
     # Helper function to calculate distance
     def calc_distance(wp):
@@ -4058,25 +4076,27 @@ def navigate_ship(
     """
     try:
         # 1. Check if this requires multi-hop
-        ship = client.get_ship(ship_symbol)
-        if isinstance(ship, dict) and "error" in ship:
-            return f"Error: {ship['error']}"
+        ship_status = _get_local_ship(ship_symbol)
+        current_wp = ship_status.location or ""
+        current_sys = current_wp.rsplit("-", 1)[0] if current_wp else ""
 
-        nav = ship.get("nav", {})
-        current_wp = nav.get("waypointSymbol", "")
         if current_wp == destination_symbol:
             return f"{ship_symbol} is already at {destination_symbol}."
 
         # Fetch route details without executing to check distance/hops
         # We assume standard CRUISE for calculation if mode not specified
-        waypoints = get_system_waypoints(nav.get("systemSymbol"))
+        waypoints = get_system_waypoints(current_sys)
         origin_obj = next((w for w in waypoints if w["symbol"] == current_wp), None)
         target_obj = next(
             (w for w in waypoints if w["symbol"] == destination_symbol), None
         )
 
         if origin_obj and target_obj:
-            path = _find_refuel_path(ship, origin_obj, target_obj, waypoints, mode)
+            ship_dict = {
+                "fuel": {"current": ship_status.fuel_current, "capacity": ship_status.fuel_capacity},
+                "engine": {"speed": ship_status.engine_speed},
+            }
+            path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode)
 
             # 2. If multi-hop route found (length > 2 means Origin -> Stop -> Dest), assign behavior
             if path and len(path) > 2:
@@ -4485,13 +4505,18 @@ def find_waypoints(
     # 1. Determine System
     ref_coords = None
     if reference_ship:
-        ship = client.get_ship(reference_ship)
-        if isinstance(ship, dict) and "error" not in ship:
-            system_symbol = ship["nav"]["systemSymbol"]
-            ref_coords = (
-                ship["nav"]["route"]["destination"]["x"],
-                ship["nav"]["route"]["destination"]["y"],
-            )
+        try:
+            ship_status = _get_local_ship(reference_ship)
+            ship_wp = ship_status.location or ""
+            if ship_wp:
+                system_symbol = ship_wp.rsplit("-", 1)[0]
+
+                # Fetch waypoints to get coords of current location
+                cache = load_waypoint_cache()
+                if ship_wp in cache:
+                    ref_coords = (cache[ship_wp].get("x", 0), cache[ship_wp].get("y", 0))
+        except Exception:
+            pass
 
     if not system_symbol:
         # Fallback to agent HQ system
@@ -4667,7 +4692,7 @@ def pause_behavior(ship_symbol: str) -> str:
 
 @tool
 def resume_behavior(ship_symbol: str) -> str:
-    """[STATE: behavior] Resume a paused behavior after handling an alert. Advances past the alert step."""
+    """[STATE: behavior] Resume a paused behavior after handling an alert. Does not advance the step."""
     return get_engine().resume(ship_symbol)
 
 
@@ -4792,12 +4817,15 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
             plan = ", ".join(parts)
         else:
             # Use the new JIT Probe Plan (phase-aware)
-            ship_data = client.get_ship(ship_sym)
-            if isinstance(ship_data, dict) and "error" not in ship_data:
-                loc = ship_data["nav"]["waypointSymbol"]
-                strat = evaluate_fleet_strategy()
-                plan = _get_probe_plan(loc, strat["phase"])
-            else:
+            try:
+                ship_status = _get_local_ship(ship_sym)
+                loc = ship_status.location or ""
+                if loc:
+                    strat = evaluate_fleet_strategy()
+                    plan = _get_probe_plan(loc, strat["phase"])
+                else:
+                    plan = "explore"
+            except Exception:
                 plan = "explore"
 
         result = engine.assign(ship_sym, plan)

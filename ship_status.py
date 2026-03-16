@@ -28,6 +28,7 @@ class ShipStatus:
     cargo_capacity: int = 0
     cargo_inventory: list = field(default_factory=list)  # List of {symbol, units}
     engine_speed: int = 30  # Ship engine speed for travel calculations
+    flight_mode: str = "CRUISE"  # CRUISE, DRIFT, BURN, STEALTH
 
     # Cooldown/transit tracking
     available_at: float = 0.0  # Unix timestamp when ship becomes available
@@ -97,6 +98,7 @@ class FleetTracker:
                         cargo_capacity=ship_data.get("cargo_capacity", 0),
                         cargo_inventory=ship_data.get("cargo_inventory", []),
                         engine_speed=ship_data.get("engine_speed", 30),
+                        flight_mode=ship_data.get("flight_mode", "CRUISE"),
                         available_at=ship_data.get("available_at", 0.0),
                         busy_reason=ship_data.get("busy_reason", ""),
                     )
@@ -124,6 +126,7 @@ class FleetTracker:
                     "cargo_capacity": s.cargo_capacity,
                     "cargo_inventory": s.cargo_inventory,
                     "engine_speed": s.engine_speed,
+                    "flight_mode": s.flight_mode,
                     "available_at": s.available_at,
                     "busy_reason": s.busy_reason,
                 }
@@ -161,6 +164,7 @@ class FleetTracker:
             ship.cargo_capacity = cargo.get("capacity", 0)
             ship.cargo_inventory = cargo.get("inventory", [])
             ship.engine_speed = engine.get("speed", 30)
+            ship.flight_mode = nav.get("flightMode", "CRUISE")
 
             # Check if ship is in transit
             if ship.nav_status == "IN_TRANSIT":
@@ -196,6 +200,7 @@ class FleetTracker:
         if "nav" in data:
             ship.location = data["nav"].get("waypointSymbol", ship.location)
             ship.nav_status = data["nav"].get("status", ship.nav_status)
+            ship.flight_mode = data["nav"].get("flightMode", ship.flight_mode)
         if "fuel" in data:
             ship.fuel_current = data["fuel"].get("current", ship.fuel_current)
             ship.fuel_capacity = data["fuel"].get("capacity", ship.fuel_capacity)
