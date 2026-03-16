@@ -1919,8 +1919,17 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
         return math.sqrt((ax-bx)**2 + (ay-by)**2)
 
     # Phase 1: Sell existing cargo
+    needs_gate = evaluate_fleet_strategy().get("needs_gate_materials", False)
+    gate_mats = {"FAB_MATS", "ADVANCED_CIRCUITRY"}
+
     if cargo_map:
         for good, units in cargo_map.items():
+            # If gate needs materials and we have them, detour to supply first
+            if needs_gate and good in gate_mats:
+                jg_sym = get_engine()._find_closest_incomplete_jump_gate(pos)
+                if jg_sym:
+                    return f"goto {jg_sym}, supply {good}, autotrade"
+
             best = _find_best_sell_market(ship_symbol, good)
             if best:
                 pending_sells[good] = {"wp": best["wp"], "min_sell": int(best.get("sell", 0) * 0.90)}

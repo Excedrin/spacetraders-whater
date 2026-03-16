@@ -11,8 +11,15 @@ from ship_status import FleetTracker
 from tools import (ALL_TOOLS, STATE_CHANGING_TOOLS, WAITING_TOOLS, client,
                    get_engine, set_alert_queue, set_fleet)
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging to both file and stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler('server.log'),
+        logging.StreamHandler()
+    ]
+)
 log = logging.getLogger("server")
 
 app = FastAPI(title="SpaceTraders Engine API")
