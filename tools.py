@@ -394,6 +394,11 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         if s.get("registration", {}).get("role") in ["COMMAND", "HAULER", "FREIGHTER"]
     )
 
+    probe_count = sum(
+        1 for s in ships
+        if s.get("registration", {}).get("role") == "SATELLITE"
+    )
+
     reserve_needed = max(trader_count * 350000, 350000)
     excess = credits - reserve_needed
 
@@ -433,8 +438,17 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     # Shipyard Info — check cache for ship pricing, fall back to has_shipyard flag
     cache = load_market_cache()
     hauler_price = float("inf")
+    probe_price = float("inf")
     cheapest_shipyard = "Unknown"
+    cheapest_probe_shipyard = "Unknown"
     fallback_shipyard = None
+
+    # Count markets for probe scaling
+    market_count = 0
+    if search_sys:
+        for wp, data in cache.items():
+            if isinstance(data, dict) and wp.startswith(search_sys + "-") and data.get("has_market"):
+                market_count += 1
 
     if search_sys:
         for wp, data in cache.items():
@@ -446,21 +460,31 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
                         if s.get("purchasePrice", float("inf")) < hauler_price:
                             hauler_price = s["purchasePrice"]
                             cheapest_shipyard = wp
+                    if s["type"] == "SHIP_PROBE":
+                        if s.get("purchasePrice", float("inf")) < probe_price:
+                            probe_price = s["purchasePrice"]
+                            cheapest_probe_shipyard = wp
             elif data.get("has_shipyard") and not fallback_shipyard:
                 fallback_shipyard = wp
 
         # If no priced shipyard found, use any known shipyard with default price
         if cheapest_shipyard == "Unknown" and fallback_shipyard:
             cheapest_shipyard = fallback_shipyard
+        if cheapest_probe_shipyard == "Unknown" and fallback_shipyard:
+            cheapest_probe_shipyard = fallback_shipyard
 
     ship_at_shipyard = False
     if cheapest_shipyard != "Unknown":
         ship_at_shipyard = any(s.get("nav", {}).get("waypointSymbol") == cheapest_shipyard for s in ships)
 
-    # --- UPDATED: Allow fleet expansion post-gate ---
+    # --- Allow fleet expansion post-gate ---
     # Max 3 traders before gate, max 15 traders after gate.
     max_traders = 15 if gate_built else 3
     can_buy_ship = excess > hauler_price and trader_count < max_traders
+
+    # Probe scaling: ~1 probe per 15 markets, minimum 1
+    desired_probes = max(1, market_count // 10)
+    needs_probe = probe_count < desired_probes and excess > probe_price
 
     return {
         "phase": phase,
@@ -469,10 +493,15 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         "reserve_needed": reserve_needed,
         "excess": excess,
         "trader_count": trader_count,
+        "probe_count": probe_count,
+        "desired_probes": desired_probes,
         "hauler_price": hauler_price,
+        "probe_price": probe_price,
         "cheapest_shipyard": cheapest_shipyard,
+        "cheapest_probe_shipyard": cheapest_probe_shipyard,
         "ship_at_shipyard": ship_at_shipyard,
         "can_buy_ship": can_buy_ship,
+        "needs_probe": needs_probe,
         "needs_gate_materials": needs_gate_materials,
     }
 
@@ -1746,7 +1775,8 @@ def assign_idle_ships(fleet, engine):
 
     log.info(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
              f"Credits: {strat['credits']:,} | Excess: {strat['excess']:,} | "
-             f"Can buy: {strat['can_buy_ship']} | Shipyard: {strat['cheapest_shipyard']}")
+             f"Can buy hauler: {strat['can_buy_ship']} | Needs probe: {strat['needs_probe']} "
+             f"({strat['probe_count']}/{strat['desired_probes']}) | Shipyard: {strat['cheapest_shipyard']}")
 
     for ship_symbol in idle_ships:
         ship_status = fleet.get_ship(ship_symbol)
@@ -1755,10 +1785,25 @@ def assign_idle_ships(fleet, engine):
 
         role = ship_status.role
 
-        # FEATURE 2: Buy Ship (Can be done by any ship)
+        # FEATURE 2a: Buy Probe (cheap, high value — check first)
+        if strat["needs_probe"] and not buyer_assigned and strat["cheapest_probe_shipyard"] != "Unknown":
+            target_sy = strat["cheapest_probe_shipyard"]
+            ship_to_buy = "SHIP_PROBE"
+
+            if ship_status.location != target_sy:
+                log.info(f"👔 [HQ] Dispatching {ship_symbol} to buy probe at {target_sy}.")
+                engine.assign(ship_symbol, f"goto {target_sy}, buy_ship {ship_to_buy}, stop")
+            else:
+                log.info(f"👔 [HQ] {ship_symbol} at shipyard. Buying probe.")
+                engine.assign(ship_symbol, f"buy_ship {ship_to_buy}, stop")
+
+            buyer_assigned = True
+            continue
+
+        # FEATURE 2b: Buy Hauler (Can be done by any ship)
         if strat["can_buy_ship"] and not buyer_assigned and strat["cheapest_shipyard"] != "Unknown":
             target_sy = strat["cheapest_shipyard"]
-            ship_to_buy = "SHIP_LIGHT_HAULER"  # Default expansion ship
+            ship_to_buy = "SHIP_LIGHT_HAULER"
 
             if ship_status.location != target_sy:
                 log.info(f"👔 [HQ] Dispatching {ship_symbol} to Shipyard at {target_sy} to buy {ship_to_buy}.")
@@ -1768,7 +1813,6 @@ def assign_idle_ships(fleet, engine):
                 engine.assign(ship_symbol, f"buy_ship {ship_to_buy}, stop")
 
             buyer_assigned = True
-            strat["ship_at_shipyard"] = True  # Claimed it
             continue
 
         # --- PROBES & SATELLITES ---
