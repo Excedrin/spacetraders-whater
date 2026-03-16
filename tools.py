@@ -1285,6 +1285,34 @@ def _refuel_ship_logic(ship_symbol: str) -> str:
     return f"Refueled {ship_symbol}. Fuel: {fuel.get('current')}/{fuel.get('capacity')}. Cost: {tx.get('totalPrice', '?')} cr."
 
 
+def _buy_ship_logic(ship_type: str, waypoint_symbol: str, fleet=None) -> dict:
+    """Core logic to purchase a ship at a shipyard.
+
+    Returns dict with keys: ship, agent, credits_remaining
+    Raises Exception on error.
+    """
+    data = client.purchase_ship(ship_type, waypoint_symbol)
+
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(data["error"])
+
+    new_ship = data.get("ship", {})
+    agent = data.get("agent", {})
+    credits_remaining = agent.get("credits", 0)
+
+    # Update fleet state with the new ship so it's instantly available
+    if fleet and "ship" in data:
+        fleet.update_from_api([data["ship"]])
+    elif _fleet and "ship" in data:
+        _fleet.update_from_api([data["ship"]])
+
+    return {
+        "ship": new_ship,
+        "agent": agent,
+        "credits_remaining": credits_remaining,
+    }
+
+
 def _transfer_cargo_logic(
     from_ship: str, to_ship: str, trade_symbol: str, units: int = None
 ) -> str:
@@ -1686,6 +1714,8 @@ def assign_idle_ships(fleet, engine):
                 if step.step_type == StepType.GOTO and step.args:
                     probe_targets.add(step.args[0])
 
+    buyer_assigned = strat["ship_at_shipyard"]
+
     for ship_symbol in idle_ships:
         ship_status = fleet.get_ship(ship_symbol)
         if not ship_status or not ship_status.is_available():
@@ -1693,19 +1723,25 @@ def assign_idle_ships(fleet, engine):
 
         role = ship_status.role
 
+        # FEATURE 2: Buy Ship (Can be done by any ship)
+        if strat["can_buy_ship"] and not buyer_assigned and strat["cheapest_shipyard"] != "Unknown":
+            target_sy = strat["cheapest_shipyard"]
+            ship_to_buy = "SHIP_LIGHT_HAULER"  # Default expansion ship
+
+            if ship_status.location != target_sy:
+                log.info(f"👔 [HQ] Dispatching {ship_symbol} to Shipyard at {target_sy} to buy {ship_to_buy}.")
+                engine.assign(ship_symbol, f"goto {target_sy}, buy_ship {ship_to_buy}, stop")
+            else:
+                log.info(f"👔 [HQ] {ship_symbol} is at shipyard. Buying {ship_to_buy}.")
+                engine.assign(ship_symbol, f"buy_ship {ship_to_buy}, stop")
+
+            buyer_assigned = True
+            strat["ship_at_shipyard"] = True  # Claimed it
+            continue
+
         # --- PROBES & SATELLITES ---
         if role == "SATELLITE":
-            # Priority 1: Shipyard Squatter
-            if strat["can_buy_ship"] and not strat["ship_at_shipyard"] and strat["cheapest_shipyard"] != "Unknown":
-                if ship_status.location != strat["cheapest_shipyard"]:
-                    log.info(f"👔 [HQ] Dispatching {ship_symbol} to Shipyard at {strat['cheapest_shipyard']} for impending purchase.")
-                    engine.assign(ship_symbol, f"goto {strat['cheapest_shipyard']}, stop")
-                    strat["ship_at_shipyard"] = True  # Claimed it, so other probes don't also go
-                else:
-                    log.info(f"👔 [HQ] {ship_symbol} is holding position at shipyard. Ready to buy.")
-                continue
-
-            # Priority 2: Smart Scout (Refresh oldest market prices or expand)
+            # Smart Scout (Refresh oldest market prices or expand)
             plan = _get_probe_plan(ship_status.location, strat["phase"], claimed_targets=probe_targets)
             log.info(f"👔 [HQ] Dispatching {ship_symbol} to Scout: {plan}")
             engine.assign(ship_symbol, plan)
@@ -1717,21 +1753,19 @@ def assign_idle_ships(fleet, engine):
 
         # --- HAULERS & COMMAND ---
         if role in ["HAULER", "COMMAND", "FREIGHTER"]:
-            # Phase 3: "Slow Mode" Gate Construction
-            if strat["phase"] == 3 and needs_gate_materials:
-                # Only pull funds for construction if we have a safe buffer above our reserve
-                if strat["excess"] > 150_000:
-                    # Consistent hash assignment: ~1 in 3 ships will do construction duties
-                    # This ensures the same ship usually hauls mats, while others focus on trading.
-                    try:
-                        ship_num = int(ship_symbol.split("-")[-1], 16)
-                    except ValueError:
-                        ship_num = sum(ord(c) for c in ship_symbol)
+            # FEATURE 1: Supply closest Jump Gate with needed materials (like FAB_MATS)
+            if needs_gate_materials and strat["excess"] > 150_000:
+                # Consistent hash assignment: ~1 in 3 ships will do construction duties
+                # This ensures the same ship usually hauls mats, while others focus on trading.
+                try:
+                    ship_num = int(ship_symbol.split("-")[-1], 16)
+                except ValueError:
+                    ship_num = sum(ord(c) for c in ship_symbol)
 
-                    if ship_num % 3 == 0:
-                        log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction (Slow Mode).")
-                        engine.assign(ship_symbol, "construct")
-                        continue
+                if ship_num % 3 == 0:
+                    log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction.")
+                    engine.assign(ship_symbol, "construct")
+                    continue
 
             # Default: Autotrade
             log.info(f"👔 [HQ] Assigned {ship_symbol} to Autotrade.")
@@ -2052,6 +2086,8 @@ class BehaviorEngine:
                 result = self._step_explore(cfg, ship)
             elif step.step_type == StepType.CONSTRUCT:
                 result = self._step_construct(cfg, ship, step)
+            elif step.step_type == StepType.BUY_SHIP:
+                result = self._step_buy_ship(cfg, step, ship, fleet)
             elif step.step_type == StepType.NEGOTIATE:
                 result = self._step_negotiate(cfg)
             # Store last action for logging
@@ -2851,6 +2887,31 @@ class BehaviorEngine:
         """End the behavior and return ship to IDLE (manual control)."""
         self.cancel(cfg.ship_symbol)
         return None
+
+    def _step_buy_ship(self, cfg, step, ship, fleet) -> Optional[str]:
+        """Buy a ship at the current shipyard."""
+        if not step.args:
+            raise Exception("buy_ship requires a ship type (e.g., 'buy_ship SHIP_LIGHT_HAULER')")
+
+        ship_type = step.args[0]
+        waypoint = ship.location
+
+        if not waypoint:
+            raise Exception("Ship has no location")
+
+        try:
+            result = _buy_ship_logic(ship_type, waypoint, fleet=fleet)
+            new_ship = result["ship"]
+            new_ship_symbol = new_ship.get("symbol", "UNKNOWN")
+            credits_remaining = result["credits_remaining"]
+            log.info(f"🎉 [HQ] Purchased new ship: {new_ship_symbol} ({ship_type}) at {waypoint}. Credits remaining: {credits_remaining}")
+            self._advance(cfg, ship, fleet)
+            return None
+        except Exception as e:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Failed to purchase {ship_type} at {waypoint}: {str(e)}"
 
     def _evaluate_hq_opportunities(self, cfg, ship, fleet):
         """
@@ -4117,29 +4178,6 @@ def accept_contract(contract_id: str) -> str:
 
 
 @tool
-def purchase_ship(ship_type: str, waypoint_symbol: str) -> str:
-    """[STATE: credits, fleet] Purchase a ship at a shipyard.
-    You MUST have a ship or probe present at the shipyard to purchase.
-    Common types: SHIP_PROBE, SHIP_MINING_DRONE, SHIP_SIPHON_DRONE, SHIP_LIGHT_HAULER,
-    SHIP_COMMAND_FRIGATE, SHIP_EXPLORER, SHIP_HEAVY_FREIGHTER, SHIP_ORE_HOUND, SHIP_REFINING_FREIGHTER.
-    """
-    data = client.purchase_ship(ship_type, waypoint_symbol)
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    agent = data.get("agent", {})
-    ship = data.get("ship", {})
-
-    # Instantly add the new ship to fleet tracker
-    if _fleet and ship:
-        _fleet.update_from_api([ship])
-
-    return (
-        f"Purchased {ship.get('symbol', '?')} ({ship_type})!\n"
-        f"Credits remaining: {agent.get('credits', '?')}"
-    )
-
-
-@tool
 def orbit_ship(ship_symbol: str) -> str:
     """[STATE: nav_status] Put a ship into orbit. Required before navigating or extracting."""
     data = client.orbit(ship_symbol)
@@ -4250,6 +4288,24 @@ def refuel_ship(ship_symbol: str) -> str:
     """[STATE: fuel, credits] Refuel a ship at current waypoint. Auto-docks. Waypoint must sell fuel."""
     try:
         return _refuel_ship_logic(ship_symbol)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@tool
+def buy_ship(ship_type: str, waypoint_symbol: str) -> str:
+    """[STATE: credits, fleet] Purchase a ship at a shipyard.
+    Common types: SHIP_PROBE, SHIP_MINING_DRONE, SHIP_SIPHON_DRONE, SHIP_LIGHT_HAULER,
+    SHIP_COMMAND_FRIGATE, SHIP_EXPLORER, SHIP_HEAVY_FREIGHTER, SHIP_ORE_HOUND, SHIP_REFINING_FREIGHTER.
+    """
+    try:
+        result = _buy_ship_logic(ship_type, waypoint_symbol)
+        ship = result["ship"]
+        credits = result["credits_remaining"]
+        return (
+            f"Purchased {ship.get('symbol', '?')} ({ship_type})!\n"
+            f"Credits remaining: {credits}"
+        )
     except Exception as e:
         return f"Error: {e}"
 
@@ -4761,6 +4817,7 @@ def create_behavior(ship_symbol: str, steps: str, start_step: int = 0) -> str:
       refuel                     - Refuel at current market
       scout                      - View market prices at current location
       chart                      - Chart the current location
+      buy_ship SHIP_TYPE         - Buy a ship at current shipyard (e.g., buy_ship SHIP_LIGHT_HAULER)
       alert MESSAGE              - Pause and alert you
       repeat                     - Restart from step 1
       stop                       - End behavior, return ship to IDLE (manual control)
@@ -5042,6 +5099,7 @@ ALL_TOOLS = [
     dock_ship,
     navigate_ship,
     refuel_ship,
+    buy_ship,
     plan_route,
     # Mining & resources
     extract_ore,
@@ -5056,8 +5114,6 @@ ALL_TOOLS = [
     deliver_contract,
     fulfill_contract,
     negotiate_contract,
-    # Ships & shipyard
-    purchase_ship,
     # Scanning & exploration
     scan_waypoints,
     scan_ships,
@@ -5099,8 +5155,8 @@ SIGNIFICANT_TOOLS = {
     "accept_contract",
     "fulfill_contract",
     "negotiate_contract",
-    "purchase_ship",
     "refuel_ship",
+    "buy_ship",
     "dock_ship",
     "orbit_ship",
     "deliver_contract",
@@ -5130,6 +5186,7 @@ STATE_CHANGING_TOOLS = {
     "jettison_cargo",
     "transfer_cargo",
     "refuel_ship",
+    "buy_ship",
     "deliver_contract",
     "dock_ship",
     "orbit_ship",
