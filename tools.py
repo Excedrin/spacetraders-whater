@@ -1738,6 +1738,126 @@ def assign_idle_ships(fleet, engine):
             engine.assign(ship_symbol, "autotrade")
 
 
+def _estimate_buyable_units(cached_price: int, max_price: int, trade_volume: int, spare_capacity: int) -> int:
+    """Estimate how many units we can buy before price exceeds max_price.
+    Uses a conservative 3% price increase per tradeVolume lot."""
+    if cached_price <= 0 or trade_volume <= 0:
+        return 0
+    price = float(cached_price)
+    total = 0
+    for _ in range(20):  # safety cap
+        if price > max_price:
+            break
+        lot = min(trade_volume, spare_capacity - total)
+        if lot <= 0:
+            break
+        total += lot
+        price = price * 1.03  # ~3% increase per lot
+    return total
+
+
+def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
+    """Build a multi-stop trade route that fills cargo across nearby markets."""
+    ship = _get_local_ship(ship_symbol)
+    pos = ship.location
+    cargo_map = {item["symbol"]: item["units"] for item in ship.cargo_inventory}
+    spare = ship.cargo_capacity - ship.cargo_units
+
+    cache = load_waypoint_cache()
+
+    steps = []
+    pending_sells = {}
+    goods_in_plan = set()
+
+    def dist(a, b):
+        if a not in cache or b not in cache:
+            return 1000
+        sys_a = a.rsplit("-", 1)[0]
+        sys_b = b.rsplit("-", 1)[0]
+        if sys_a != sys_b:
+            return 1000  # Penalize cross-system routing
+        ax, ay = cache[a].get("x"), cache[a].get("y")
+        bx, by = cache[b].get("x"), cache[b].get("y")
+        if ax is None or bx is None:
+            return 1000
+        return math.sqrt((ax-bx)**2 + (ay-by)**2)
+
+    # Phase 1: Sell existing cargo
+    if cargo_map:
+        for good, units in cargo_map.items():
+            best = _find_best_sell_market(ship_symbol, good)
+            if best:
+                pending_sells[good] = {"wp": best["wp"], "min_sell": int(best.get("sell", 0) * 0.90)}
+                goods_in_plan.add(good)
+            else:
+                return ""  # Cannot sell existing cargo, fail plan to trigger alert
+
+    # Phase 2: Greedy buy loop
+    routes = _analyze_trade_routes(ship_symbol, min_profit=15)
+    routes = [r for r in routes if r["good"] not in active_goods]
+
+    for _ in range(5):  # max 5 buy stops
+        if spare <= 0:
+            break
+
+        candidates = []
+        for r in routes:
+            if r["good"] in goods_in_plan:
+                continue
+            src_dist = dist(pos, r["src"])
+            max_buy = int(r["buy"] * 1.10)
+            units = _estimate_buyable_units(r["buy"], max_buy, r["volume"], spare)
+            if units <= 0:
+                continue
+            total_profit = r["profit"] * units
+            score = total_profit / max(1.0, src_dist)
+            candidates.append((score, r, units))
+
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, best, est_units = candidates[0]
+
+        # Sell-as-you-go: if best source is also a sell sink for pending cargo
+        for good, sell_info in list(pending_sells.items()):
+            d_sell = dist(pos, sell_info["wp"])
+            d_src = dist(pos, best["src"])
+            if sell_info["wp"] == best["src"] or d_sell < d_src:
+                if pos != sell_info["wp"]:
+                    steps.append(f"goto {sell_info['wp']}")
+                    pos = sell_info["wp"]
+                steps.append(f"sell {good} min:{sell_info['min_sell']}")
+                del pending_sells[good]
+
+        # Go to source and buy
+        if pos != best["src"]:
+            steps.append(f"goto {best['src']}")
+            pos = best["src"]
+
+        max_buy = int(best["buy"] * 1.10)
+        steps.append(f"buy {best['good']} max:{max_buy}")
+
+        pending_sells[best["good"]] = {"wp": best["snk"], "min_sell": int(best["sell"] * 0.90)}
+        goods_in_plan.add(best["good"])
+        spare -= est_units
+
+    # Phase 3: Sell remaining (group by destination)
+    sell_groups = {}
+    for good, info in pending_sells.items():
+        sell_groups.setdefault(info["wp"], []).append((good, info["min_sell"]))
+
+    # Sort destinations by number of goods (sell more first) then distance
+    for dest in sorted(sell_groups.keys(), key=lambda d: (-len(sell_groups[d]), dist(pos, d))):
+        if pos != dest:
+            steps.append(f"goto {dest}")
+            pos = dest
+        for good, min_sell in sell_groups[dest]:
+            steps.append(f"sell {good} min:{min_sell}")
+
+    return ", ".join(steps)
+
+
 class BehaviorEngine:
     """
     Manages autonomous ship behaviors.
@@ -2289,7 +2409,7 @@ class BehaviorEngine:
     def _step_autotrade(self, cfg) -> Optional[str]:
         """
         Dynamic Step:
-        1. Analyzes market/cargo to generate a specific trade route string.
+        1. Analyzes market/cargo to generate a multi-stop trade route string.
         2. Calls self.assign() to overwrite the current behavior with the new plan.
         """
         # --- FLEET-AWARE LOGIC ---
@@ -2323,53 +2443,16 @@ class BehaviorEngine:
             self._save()
             return f"{cfg.ship_symbol} ALERT: Cannot autotrade—0 cargo capacity."
 
-        inventory = cargo_data.get("inventory", [])
+        # Generate multi-stop trade route
+        plan = _plan_trade_route(cfg.ship_symbol, active_goods)
 
-        new_plan = ""
+        if not plan:
+            cfg.paused = True
+            cfg.alert_sent = True
+            self._save()
+            return f"{cfg.ship_symbol} ALERT: Auto-trade found no profitable routes or cannot sell existing cargo. Scout more markets or expand."
 
-        # A. Handle Existing Cargo (Sell it off first)
-        if inventory:
-            # Pick the first item
-            item = inventory[0]
-            symbol = item["symbol"]
-
-            best_market = _find_best_sell_market(cfg.ship_symbol, symbol)
-            if best_market:
-                # Plan: Goto -> Sell -> Stop (wait for LLM to assign next task)
-                new_plan = f"goto {best_market['wp']}, sell {symbol}, stop"
-            else:
-                # Pause and alert if we can't sell what we have
-                cfg.paused = True
-                cfg.alert_sent = True
-                self._save()
-                return f"{cfg.ship_symbol} ALERT: Auto-trade has {symbol} but no known buyer in system. Scout markets."
-
-        # B. Find New Trade (Buy low, sell high)
-        else:
-            routes = _analyze_trade_routes(cfg.ship_symbol, min_profit=50)
-
-            # --- FILTER OUT BUSY ROUTES ---
-            routes = [r for r in routes if r["good"] not in active_goods]
-
-            if not routes:
-                # Pause and alert if no routes found
-                cfg.paused = True
-                cfg.alert_sent = True
-                self._save()
-                return f"{cfg.ship_symbol} ALERT: Auto-trade found no unique profitable routes. Scout more markets or expand to new systems."
-
-            best = routes[0]
-            max_buy = int(best["buy"] * 1.10)
-            min_sell = int(best["sell"] * 0.90)
-
-            # Plan: Goto Src -> Buy -> Goto Snk -> Sell -> Stop (wait for LLM to assign next task)
-            new_plan = (
-                f"goto {best['src']}, "
-                f"buy {best['good']} max:{max_buy}, "
-                f"goto {best['snk']}, "
-                f"sell {best['good']} min:{min_sell}, "
-                f"stop"
-            )
+        new_plan = plan + ", stop"
 
         # 2. Delegate to assign()
         # This handles parsing, state reset (step 0, phase INIT), and saving automatically.
@@ -3081,7 +3164,12 @@ def view_ships(system_symbol: str = None) -> str:
                 state = "PAUSED" if cfg.paused else cfg.step_phase
                 if cfg.error_message:
                     state = f"ERR: {cfg.error_message}"
-                beh_text = f" | Job: {cfg.steps_str} [{state}]"
+                # Highlight current step with [[ ]]
+                steps = cfg.steps_str.split(",")
+                if cfg.current_step_index < len(steps):
+                    steps[cfg.current_step_index] = f"[[ {steps[cfg.current_step_index].strip()} ]]"
+                highlighted_steps = ", ".join(steps)
+                beh_text = f" | Job: {highlighted_steps} [{state}]"
 
             lines.append(f"   {symbol} ({s.get('registration', {}).get('role', '?')})")
             lines.append(
