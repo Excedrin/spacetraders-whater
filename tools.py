@@ -1623,6 +1623,8 @@ def _get_probe_plan(ship_location: str, phase: int, claimed_targets: set = None)
     for wp in system_wps:
         if wp.get("has_market"):
             wp_sym = wp["symbol"]
+            if wp_sym == ship_location:
+                continue  # Skip current location — we just scouted it
             if claimed_targets and wp_sym in claimed_targets:
                 continue  # Another probe is already headed there
             age = now - wp.get("last_updated", 0)
@@ -2804,16 +2806,16 @@ class BehaviorEngine:
         if not current_entry.get("has_market") or not dest_entry.get("has_market"):
             return  # Can't trade without markets at both locations
 
-        # Get market data for current and destination waypoints
-        current_market = current_entry.get("market", {})
-        dest_market = dest_entry.get("market", {})
+        # Get cached trade_goods for current and destination waypoints
+        current_goods = current_entry.get("trade_goods", [])
+        dest_goods = dest_entry.get("trade_goods", [])
 
-        if not current_market or not dest_market:
+        if not current_goods or not dest_goods:
             return  # No market data cached
 
-        # Extract current and destination price lists
-        current_exchange = {item["symbol"]: item for item in current_market.get("exchange", [])}
-        dest_exchange = {item["symbol"]: item for item in dest_market.get("exchange", [])}
+        # Build lookup dicts by symbol
+        current_exchange = {item["symbol"]: item for item in current_goods}
+        dest_exchange = {item["symbol"]: item for item in dest_goods}
 
         # Build set of goods already in the behavior sequence
         goods_in_sequence = set()
@@ -3981,27 +3983,28 @@ def view_market(waypoint_symbol: str) -> str:
             if api_error:
                 lines.append(f"  API error: {api_error}")
 
-    # Shipyard data (if present at same waypoint)
-    try:
-        shipyard = client.get_shipyard(system_symbol, waypoint_symbol)
-        if isinstance(shipyard, dict) and "error" not in shipyard and shipyard:
-            _save_shipyard_to_cache(waypoint_symbol, shipyard)
-            ships = shipyard.get("ships", shipyard.get("shipTypes", []))
-            lines.append(f"\nShipyard at {waypoint_symbol}:")
-            if isinstance(ships, list) and ships:
-                for s in ships:
-                    if isinstance(s, dict) and "name" in s:
-                        lines.append(
-                            f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits"
-                        )
-                    else:
-                        lines.append(f"  {s.get('type', str(s))}")
-            else:
-                lines.append(
-                    "  No ship details available (need a ship present to see prices)."
-                )
-    except Exception:
-        pass
+    # Shipyard data (only if waypoint has a shipyard)
+    if cached.get("has_shipyard"):
+        try:
+            shipyard = client.get_shipyard(system_symbol, waypoint_symbol)
+            if isinstance(shipyard, dict) and "error" not in shipyard and shipyard:
+                _save_shipyard_to_cache(waypoint_symbol, shipyard)
+                ships = shipyard.get("ships", shipyard.get("shipTypes", []))
+                lines.append(f"\nShipyard at {waypoint_symbol}:")
+                if isinstance(ships, list) and ships:
+                    for s in ships:
+                        if isinstance(s, dict) and "name" in s:
+                            lines.append(
+                                f"  {s.get('type', '?')} ({s.get('name', '?')}) — {s.get('purchasePrice', '?')} credits"
+                            )
+                        else:
+                            lines.append(f"  {s.get('type', str(s))}")
+                else:
+                    lines.append(
+                        "  No ship details available (need a ship present to see prices)."
+                    )
+        except Exception:
+            pass
 
     return "\n".join(lines)
 
