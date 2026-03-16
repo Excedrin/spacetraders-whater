@@ -153,4 +153,7 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - Eliminates need for separate tool calls; atomic consistency across bot/CLI.
 - `play_cli.py` reads advisor from state instead of calling tool directly.
 
+**HQ Design Philosophy — Short-Lived Behaviors + Idle Re-evaluation:**
+The core pattern is that ships receive short, focused behaviors (e.g., `goto WP, scout, stop` or a single trade route ending in `stop`). When a behavior completes, the ship becomes idle, and `assign_idle_ships()` re-evaluates what it should do next based on current game state. This means strategic pivots happen naturally — a hauler that just finished a trade run might be reassigned to buy construction materials, or a probe that just scouted a market might be sent to the most stale market across the entire system. No behavior needs to encode long-term strategy; the HQ director handles that by making fresh decisions each time a ship goes idle. This keeps individual behaviors simple while enabling complex fleet-wide coordination like "pause trading to fund jump gate construction" or "redirect probes to cover neglected market clusters."
+
 This design successfully separates the "Game Engine" (autonomous server tick loop) from the "Brain" (occasional LLM strategic intervention), making the system robust and scalable. The HQ Director extends this by adding a third layer: **Autonomous Task Distribution** that intelligently assigns idle ships based on game phase, without requiring LLM intervention.

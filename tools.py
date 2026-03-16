@@ -86,18 +86,36 @@ def _save_cache(cache: dict):
     WAYPOINT_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
+def _fetch_and_cache_construction(wp_sym: str):
+    """Fetch construction status from API and store it in the waypoint cache."""
+    sys_sym = wp_sym.rsplit("-", 1)[0]
+    const = client.get_construction(sys_sym, wp_sym)
+    if not isinstance(const, dict) or "error" in const:
+        return
+    cache = load_waypoint_cache()
+    entry = cache.setdefault(wp_sym, {})
+    entry["construction"] = {
+        "isComplete": const.get("isComplete", False),
+        "materials": const.get("materials", []),
+    }
+    _save_cache(cache)
+
+
 def _ingest_waypoints(waypoints: list[dict]):
     """Ingest raw API waypoint objects into the unified cache.
 
     Merges all raw API data and determines traits like has_market, has_shipyard, is_charted.
+    Also fetches construction status for newly discovered JUMP_GATEs.
     """
     cache = load_waypoint_cache()
     modified = False
+    new_jump_gates = []
     for wp in waypoints:
         sym = wp.get("symbol")
         if not sym:
             continue
         entry = cache.setdefault(sym, {})
+        is_new_gate = wp.get("type") == "JUMP_GATE" and "construction" not in entry
         entry.update(wp)  # Merge all raw API data
 
         # Determine traits and flags
@@ -107,8 +125,15 @@ def _ingest_waypoints(waypoints: list[dict]):
         entry["has_shipyard"] = "SHIPYARD" in traits
         modified = True
 
+        if is_new_gate:
+            new_jump_gates.append(sym)
+
     if modified:
         _save_cache(cache)
+
+    # Fetch construction status for newly discovered jump gates (after saving main cache)
+    for jg_sym in new_jump_gates:
+        _fetch_and_cache_construction(jg_sym)
 
 
 def get_system_waypoints(system_symbol: str, waypoint_type: str = None, trait: str = None) -> list[dict]:
@@ -369,22 +394,27 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         if s.get("registration", {}).get("role") in ["COMMAND", "HAULER", "FREIGHTER"]
     )
 
-    reserve_needed = max(trader_count * 200000, 200000)
+    reserve_needed = max(trader_count * 350000, 350000)
     excess = credits - reserve_needed
 
     search_sys = system_symbol
     if not search_sys and ships:
         search_sys = ships[0].get("nav", {}).get("systemSymbol")
 
-    # --- NEW: Check Jump Gate Status ---
+    # --- Check Jump Gate Status (from waypoint cache, no API call) ---
     gate_built = False
+    needs_gate_materials = False
     if search_sys:
-        jgs = get_system_waypoints(search_sys, waypoint_type="JUMP_GATE")
-        if jgs:
-            jg_sym = jgs[0]["symbol"]
-            const = client.get_construction(search_sys, jg_sym)
-            if isinstance(const, dict) and "error" not in const:
+        cache = load_waypoint_cache()
+        for wp_sym, wp_data in cache.items():
+            if not isinstance(wp_data, dict) or not wp_sym.startswith(search_sys + "-"):
+                continue
+            if wp_data.get("type") == "JUMP_GATE":
+                const = wp_data.get("construction", {})
                 gate_built = const.get("isComplete", False)
+                if not gate_built:
+                    needs_gate_materials = True
+                break
 
     # --- UPDATED: Phase Logic ---
     if trader_count < 2:
@@ -400,21 +430,28 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         phase = 4
         phase_name = "PHASE 4: EXPANSION (Goal: Chart new systems, build massive fleet)"
 
-    # Shipyard Info
+    # Shipyard Info — check cache for ship pricing, fall back to has_shipyard flag
     cache = load_market_cache()
-    hauler_price = 300000
+    hauler_price = float("inf")
     cheapest_shipyard = "Unknown"
+    fallback_shipyard = None
 
     if search_sys:
         for wp, data in cache.items():
-            if not isinstance(data, dict):
+            if not isinstance(data, dict) or not wp.startswith(search_sys + "-"):
                 continue
-            if wp.startswith(search_sys) and "ships" in data:
+            if "ships" in data:
                 for s in data["ships"]:
                     if s["type"] in ["SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_COMMAND_FRIGATE"]:
                         if s.get("purchasePrice", float("inf")) < hauler_price:
                             hauler_price = s["purchasePrice"]
                             cheapest_shipyard = wp
+            elif data.get("has_shipyard") and not fallback_shipyard:
+                fallback_shipyard = wp
+
+        # If no priced shipyard found, use any known shipyard with default price
+        if cheapest_shipyard == "Unknown" and fallback_shipyard:
+            cheapest_shipyard = fallback_shipyard
 
     ship_at_shipyard = False
     if cheapest_shipyard != "Unknown":
@@ -436,6 +473,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         "cheapest_shipyard": cheapest_shipyard,
         "ship_at_shipyard": ship_at_shipyard,
         "can_buy_ship": can_buy_ship,
+        "needs_gate_materials": needs_gate_materials,
     }
 
 
@@ -1657,12 +1695,13 @@ def _get_probe_plan(ship_location: str, phase: int, claimed_targets: set = None)
                 continue  # Another probe is already headed there
             age = now - wp.get("last_updated", 0)
 
-            # Calculate distance to prioritize nearby markets
+            # Distance as minor tiebreaker only — staleness is the primary factor
             sx, sy = cache.get(ship_location, {}).get("x", 0), cache.get(ship_location, {}).get("y", 0)
             wx, wy = wp.get("x", 0), wp.get("y", 0)
             dist = max(1.0, math.sqrt((wx - sx)**2 + (wy - sy)**2))
 
-            score = (age + 60) / dist
+            # Primary: staleness (seconds). Tiebreaker: prefer closer (subtract small fraction)
+            score = age - dist * 0.1
             markets.append((score, wp_sym, age))
 
     if markets:
@@ -1691,18 +1730,7 @@ def assign_idle_ships(fleet, engine):
 
     strat = evaluate_fleet_strategy()
 
-    # Get available Jump Gate info for Phase 3
-    needs_gate_materials = False
-    if strat["phase"] == 3:
-        ships_data = client.list_ships()
-        if isinstance(ships_data, list) and ships_data:
-            sys_sym = ships_data[0]["nav"]["systemSymbol"]
-            jgs = get_system_waypoints(sys_sym, waypoint_type="JUMP_GATE")
-            if jgs:
-                jg_sym = jgs[0]["symbol"]
-                const = client.get_construction(sys_sym, jg_sym)
-                if isinstance(const, dict) and "error" not in const and not const.get("isComplete"):
-                    needs_gate_materials = True
+    needs_gate_materials = strat["needs_gate_materials"]
 
     # Track probe destinations to avoid duplicate scouting assignments
     # Seed with GOTO destinations of probes already running behaviors
@@ -1714,7 +1742,11 @@ def assign_idle_ships(fleet, engine):
                 if step.step_type == StepType.GOTO and step.args:
                     probe_targets.add(step.args[0])
 
-    buyer_assigned = strat["ship_at_shipyard"]
+    buyer_assigned = False
+
+    log.info(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
+             f"Credits: {strat['credits']:,} | Excess: {strat['excess']:,} | "
+             f"Can buy: {strat['can_buy_ship']} | Shipyard: {strat['cheapest_shipyard']}")
 
     for ship_symbol in idle_ships:
         ship_status = fleet.get_ship(ship_symbol)
@@ -1838,6 +1870,9 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
         for r in routes:
             if r["good"] in goods_in_plan:
                 continue
+            # Skip routes where source and sink are the same market
+            if r["src"] == r["snk"]:
+                continue
             src_dist = dist(pos, r["src"])
             max_buy = int(r["buy"] * 1.10)
             units = _estimate_buyable_units(r["buy"], max_buy, r["volume"], spare)
@@ -1852,6 +1887,9 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, best, est_units = candidates[0]
+
+        log.info(f"[TradeRoute] {ship_symbol} pick: {best['good']} src={best['src']} snk={best['snk']} "
+                 f"buy={best['buy']} sell={best['sell']} est_units={est_units} spare={spare} pos={pos}")
 
         # Sell-as-you-go: if best source is also a sell sink for pending cargo
         for good, sell_info in list(pending_sells.items()):
@@ -1870,7 +1908,7 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
             pos = best["src"]
 
         max_buy = int(best["buy"] * 1.10)
-        steps.append(f"buy {best['good']} max:{max_buy}")
+        steps.append(f"buy {best['good']} {est_units} max:{max_buy}")
 
         pending_sells[best["good"]] = {"wp": best["snk"], "min_sell": int(best["sell"] * 0.90)}
         goods_in_plan.add(best["good"])
@@ -2390,6 +2428,9 @@ class BehaviorEngine:
         except Exception as e:
             raise e
 
+        # Update cached construction status after supplying materials
+        _fetch_and_cache_construction(waypoint)
+
         self._advance(cfg, ship, fleet)
         return None
 
@@ -2590,16 +2631,11 @@ class BehaviorEngine:
             if wp_data.get("type") != "JUMP_GATE":
                 continue
 
-            # Check if incomplete (requires API call to verify)
-            sys_sym = wp_sym.rsplit("-", 1)[0]
-            const = client.get_construction(sys_sym, wp_sym)
-
-            if isinstance(const, dict) and "error" in const:
-                # Skip on error
-                continue
-
+            # Check if incomplete (from cached construction status)
+            const = wp_data.get("construction", {})
+            if not const:
+                continue  # No construction data cached yet
             if const.get("isComplete", False):
-                # Gate is complete, skip
                 continue
 
             # This gate is incomplete. Calculate distance if we have coords.
@@ -2642,10 +2678,14 @@ class BehaviorEngine:
 
         sys_sym = jg_sym.rsplit("-", 1)[0]
 
-        # 2. Check Construction Status
-        const = client.get_construction(sys_sym, jg_sym)
-        if isinstance(const, dict) and "error" in const:
-            raise Exception(const["error"])
+        # 2. Check Construction Status (from cache)
+        cache = load_waypoint_cache()
+        const = cache.get(jg_sym, {}).get("construction", {})
+        if not const:
+            # No cached data — fetch once and cache it
+            _fetch_and_cache_construction(jg_sym)
+            cache = load_waypoint_cache()
+            const = cache.get(jg_sym, {}).get("construction", {})
 
         if const.get("isComplete", False) or not const.get("materials"):
             cfg.paused = True
@@ -3015,12 +3055,16 @@ class BehaviorEngine:
             sell_step = Step(StepType.SELL, [symbol, f"min:{min_sell}"])
             new_steps.append((buy_step, sell_step))
 
-        # Insert steps before the GOTO (at current_step_index + 1)
-        insert_pos = next_idx
+        # Insert BUY steps before the GOTO, SELL steps after the GOTO
+        # Result: buy HERE, goto DEST, sell THERE
+        buy_insert = next_idx
+        sell_insert = next_idx + 1  # After the GOTO step
         for buy_step, sell_step in new_steps:
-            cfg.steps.insert(insert_pos, sell_step)
-            cfg.steps.insert(insert_pos, buy_step)
-            insert_pos += 2
+            cfg.steps.insert(buy_insert, buy_step)
+            sell_insert += 1  # Adjust for the buy we just inserted
+            cfg.steps.insert(sell_insert, sell_step)
+            buy_insert += 1  # Next buy goes after previous buy
+            sell_insert += 1  # Next sell goes after previous sell
 
         # Rebuild steps_str to persist changes
         cfg.steps_str = ", ".join(str(s) for s in cfg.steps)
