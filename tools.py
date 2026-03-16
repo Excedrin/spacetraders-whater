@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import math
@@ -39,7 +40,8 @@ def set_alert_queue(q):
 
 
 # HQ Director Toggle
-_hq_enabled = True
+
+_hq_enabled = ast.literal_eval(os.environ.get("ST_ENABLE_HQ", "False"))
 
 
 def set_hq_enabled(enabled: bool):
@@ -1058,6 +1060,14 @@ def _sell_cargo_logic(
                 f"{trade_symbol} is required by an active contract. Use force=True to override."
             )
 
+        # Check Gate Materials Safety
+        if trade_symbol in ["FAB_MATS", "ADVANCED_CIRCUITRY"]:
+            strat = evaluate_fleet_strategy()
+            if strat.get("needs_gate_materials"):
+                raise Exception(
+                    f"{trade_symbol} is needed for Jump Gate construction! Use force=True to override."
+                )
+
     # 2. Get ship state from local tracker (0 API calls)
     ship = _get_local_ship(ship_symbol)
     waypoint = ship.location
@@ -1085,7 +1095,12 @@ def _sell_cargo_logic(
                         max_per_transaction = vol
                     break
 
-    # 4. Sell in chunks if needed
+    # 4. Enforce minimum price from cargo costs if not explicitly set
+    avg_cost = ship.cargo_costs.get(trade_symbol, 0.0)
+    if min_price is None and avg_cost > 0:
+        min_price = int(avg_cost) + 1  # Never sell below cost
+
+    # 5. Sell in chunks if needed
     _ensure_dock_logic(ship_symbol)
     total_sold = 0
     total_revenue = 0
@@ -1109,6 +1124,9 @@ def _sell_cargo_logic(
         total_sold += units_sold
         total_revenue += tx.get("totalPrice", 0)
         sell_count += 1
+
+        # Update cargo costs on sell
+        ship.update_cargo_costs_on_sell(trade_symbol, units_sold)
 
         # 1. Did the price drop below our floor on THIS transaction?
         if min_price and price_per_unit < min_price:
@@ -1231,6 +1249,9 @@ def _buy_cargo_logic(
         total_purchased += units_bought
         total_cost += tx.get("totalPrice", 0)
         purchase_count += 1
+
+        # Update cargo cost tracking
+        ship.record_purchase(trade_symbol, units_bought, float(price_per_unit))
 
         # 1. Did we accidentally overpay on THIS transaction?
         if max_price and price_per_unit > max_price:
@@ -3589,9 +3610,6 @@ def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:
         # For selling cargo, we want purchasePrice (what they pay us)
         if mm["purchasePrice"]:
             candidates.append({"wp": res["symbol"], "price": mm["purchasePrice"]})
-        elif "Import" in mm["roles"] or "Exchange" in mm["roles"]:
-            # It's an import/exchange, but we don't have price data.
-            candidates.append({"wp": res["symbol"], "price": 0})
 
     if not candidates:
         return None

@@ -34,6 +34,9 @@ class ShipStatus:
     available_at: float = 0.0  # Unix timestamp when ship becomes available
     busy_reason: str = ""  # "extraction_cooldown", "in_transit", etc.
 
+    # Cargo cost tracking (average cost per unit for each good)
+    cargo_costs: dict = field(default_factory=dict)  # {good_symbol: avg_cost_per_unit}
+
     def is_available(self) -> bool:
         """Check if ship is available for commands."""
         return time.time() >= self.available_at
@@ -51,6 +54,24 @@ class ShipStatus:
         """Mark ship as available."""
         self.available_at = 0.0
         self.busy_reason = ""
+
+    def record_purchase(self, good_symbol: str, units_bought: int, price_per_unit: float):
+        """Update average cost for purchased cargo."""
+        if units_bought <= 0:
+            return
+        current_avg = self.cargo_costs.get(good_symbol, 0.0)
+        current_units = sum(u for item in self.cargo_inventory if item["symbol"] == good_symbol for u in [item["units"]])
+
+        new_avg = (current_avg * current_units + price_per_unit * units_bought) / (current_units + units_bought)
+        self.cargo_costs[good_symbol] = new_avg
+
+    def update_cargo_costs_on_sell(self, good_symbol: str, units_sold: int):
+        """Update cargo costs when cargo is sold/jettisoned."""
+        if good_symbol not in self.cargo_costs:
+            return
+        remaining_units = sum(u for item in self.cargo_inventory if item["symbol"] == good_symbol for u in [item["units"]])
+        if remaining_units <= 0:
+            self.cargo_costs.pop(good_symbol, None)
 
     def summary(self) -> str:
         """One-line summary of ship status."""
@@ -101,6 +122,7 @@ class FleetTracker:
                         flight_mode=ship_data.get("flight_mode", "CRUISE"),
                         available_at=ship_data.get("available_at", 0.0),
                         busy_reason=ship_data.get("busy_reason", ""),
+                        cargo_costs=ship_data.get("cargo_costs", {}),
                     )
                     self.ships[ship.symbol] = ship
             except (json.JSONDecodeError, KeyError):
@@ -129,6 +151,7 @@ class FleetTracker:
                     "flight_mode": s.flight_mode,
                     "available_at": s.available_at,
                     "busy_reason": s.busy_reason,
+                    "cargo_costs": s.cargo_costs,
                 }
                 for s in self.ships.values()
             ]
