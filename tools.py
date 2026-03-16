@@ -2829,7 +2829,7 @@ class BehaviorEngine:
         # 6. Execute!
         self.assign(
             cfg.ship_symbol,
-            f"goto {src_wp}, buy {target_mat} {buy_qty}, goto {jg_sym}, supply {target_mat}, construct",
+            f"goto {src_wp}, buy {target_mat} {buy_qty}, goto {jg_sym}, supply {target_mat}, stop",
         )
         return None
 
