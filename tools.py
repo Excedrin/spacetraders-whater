@@ -21,6 +21,9 @@ from api_client import SpaceTradersClient
 load_dotenv()
 client = SpaceTradersClient(os.environ["ST_TOKEN"])
 
+TRADE_PROFIT_MARGIN = 0.10  # 10% margin for planned trades
+JIT_TRADE_MARGIN = 0.02     # 2% safety margin for JIT trades
+
 # Fleet tracker — injected by the caller (bot.py or play_cli.py) via set_fleet().
 _fleet = None
 
@@ -1932,7 +1935,12 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
 
             best = _find_best_sell_market(ship_symbol, good)
             if best:
-                pending_sells[good] = {"wp": best["wp"], "min_sell": int(best.get("sell", 0) * 0.90)}
+                cost = ship.cargo_costs.get(good, 0.0)
+                if cost > 0:
+                    min_sell = int(cost * (1.0 + TRADE_PROFIT_MARGIN))
+                else:
+                    min_sell = int(best["price"] * (1.0 - TRADE_PROFIT_MARGIN))
+                pending_sells[good] = {"wp": best["wp"], "min_sell": min_sell}
                 goods_in_plan.add(good)
             else:
                 return ""  # Cannot sell existing cargo, fail plan to trigger alert
@@ -1953,7 +1961,7 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
             if r["src"] == r["snk"]:
                 continue
             src_dist = dist(pos, r["src"])
-            max_buy = int(r["buy"] * 1.10)
+            max_buy = int(r["buy"] * (1.0 + TRADE_PROFIT_MARGIN))
             units = _estimate_buyable_units(r["buy"], max_buy, r["volume"], spare)
             if units <= 0:
                 continue
@@ -1986,10 +1994,10 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
             steps.append(f"goto {best['src']}")
             pos = best["src"]
 
-        max_buy = int(best["buy"] * 1.10)
+        max_buy = int(best["buy"] * (1.0 + TRADE_PROFIT_MARGIN))
         steps.append(f"buy {best['good']} {est_units} max:{max_buy}")
 
-        pending_sells[best["good"]] = {"wp": best["snk"], "min_sell": int(best["sell"] * 0.90)}
+        pending_sells[best["good"]] = {"wp": best["snk"], "min_sell": int(best["sell"] * (1.0 - TRADE_PROFIT_MARGIN))}
         goods_in_plan.add(best["good"])
         spare -= est_units
 
@@ -2339,7 +2347,12 @@ class BehaviorEngine:
         min_price = None
         for arg in step.args[1:]:
             if arg.startswith("min:"):
-                min_price = int(arg[4:])
+                try:
+                    parsed_min = int(arg[4:])
+                    if parsed_min > 0:
+                        min_price = parsed_min
+                except ValueError:
+                    pass
                 break
         # Refresh market cache before selling so prices are current
         if ship.location:
@@ -3037,29 +3050,37 @@ class BehaviorEngine:
         HQ JIT Planner Hook: Evaluate dynamic multi-cargo opportunities before advancing.
 
         This hook runs when a step completes and checks if the next step is a GOTO.
-        If so, it calculates spare cargo capacity and dynamically inserts profitable
-        secondary cargo trades (profit > 15/unit) between current step and destination.
+        If so, it calculates spare cargo capacity and dynamically inserts the single most
+        profitable secondary cargo trade (profit > 15/unit) between current step and destination.
+        On subsequent _advance calls, if more capacity exists, it will insert the next trade.
         """
         # Check if the next step exists and is a GOTO
         next_idx = cfg.current_step_index + 1
         if next_idx >= len(cfg.steps):
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: No next step after current index")
             return  # No next step or behavior will loop
 
         next_step = cfg.steps[next_idx]
         if next_step.step_type != StepType.GOTO:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: Next step is not GOTO, it's {next_step.step_type}")
             return  # Not a navigation step
 
         dest_waypoint = next_step.args[0] if next_step.args else None
         if not dest_waypoint or not ship.location:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: Missing destination or ship location")
             return  # Can't determine route
 
         if ship.location == dest_waypoint:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: Already at destination {dest_waypoint}")
             return  # Already at destination
 
         # Calculate spare cargo capacity
         spare_capacity = ship.cargo_capacity - ship.cargo_units
         if spare_capacity <= 0:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: No spare cargo capacity ({ship.cargo_units}/{ship.cargo_capacity})")
             return  # No room for additional cargo
+
+        log.info(f"[HQ JIT] {cfg.ship_symbol}: Checking opportunities {ship.location} -> {dest_waypoint} (spare: {spare_capacity} units)")
 
         # Load market cache for both current and destination waypoints
         cache = load_waypoint_cache()
@@ -3067,6 +3088,7 @@ class BehaviorEngine:
         dest_entry = cache.get(dest_waypoint, {})
 
         if not current_entry.get("has_market") or not dest_entry.get("has_market"):
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: Missing market data at {ship.location} or {dest_waypoint}")
             return  # Can't trade without markets at both locations
 
         # Get cached trade_goods for current and destination waypoints
@@ -3074,6 +3096,7 @@ class BehaviorEngine:
         dest_goods = dest_entry.get("trade_goods", [])
 
         if not current_goods or not dest_goods:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: No trade goods cached for route")
             return  # No market data cached
 
         # Build lookup dicts by symbol
@@ -3107,50 +3130,54 @@ class BehaviorEngine:
                     "buy_price": buy_price,
                     "sell_price": sell_price,
                     "profit_per_unit": profit_per_unit,
-                    "max_units": min(spare_capacity, item.get("tradeVolume", 0)),
+                    "trade_volume": item.get("tradeVolume", 0),
                 })
 
         if not profitable_trades:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: No profitable trades found (threshold: >15 credits/unit)")
             return  # No profitable opportunities
 
         # Sort by profit per unit (descending)
         profitable_trades.sort(key=lambda x: x["profit_per_unit"], reverse=True)
 
-        # Dynamically insert buy/sell steps with price safety bounds
-        # Insert in reverse order so indices stay valid
-        new_steps = []
-        for trade in profitable_trades:
-            symbol = trade["symbol"]
-            buy_price = trade["buy_price"]
-            sell_price = trade["sell_price"]
-            units = trade["max_units"]
+        # Process only the single most profitable trade
+        trade = profitable_trades[0]
+        symbol = trade["symbol"]
+        buy_price = trade["buy_price"]
+        sell_price = trade["sell_price"]
+        profit_per_unit = trade["profit_per_unit"]
 
-            # Set safety margin: buy 2% below current price, sell 2% above
-            max_buy = int(buy_price * 1.02)
-            min_sell = int(sell_price * 0.98)
+        units = min(spare_capacity, trade["trade_volume"])
+        if units <= 0:
+            log.debug(f"[HQ JIT] {cfg.ship_symbol}: Can't fit {symbol} (need {trade['trade_volume']}, have {spare_capacity})")
+            return
 
-            # Create BUY and SELL steps
-            buy_step = Step(StepType.BUY, [symbol, str(units), f"max:{max_buy}"])
-            sell_step = Step(StepType.SELL, [symbol, f"min:{min_sell}"])
-            new_steps.append((buy_step, sell_step))
+        # Set safety margin
+        max_buy = int(buy_price * (1.0 + JIT_TRADE_MARGIN))
+        min_sell = int(sell_price * (1.0 - JIT_TRADE_MARGIN))
 
-        # Insert BUY steps before the GOTO, SELL steps after the GOTO
+        # Create BUY and SELL steps
+        buy_step = Step(StepType.BUY, [symbol, str(units), f"max:{max_buy}"])
+        sell_step = Step(StepType.SELL, [symbol, f"min:{min_sell}"])
+
+        # Insert BUY before the GOTO, SELL after the GOTO
         # Result: buy HERE, goto DEST, sell THERE
         buy_insert = next_idx
         sell_insert = next_idx + 1  # After the GOTO step
-        for buy_step, sell_step in new_steps:
-            cfg.steps.insert(buy_insert, buy_step)
-            sell_insert += 1  # Adjust for the buy we just inserted
-            cfg.steps.insert(sell_insert, sell_step)
-            buy_insert += 1  # Next buy goes after previous buy
-            sell_insert += 1  # Next sell goes after previous sell
+
+        cfg.steps.insert(buy_insert, buy_step)
+        log.info(f"[HQ JIT] {cfg.ship_symbol}: Inserted BUY step: {buy_step}")
+
+        sell_insert += 1  # Adjust for the BUY we just inserted
+        cfg.steps.insert(sell_insert, sell_step)
+        log.info(f"[HQ JIT] {cfg.ship_symbol}: Inserted SELL step: {sell_step}")
 
         # Rebuild steps_str to persist changes
         cfg.steps_str = ", ".join(str(s) for s in cfg.steps)
         self._save()
 
-        # Console message when HQ JIT Planner is triggered
-        print(f"[HQ JIT Planner] {cfg.ship_symbol}: Inserted {len(new_steps)} dynamic cargo trades (spare capacity: {spare_capacity})")
+        # Summary log message
+        log.info(f"👔 [HQ JIT Planner] {cfg.ship_symbol}: {symbol} x{units} @ {buy_price}cr (profit: {profit_per_unit}cr/unit). Next cycle will check for more.")
 
     def _advance(self, cfg, ship, fleet):
         """
@@ -5033,25 +5060,25 @@ def assign_trade_route(
     s_good = sell_good if sell_good else buy_good
     cache = load_market_cache()
 
-    # Buy step: alert if price spikes more than 10% above the expected purchase price
+    # Buy step: alert if price spikes beyond expected margin
     buy_step = f"buy {buy_good}"
     buy_market = cache.get(buy_waypoint, {})
     for good in buy_market.get("trade_goods", []):
         if good.get("symbol") == buy_good:
             buy_cost = good.get("purchasePrice")
             if buy_cost:
-                max_buy = int(buy_cost * 1.10)
+                max_buy = int(buy_cost * (1.0 + TRADE_PROFIT_MARGIN))
                 buy_step = f"buy {buy_good} max:{max_buy}"
             break
 
-    # Sell step: alert if price drops more than 10% below the expected sell price
+    # Sell step: alert if price drops below expected margin
     sell_step = f"sell {s_good}"
     sell_market = cache.get(sell_waypoint, {})
     for good in sell_market.get("trade_goods", []):
         if good.get("symbol") == s_good:
             sell_price = good.get("sellPrice")
             if sell_price:
-                min_sell = int(sell_price * 0.90)
+                min_sell = int(sell_price * (1.0 - TRADE_PROFIT_MARGIN))
                 sell_step = f"sell {s_good} min:{min_sell}"
             break
 
