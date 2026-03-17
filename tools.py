@@ -45,17 +45,50 @@ def set_alert_queue(q):
 
 
 # HQ Director Toggle
+# Can be "NONE", "ALL", or comma-separated list of ship roles/names
+# Ship roles: HAULER, FREIGHTER, SATELLITE, COMMAND
+# Ship names: WHATER-1, WHATER-2, etc.
 
-_hq_enabled = ast.literal_eval(os.environ.get("ST_ENABLE_HQ", "False"))
+_hq_managed_ships = os.environ.get("ST_ENABLE_HQ", "NONE").strip().upper()
 
 
-def set_hq_enabled(enabled: bool):
-    global _hq_enabled
-    _hq_enabled = enabled
+def set_hq_enabled(targets: str):
+    """Set which ships HQ should manage.
+
+    Args:
+        targets: "ALL" (all ships), "NONE" (disable), or comma-separated list of ship roles/names
+                 Examples: "ALL", "NONE", "HAULER,SATELLITE", "WHATER-1,WHATER-2"
+    """
+    global _hq_managed_ships
+    _hq_managed_ships = targets.strip().upper()
 
 
 def get_hq_enabled() -> bool:
-    return _hq_enabled
+    """Returns True if HQ is enabled for any ships."""
+    return _hq_managed_ships != "NONE"
+
+
+def is_ship_hq_managed(ship_symbol: str, fleet) -> bool:
+    """Check if a specific ship should be managed by HQ.
+
+    Args:
+        ship_symbol: The ship's symbol (e.g., "WHATER-1")
+        fleet: FleetTracker instance to get ship role
+
+    Returns:
+        True if the ship should be HQ-managed
+    """
+    if _hq_managed_ships == "NONE":
+        return False
+    if _hq_managed_ships == "ALL":
+        return True
+
+    # Check if ship name or role is in the managed list
+    ship = fleet.get_ship(ship_symbol) if fleet else None
+    ship_role = ship.role if ship else None
+
+    targets = {t.strip() for t in _hq_managed_ships.split(",")}
+    return ship_symbol in targets or ship_role in targets
 
 
 # ──────────────────────────────────────────────
@@ -420,27 +453,26 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     agent = client.get_agent()
     credits = agent.get("credits", 0) if isinstance(agent, dict) and "error" not in agent else 0
 
-    ships = client.list_ships()
-    if isinstance(ships, dict) and "error" in ships:
-        ships = []
+    # Read instantly from local memory instead of API
+    ships = list(_fleet.ships.values()) if _fleet else []
 
     total_ships = len(ships)
     trader_count = sum(
         1 for s in ships
-        if s.get("registration", {}).get("role") in ["COMMAND", "HAULER", "FREIGHTER"]
+        if s.role in ["COMMAND", "HAULER", "FREIGHTER"]
     )
 
     probe_count = sum(
         1 for s in ships
-        if s.get("registration", {}).get("role") == "SATELLITE"
+        if s.role == "SATELLITE"
     )
 
     reserve_needed = max(trader_count * RESERVE_BUFFER, RESERVE_BUFFER)
     excess = credits - reserve_needed
 
     search_sys = system_symbol
-    if not search_sys and ships:
-        search_sys = ships[0].get("nav", {}).get("systemSymbol")
+    if not search_sys and ships and ships[0].location:
+        search_sys = get_system_from_waypoint(ships[0].location)
 
     # --- Check Jump Gate Status (from waypoint cache, fetch if missing) ---
     gate_built = False
@@ -515,7 +547,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
 
     ship_at_shipyard = False
     if cheapest_shipyard != "Unknown":
-        ship_at_shipyard = any(s.get("nav", {}).get("waypointSymbol") == cheapest_shipyard for s in ships)
+        ship_at_shipyard = any(s.location == cheapest_shipyard for s in ships)
 
     # --- Allow fleet expansion post-gate ---
     # Max 3 traders before gate, max 15 traders after gate.
@@ -583,8 +615,7 @@ def get_financial_assessment(system_symbol: str = None) -> str:
             f"🔴 LOW CAPITAL: Do not buy ships or materials! Focus on autotrade to build reserve."
         )
 
-    hq_status = "ENABLED" if get_hq_enabled() else "DISABLED"
-    lines.append(f"\n[HQ Fleet Director: {hq_status}]")
+    lines.append(f"\n[HQ Fleet Director: {_hq_managed_ships}]")
 
     return "\n".join(lines)
 
@@ -1852,6 +1883,10 @@ def assign_idle_ships(fleet, engine):
         if not ship_status or not ship_status.is_available():
             continue
 
+        # Skip ships that aren't managed by HQ
+        if not is_ship_hq_managed(ship_symbol, fleet):
+            continue
+
         role = ship_status.role
 
         # FEATURE 2a: Buy Probe (cheap, high value — check first)
@@ -1985,6 +2020,41 @@ def _build_sell_sequence(ship_symbol: str, cargo_map: dict, ship) -> Optional[li
             steps.append(f"sell {good} min:{min_sell}")
 
     return steps
+
+
+def _clear_unwanted_cargo_or_reassign(cfg, ship, next_step_name: str, engine) -> Optional[str]:
+    """
+    Helper: If ship has unwanted cargo, build a sell sequence and reassign behavior.
+
+    Args:
+        cfg: BehaviorConfig
+        ship: Ship status object
+        next_step_name: Step to append after selling (e.g., 'construct', 'negotiate')
+        engine: BehaviorEngine instance
+
+    Returns:
+        None to continue step execution, or error string if cargo can't be sold
+    """
+    cargo = client.get_cargo(cfg.ship_symbol)
+    inv = cargo.get("inventory", [])
+
+    if cargo.get("units", 0) > 0:
+        cargo_map = {item["symbol"]: item.get("units", 1) for item in inv}
+        sell_steps = _build_sell_sequence(cfg.ship_symbol, cargo_map, ship)
+
+        if sell_steps is None:
+            cfg.paused = True
+            cfg.alert_sent = True
+            engine._save()
+            return f"{cfg.ship_symbol} ALERT: Has cargo but can't find markets to sell."
+
+        steps = sell_steps + [next_step_name]
+        behavior_str = ", ".join(steps)
+        engine.assign(cfg.ship_symbol, behavior_str)
+        log.info(f"[{next_step_name.upper()}] {cfg.ship_symbol}: Has unwanted cargo. Auto-assigning: {behavior_str}")
+        return None  # Step completed, new behavior assigned
+
+    return None  # No cargo to clear, continue with normal step
 
 
 def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
@@ -2894,22 +2964,27 @@ class BehaviorEngine:
             self._save()
             return f"{cfg.ship_symbol} ALERT: Jump gate construction in {sys_sym} is COMPLETE!"
 
-        # 3. Find needed material
-        target_mat = None
-        needed_qty = 0
-        for mat in const.get("materials", []):
-            if mat.get("fulfilled", 0) < mat.get("required", 0):
-                target_mat = mat["tradeSymbol"]
-                needed_qty = mat["required"] - mat["fulfilled"]
-                break
+        # 3. Find needed material (pick least-completed one to alternate between materials)
+        incomplete_materials = [m for m in const.get("materials", [])
+                                if m.get("fulfilled", 0) < m.get("required", 0)]
 
-        if not target_mat:
+        if not incomplete_materials:
             cfg.paused = True
             cfg.alert_sent = True
             self._save()
             return (
                 f"{cfg.ship_symbol} ALERT: All materials fulfilled. Gate is complete!"
             )
+
+        # Sort by completion percentage (ascending = least complete first)
+        # This alternates supply runs between materials, giving source markets time to restock
+        incomplete_materials.sort(
+            key=lambda m: m.get("fulfilled", 0) / max(m.get("required", 1), 1)
+        )
+
+        mat = incomplete_materials[0]
+        target_mat = mat["tradeSymbol"]
+        needed_qty = mat["required"] - mat["fulfilled"]
 
         # 4. Cargo Check (If we already have the material, go supply it!)
         cargo = client.get_cargo(cfg.ship_symbol)
@@ -2922,23 +2997,10 @@ class BehaviorEngine:
                 )
                 return None
 
-        if cargo.get("units", 0) > 0:
-            # Build sell sequence for unwanted cargo
-            cargo_map = {item["symbol"]: item.get("units", 1) for item in inv}
-            sell_steps = _build_sell_sequence(cfg.ship_symbol, cargo_map, ship)
-
-            if sell_steps is None:
-                cfg.paused = True
-                cfg.alert_sent = True
-                self._save()
-                return f"{cfg.ship_symbol} ALERT: Has cargo but can't find markets to sell."
-
-            # Append construct to the sell sequence
-            steps = sell_steps + ["construct"]
-            behavior_str = ", ".join(steps)
-            self.assign(cfg.ship_symbol, behavior_str)
-            log.info(f"[Construct] {cfg.ship_symbol}: Has unwanted cargo. Auto-assigning: {behavior_str}")
-            return None
+        # Clear unwanted cargo if present
+        clear_result = _clear_unwanted_cargo_or_reassign(cfg, ship, "construct", self)
+        if clear_result is not None:
+            return clear_result  # Either None (success) or error message
 
         # 4b. Check for other ships already delivering this material
         in_transit = 0
@@ -2996,14 +3058,11 @@ class BehaviorEngine:
         credits = agent.get("credits", 0)
 
         # Calculate Required Reserve (same logic as the HUD)
-        ships = client.list_ships()
-        if isinstance(ships, dict) and "error" in ships:
-            ships = []
+        ships = list(_fleet.ships.values()) if _fleet else []
         trader_count = sum(
             1
             for s in ships
-            if s.get("registration", {}).get("role")
-            in ["COMMAND", "HAULER", "FREIGHTER"]
+            if s.role in ["COMMAND", "HAULER", "FREIGHTER"]
         )
         reserve_needed = max(trader_count * 100000, 100000)
 
@@ -3026,6 +3085,12 @@ class BehaviorEngine:
         1. If active contract exists -> Set behavior to fulfill it (Buy -> Deliver loop).
         2. If no active contract -> Go to HQ -> Negotiate -> Accept -> Loop.
         """
+        # 0. Clear unwanted cargo if present
+        ship = _get_local_ship(cfg.ship_symbol)
+        clear_result = _clear_unwanted_cargo_or_reassign(cfg, ship, "negotiate", self)
+        if clear_result is not None:
+            return clear_result  # Either None (success) or error message
+
         # 1. Check for active unfulfilled contracts
         contracts = client.list_contracts()
         if isinstance(contracts, dict) and "error" in contracts:
@@ -3836,7 +3901,7 @@ def _find_waypoints_logic(
 
 @tool
 def view_cargo(ship_symbol: str) -> str:
-    """[READ-ONLY] View the cargo contents of a specific ship."""
+    """[READ-ONLY] View the cargo contents of a specific ship with costs."""
     data = client.get_cargo(ship_symbol)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
@@ -3846,26 +3911,27 @@ def view_cargo(ship_symbol: str) -> str:
     lines = [f"Cargo for {ship_symbol}: {units}/{capacity} units"]
     if not inventory:
         lines.append("  (empty)")
-    for item in inventory:
-        lines.append(f"  {item['symbol']}: {item['units']} units")
+    else:
+        # Get cargo costs from FleetTracker if available
+        ship = _get_local_ship(ship_symbol) if _fleet else None
+        for item in inventory:
+            symbol = item['symbol']
+            item_units = item['units']
+            cost = ship.cargo_costs.get(symbol, 0.0) if ship else 0.0
+            if cost > 0:
+                total_value = int(cost * item_units)
+                lines.append(f"  {symbol}: {item_units} units @ {cost:.0f}cr ea = {total_value:,}cr total")
+            else:
+                lines.append(f"  {symbol}: {item_units} units")
     return "\n".join(lines)
 
 
 @tool
 def view_ship_details(ship_symbol: str) -> str:
     """[READ-ONLY] View detailed ship info: mounts, modules, capabilities."""
-    ships = client.list_ships()
-    if isinstance(ships, dict) and "error" in ships:
-        return f"Error: {ships['error']}"
-
-    ship = None
-    for s in ships:
-        if s.get("symbol") == ship_symbol:
-            ship = s
-            break
-
-    if not ship:
-        return f"Error: Ship {ship_symbol} not found"
+    ship = client.get_ship(ship_symbol)
+    if isinstance(ship, dict) and "error" in ship:
+        return f"Error: {ship['error']}"
 
     lines = [f"=== {ship_symbol} Details ==="]
 
@@ -4190,9 +4256,62 @@ def view_market(waypoint_symbol: str) -> str:
     live prices if a ship is present, otherwise cached prices with staleness indicator.
 
     Args:
-        waypoint_symbol: Waypoint with market (e.g., 'X1-KD26-B7')
+        waypoint_symbol: Waypoint with market (e.g., 'X1-KD26-B7'), or "ALL" to view all cached markets
     """
     import time
+
+    # Handle "ALL" special case — return all cached markets without API calls
+    if waypoint_symbol.upper() == "ALL":
+        cache = load_market_cache()
+        lines = ["=== All Known Markets ==="]
+
+        # Collect all market lags for average calculation
+        lags = []
+        current_time = int(time.time())
+
+        # Sort by system for better organization
+        waypoints_by_system = {}
+        for wp, data in cache.items():
+            if wp == "_systems_fetched":
+                continue
+            # Only include waypoints with MARKETPLACE trait
+            if not data.get("has_market"):
+                continue
+            sys = "-".join(wp.split("-")[:2])
+            waypoints_by_system.setdefault(sys, []).append((wp, data))
+
+        # Display markets grouped by system
+        for sys_sym in sorted(waypoints_by_system.keys()):
+            lines.append(f"\n[{sys_sym}]")
+            for wp, market_data in waypoints_by_system[sys_sym]:
+                last_updated = market_data.get("last_updated")
+                if last_updated:
+                    age_sec = current_time - last_updated
+                    lags.append(age_sec)
+                    if age_sec < 3600:
+                        age_str = f"{age_sec // 60}m"
+                    elif age_sec < 86400:
+                        age_str = f"{age_sec // 3600}h"
+                    else:
+                        age_str = f"{age_sec // 86400}d"
+                else:
+                    age_str = "?"
+
+                goods_count = len(market_data.get("trade_goods", []))
+                lines.append(f"  {wp}: {goods_count} goods ({age_str} old)")
+
+        # Add average lag summary
+        if lags:
+            avg_lag_sec = sum(lags) // len(lags)
+            if avg_lag_sec < 3600:
+                avg_lag_str = f"{avg_lag_sec // 60}m"
+            elif avg_lag_sec < 86400:
+                avg_lag_str = f"{avg_lag_sec // 3600}h"
+            else:
+                avg_lag_str = f"{avg_lag_sec // 86400}d"
+            lines.append(f"\nAverage market age: {avg_lag_str}")
+
+        return "\n".join(lines)
 
     system_symbol = "-".join(waypoint_symbol.split("-")[:2])
     lines = [f"Market at {waypoint_symbol}:"]
@@ -5158,13 +5277,23 @@ def assign_jump_gate_construction(ship_symbol: str) -> str:
 
 
 @tool
-def toggle_hq(enabled: bool) -> str:
-    """[STATE: hq] Enable or disable the automated HQ Fleet Director.
-    If True, HQ will automatically assign tasks to idle ships based on game phase.
-    If False, idle ships will remain idle until you command them.
+def toggle_hq(targets: str) -> str:
+    """[STATE: hq] Configure which ships the HQ Fleet Director manages.
+    Args:
+        targets: "ALL" (manage all ships), "NONE" (disable HQ), or comma-separated list of ship roles/names
+                 Ship roles: HAULER, FREIGHTER, SATELLITE, COMMAND
+                 Examples: "ALL", "HAULER,SATELLITE", "WHATER-1,WHATER-2"
     """
-    set_hq_enabled(enabled)
-    status = "ENABLED (Ships will be auto-assigned)" if enabled else "DISABLED (Manual control only)"
+    set_hq_enabled(targets)
+
+    targets_upper = targets.strip().upper()
+    if targets_upper == "NONE":
+        status = "DISABLED (Manual control only)"
+    elif targets_upper == "ALL":
+        status = "ENABLED for ALL ships"
+    else:
+        status = f"ENABLED for: {targets}"
+
     return f"HQ Fleet Director is now {status}."
 
 
