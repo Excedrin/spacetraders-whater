@@ -23,6 +23,8 @@ client = SpaceTradersClient(os.environ["ST_TOKEN"])
 
 TRADE_PROFIT_MARGIN = 0.10  # 10% margin for planned trades
 JIT_TRADE_MARGIN = 0.02     # 2% safety margin for JIT trades
+GATE_MIN_CREDIT_BUFFER = 250_000 
+RESERVE_BUFFER = 350_000
 
 # Fleet tracker — injected by the caller (bot.py or play_cli.py) via set_fleet().
 _fleet = None
@@ -404,7 +406,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         if s.get("registration", {}).get("role") == "SATELLITE"
     )
 
-    reserve_needed = max(trader_count * 350000, 350000)
+    reserve_needed = max(trader_count * RESERVE_BUFFER, RESERVE_BUFFER)
     excess = credits - reserve_needed
 
     search_sys = system_symbol
@@ -1866,7 +1868,9 @@ def assign_idle_ships(fleet, engine):
         if role in ["HAULER", "COMMAND", "FREIGHTER"]:
             # FEATURE 1: Supply closest Jump Gate with needed materials
             # Assign first idle trader to construction; rest autotrade.
-            if needs_gate_materials and strat["excess"] > 150_000 and not constructor_assigned:
+            # Avoid assigning multiple ships to construct by checking if any other ship is already doing it
+            active_construct_ships = engine._find_active_ships_with_keywords(["supply", "construct"])
+            if needs_gate_materials and strat["excess"] > GATE_MIN_CREDIT_BUFFER and not constructor_assigned and not active_construct_ships:
                 log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction.")
                 engine.assign(ship_symbol, "construct")
                 constructor_assigned = True
@@ -1893,6 +1897,62 @@ def _estimate_buyable_units(cached_price: int, max_price: int, trade_volume: int
         total += lot
         price = price * 1.03  # ~3% increase per lot
     return total
+
+
+def _build_sell_sequence(ship_symbol: str, cargo_map: dict, ship) -> Optional[list[str]]:
+    """
+    Build a sequence of navigation and sell steps for unwanted cargo.
+
+    Args:
+        ship_symbol: Ship to sell cargo from
+        cargo_map: Dict of {good_symbol: units}
+        ship: Ship object with cargo_costs and location
+
+    Returns:
+        List of step strings (goto + sell commands) or None if can't find markets
+    """
+    if not cargo_map:
+        return []
+
+    pos = ship.location
+    pending_sells = {}
+
+    # Check if any cargo is needed for gate construction (special case)
+    needs_gate = evaluate_fleet_strategy().get("needs_gate_materials", False)
+    gate_mats = {"FAB_MATS", "ADVANCED_CIRCUITRY"}
+
+    for good in cargo_map.keys():
+        # If gate needs materials and we have them, prioritize gate supply over normal sell
+        if needs_gate and good in gate_mats:
+            jg_sym = get_engine()._find_closest_incomplete_jump_gate(pos)
+            if jg_sym:
+                return [f"goto {jg_sym}", f"supply {good}"]
+
+        # Find best sell market
+        best = _find_best_sell_market(ship_symbol, good)
+        if best:
+            cost = ship.cargo_costs.get(good, 0.0)
+            if cost > 0:
+                min_sell = int(cost * (1.0 + TRADE_PROFIT_MARGIN))
+            else:
+                min_sell = int(best["price"] * (1.0 - TRADE_PROFIT_MARGIN))
+            pending_sells[good] = {"wp": best["wp"], "min_sell": min_sell}
+        else:
+            return None  # Can't find market for this cargo
+
+    # Group sells by destination waypoint
+    sell_groups = {}
+    for good, info in pending_sells.items():
+        sell_groups.setdefault(info["wp"], []).append((good, info["min_sell"]))
+
+    # Build steps: goto each destination and sell
+    steps = []
+    for wp in sorted(sell_groups.keys()):
+        steps.append(f"goto {wp}")
+        for good, min_sell in sell_groups[wp]:
+            steps.append(f"sell {good} min:{min_sell}")
+
+    return steps
 
 
 def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
@@ -1922,28 +1982,19 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
         return math.sqrt((ax-bx)**2 + (ay-by)**2)
 
     # Phase 1: Sell existing cargo
-    needs_gate = evaluate_fleet_strategy().get("needs_gate_materials", False)
-    gate_mats = {"FAB_MATS", "ADVANCED_CIRCUITRY"}
-
     if cargo_map:
-        for good, units in cargo_map.items():
-            # If gate needs materials and we have them, detour to supply first
-            if needs_gate and good in gate_mats:
-                jg_sym = get_engine()._find_closest_incomplete_jump_gate(pos)
-                if jg_sym:
-                    return f"goto {jg_sym}, supply {good}, autotrade"
+        sell_steps = _build_sell_sequence(ship_symbol, cargo_map, ship)
+        if sell_steps is None:
+            return ""  # Cannot sell existing cargo, fail plan to trigger alert
 
-            best = _find_best_sell_market(ship_symbol, good)
-            if best:
-                cost = ship.cargo_costs.get(good, 0.0)
-                if cost > 0:
-                    min_sell = int(cost * (1.0 + TRADE_PROFIT_MARGIN))
-                else:
-                    min_sell = int(best["price"] * (1.0 - TRADE_PROFIT_MARGIN))
-                pending_sells[good] = {"wp": best["wp"], "min_sell": min_sell}
-                goods_in_plan.add(good)
-            else:
-                return ""  # Cannot sell existing cargo, fail plan to trigger alert
+        if sell_steps and sell_steps[0].startswith("goto "):
+            # Gate supply special case: just return the gate sequence with autotrade
+            return ", ".join(sell_steps) + ", autotrade"
+
+        # Normal sell sequence: add to steps and track goods
+        steps.extend(sell_steps)
+        for good in cargo_map.keys():
+            goods_in_plan.add(good)
 
     # Phase 2: Greedy buy loop
     routes = _analyze_trade_routes(ship_symbol, min_profit=15)
@@ -2582,17 +2633,8 @@ class BehaviorEngine:
         2. Calls self.assign() to overwrite the current behavior with the new plan.
         """
         # --- FLEET-AWARE LOGIC ---
-        # Find goods currently being traded by OTHER ships
-        active_goods = set()
-        for other_cfg in self.behaviors.values():
-            if other_cfg.ship_symbol != cfg.ship_symbol:
-                # Naive parse: find 'buy X' in their steps
-                for part in other_cfg.steps_str.split(","):
-                    part = part.strip()
-                    if part.startswith("buy "):
-                        tokens = part.split()
-                        if len(tokens) > 1:
-                            active_goods.add(tokens[1])
+        # Find goods currently being bought by OTHER ships to avoid duplication
+        active_goods = self._extract_active_goods_for_keyword("buy")
         # ----------------------------
 
         # 1. Check Cargo
@@ -2747,6 +2789,47 @@ class BehaviorEngine:
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
 
+    def _find_active_ships_with_keywords(self, keywords: list[str], exclude_ship: str = None) -> set:
+        """
+        Find all ships that have any of the given keywords in their behavior steps.
+
+        Args:
+            keywords: List of keywords to search for (e.g., ['supply', 'construct'])
+            exclude_ship: Ship symbol to skip (typically the current ship)
+
+        Returns:
+            Set of ship symbols that have the keywords in their behavior
+        """
+        matching = set()
+        for cfg in self.behaviors.values():
+            if exclude_ship and cfg.ship_symbol == exclude_ship:
+                continue
+            for keyword in keywords:
+                if keyword in cfg.steps_str:
+                    matching.add(cfg.ship_symbol)
+                    break
+        return matching
+
+    def _extract_active_goods_for_keyword(self, keyword: str) -> set:
+        """
+        Extract goods/items being actively processed with a keyword by other ships.
+
+        Args:
+            keyword: The keyword to search for (e.g., 'buy', 'sell')
+
+        Returns:
+            Set of goods/items found (e.g., {'IRON_ORE', 'COPPER_ORE'})
+        """
+        goods = set()
+        for cfg in self.behaviors.values():
+            for part in cfg.steps_str.split(","):
+                part = part.strip()
+                if part.startswith(f"{keyword} "):
+                    tokens = part.split()
+                    if len(tokens) > 1:
+                        goods.add(tokens[1])
+        return goods
+
     def _step_construct(self, cfg, ship, step=None) -> Optional[str]:
         """Smart construction: Check jump gate needs, check budget, buy, supply.
 
@@ -2814,10 +2897,45 @@ class BehaviorEngine:
                 return None
 
         if cargo.get("units", 0) > 0:
-            cfg.paused = True
-            cfg.alert_sent = True
-            self._save()
-            return f"{cfg.ship_symbol} ALERT: Has wrong cargo to construct. Empty cargo before resuming."
+            # Build sell sequence for unwanted cargo
+            cargo_map = {item["symbol"]: item.get("units", 1) for item in inv}
+            sell_steps = _build_sell_sequence(cfg.ship_symbol, cargo_map, ship)
+
+            if sell_steps is None:
+                cfg.paused = True
+                cfg.alert_sent = True
+                self._save()
+                return f"{cfg.ship_symbol} ALERT: Has cargo but can't find markets to sell."
+
+            # Append construct to the sell sequence
+            steps = sell_steps + ["construct"]
+            behavior_str = ", ".join(steps)
+            self.assign(cfg.ship_symbol, behavior_str)
+            log.info(f"[Construct] {cfg.ship_symbol}: Has unwanted cargo. Auto-assigning: {behavior_str}")
+            return None
+
+        # 4b. Check for other ships already delivering this material
+        in_transit = 0
+        for other_ship_sym, other_cfg in self.behaviors.items():
+            if other_ship_sym == cfg.ship_symbol:
+                continue  # Skip self
+            if "construct" not in other_cfg.steps_str:
+                continue  # Not a construct ship
+
+            # Check this ship's cargo for the target material
+            other_cargo = client.get_cargo(other_ship_sym)
+            for item in other_cargo.get("inventory", []):
+                if item["symbol"] == target_mat:
+                    in_transit += item.get("units", 0)
+                    log.debug(f"[Construct] {cfg.ship_symbol}: {other_ship_sym} has {item['units']} {target_mat} in transit")
+
+        if in_transit > 0:
+            needed_qty = max(0, needed_qty - in_transit)
+            log.info(f"[Construct] {cfg.ship_symbol}: Reducing need from {needed_qty + in_transit} to {needed_qty} ({in_transit} already in transit)")
+
+        if needed_qty <= 0:
+            log.info(f"[Construct] {cfg.ship_symbol}: Enough material already in transit, going idle for HQ reassignment")
+            return None  # Complete the construct step, let ship go idle
 
         # 5. Budget Check & Sourcing
         # Try to find source in current system first, then globally
