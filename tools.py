@@ -58,6 +58,35 @@ def get_hq_enabled() -> bool:
     return _hq_enabled
 
 
+# ──────────────────────────────────────────────
+#  Utility Helpers
+# ──────────────────────────────────────────────
+
+def get_system_from_waypoint(waypoint_symbol: str) -> str:
+    """Extract the system symbol from a waypoint symbol (e.g., 'X1-ABC-123' -> 'X1-ABC')."""
+    return waypoint_symbol.rsplit("-", 1)[0]
+
+
+def calculate_distance(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Calculate Euclidean distance between two points."""
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+
+def waypoint_distance(wp1_sym: str, wp2_sym: str, cache: dict = None) -> float:
+    """Calculate distance between two waypoints using cached coordinates."""
+    if not cache:
+        cache = load_waypoint_cache()
+    wp1 = cache.get(wp1_sym, {})
+    wp2 = cache.get(wp2_sym, {})
+    if not isinstance(wp1, dict) or not isinstance(wp2, dict):
+        return float('inf')
+    x1, y1 = wp1.get("x"), wp1.get("y")
+    x2, y2 = wp2.get("x"), wp2.get("y")
+    if x1 is None or y1 is None or x2 is None or y2 is None:
+        return float('inf')
+    return calculate_distance(x1, y1, x2, y2)
+
+
 WAYPOINT_CACHE_FILE = Path("waypoint_cache.json")
 MARKET_CACHE_FILE = WAYPOINT_CACHE_FILE  # Alias for existing code
 BEHAVIORS_FILE = Path("behaviors.json")
@@ -537,7 +566,10 @@ def get_financial_assessment(system_symbol: str = None) -> str:
             f"🟢 EXPANSION READY: You have enough excess capital to buy a Hauler (~{strat['hauler_price']:,} cr at {strat['cheapest_shipyard']})."
         )
         if not strat['ship_at_shipyard']:
-            lines.append(f"   ⚠️ ACTION REQUIRED: Send a ship to {strat['cheapest_shipyard']} to make the purchase.")
+            if strat['cheapest_shipyard'] != "Unknown":
+                lines.append(f"   ⚠️ ACTION REQUIRED: Send a ship to {strat['cheapest_shipyard']} to make the purchase.")
+            else:
+                lines.append(f"   ⚠️ ACTION REQUIRED: Find a shipyard to make the purchase (no priced shipyards known in current system).")
     elif strat['excess'] > 0 and strat['trader_count'] >= 3:
         lines.append(
             f"🔵 FLEET CAPPED: Local market is saturated ({strat['trader_count']} traders). Excess funds will auto-route to Jump Gate Construction."
@@ -1971,15 +2003,9 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
     def dist(a, b):
         if a not in cache or b not in cache:
             return 1000
-        sys_a = a.rsplit("-", 1)[0]
-        sys_b = b.rsplit("-", 1)[0]
-        if sys_a != sys_b:
+        if get_system_from_waypoint(a) != get_system_from_waypoint(b):
             return 1000  # Penalize cross-system routing
-        ax, ay = cache[a].get("x"), cache[a].get("y")
-        bx, by = cache[b].get("x"), cache[b].get("y")
-        if ax is None or bx is None:
-            return 1000
-        return math.sqrt((ax-bx)**2 + (ay-by)**2)
+        return waypoint_distance(a, b, cache)
 
     # Phase 1: Sell existing cargo
     if cargo_map:
@@ -3586,160 +3612,6 @@ def _buys_or_sells(m_data: dict, target: str):
 
     return hit, match_reason
 
-
-@tool
-def find_waypoints(
-    waypoint_type: str = None,
-    trait: str = None,
-    trade_symbol: str = None,
-    system_symbol: str = None,
-    reference_ship: str = None,
-) -> str:
-    """Find locations of interest. Merges functionality of finding waypoints, markets, and nearest resources.
-
-    Args:
-        waypoint_type: Filter by type (e.g., ASTEROID, PLANET, GAS_GIANT).
-        trait: Filter by trait (e.g., MARKETPLACE, SHIPYARD, COMMON_METAL_DEPOSITS).
-        trade_symbol: Find markets buying/selling this good (e.g., FUEL, IRON_ORE). Uses cached data.
-        system_symbol: System to search. Defaults to reference_ship's system or agent's HQ system.
-        reference_ship: Sort results by distance from this ship.
-    """
-    # 1. Determine System
-    ref_coords = None
-    if reference_ship:
-        try:
-            ship_status = _get_local_ship(reference_ship)
-            ship_wp = ship_status.location or ""
-            if ship_wp:
-                system_symbol = ship_wp.rsplit("-", 1)[0]
-
-                # Fetch waypoints to get coords of current location
-                cache = load_waypoint_cache()
-                if ship_wp in cache:
-                    ref_coords = (cache[ship_wp].get("x", 0), cache[ship_wp].get("y", 0))
-        except Exception:
-            pass
-
-    if not system_symbol:
-        # Fallback to agent HQ system
-        agent = client.get_agent()
-        if "headquarters" in agent:
-            system_symbol = "-".join(agent["headquarters"].split("-")[:2])
-        else:
-            return "Error: system_symbol or reference_ship must be provided."
-
-    # 2. Logic Branch: Trade Symbol Search
-    if trade_symbol:
-        cache = load_market_cache()
-        candidates = []
-
-        # We need waypoint coordinates for the whole system to calculate distance
-        all_wps = get_system_waypoints(system_symbol)
-        wp_lut = (
-            {w["symbol"]: (w["x"], w["y"]) for w in all_wps}
-            if isinstance(all_wps, list)
-            else {}
-        )
-
-        for wp_sym, mdata in cache.items():
-            if not isinstance(mdata, dict):
-                continue
-            # Check if this market is in the target system
-            if not wp_sym.startswith(system_symbol):
-                continue
-
-            # Check if good exists here
-            goods = mdata.get("trade_goods", [])
-            exports = mdata.get("exports", [])
-            imports = mdata.get("imports", [])
-            exchange = mdata.get("exchange", [])
-
-            # Check price data first
-            price_match = next((g for g in goods if g["symbol"] == trade_symbol), None)
-
-            # Check structural data
-            is_import = trade_symbol in imports
-            is_export = trade_symbol in exports
-            is_exchange = trade_symbol in exchange
-
-            if price_match or is_import or is_export or is_exchange:
-                dist = float("inf")
-                if ref_coords and wp_sym in wp_lut:
-                    wx, wy = wp_lut[wp_sym]
-                    dist = math.sqrt(
-                        (wx - ref_coords[0]) ** 2 + (wy - ref_coords[1]) ** 2
-                    )
-
-                details = []
-                if price_match:
-                    if price_match.get("purchasePrice"):
-                        details.append(f"BUY: {price_match['purchasePrice']}")
-                    if price_match.get("sellPrice"):
-                        details.append(f"SELL: {price_match['sellPrice']}")
-                else:
-                    if is_import:
-                        details.append("Imports (Buy)")
-                    if is_export:
-                        details.append("Exports (Sell)")
-                    if is_exchange:
-                        details.append("Exchange")
-
-                candidates.append((dist, wp_sym, ", ".join(details)))
-
-        if not candidates:
-            return f"No known markets for {trade_symbol} in {system_symbol}. (Note: Only checks cached data. Use scan_system or view_market to update cache)."
-
-        # Sort
-        candidates.sort(key=lambda x: x[0])
-        lines = [f"Markets for {trade_symbol} in {system_symbol}:"]
-        for dist, sym, det in candidates:
-            d_str = f" ({dist:.1f} dist)" if dist != float("inf") else ""
-            lines.append(f"  {sym}{d_str}: {det}")
-        return "\n".join(lines)
-
-    # 3. Logic Branch: Waypoint/Trait Search
-    params = {}
-    if waypoint_type:
-        params["type"] = waypoint_type
-    if trait:
-        params["traits"] = trait
-
-    data = get_system_waypoints(system_symbol, waypoint_type=params.get("type"), trait=params.get("trait"))
-
-    # Special case: ASTEROID should also fetch ENGINEERED_ASTEROID
-    if waypoint_type == "ASTEROID" and isinstance(data, list):
-        eng = get_system_waypoints(system_symbol, waypoint_type="ENGINEERED_ASTEROID")
-        if isinstance(eng, list):
-            data.extend(eng)
-
-    if isinstance(data, dict) and "error" in data:
-        return f"Error: {data['error']}"
-    if not data:
-        return f"No waypoints found in {system_symbol} matching your criteria."
-
-    # Sort by distance
-    if ref_coords:
-
-        def get_dist(w):
-            return math.sqrt(
-                (w["x"] - ref_coords[0]) ** 2 + (w["y"] - ref_coords[1]) ** 2
-            )
-
-        data.sort(key=get_dist)
-
-    lines = [f"Waypoints in {system_symbol}:"]
-    for wp in data:
-        d_str = ""
-        if ref_coords:
-            d = math.sqrt(
-                (wp["x"] - ref_coords[0]) ** 2 + (wp["y"] - ref_coords[1]) ** 2
-            )
-            d_str = f" ({d:.1f} dist)"
-
-        t_list = [t["symbol"] for t in wp.get("traits", [])]
-        lines.append(f"  {wp['symbol']} [{wp['type']}]{d_str} - {', '.join(t_list)}")
-
-    return "\n".join(lines)
 
 
 def _find_best_sell_market(ship_symbol: str, good: str) -> Optional[dict]:

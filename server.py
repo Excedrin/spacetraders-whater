@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from ship_status import FleetTracker
 from tools import (ALL_TOOLS, STATE_CHANGING_TOOLS, WAITING_TOOLS, client,
-                   get_engine, set_alert_queue, set_fleet)
+                   get_engine, set_alert_queue, set_fleet, get_system_from_waypoint)
 
 # Setup logging to both file and stdout
 logging.basicConfig(
@@ -158,7 +158,7 @@ def get_state():
         if fleet.ships:
             first_ship = next(iter(fleet.ships.values()))
             if first_ship.location:
-                sys_sym = first_ship.location.rsplit("-", 1)[0]
+                sys_sym = get_system_from_waypoint(first_ship.location)
 
         advisor_status = get_financial_assessment(sys_sym)
 

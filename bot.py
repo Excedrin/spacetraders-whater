@@ -28,7 +28,7 @@ from events import write_event
 from narrative import (NarrativeContext, NarrativeSegment, generate_narrative,
                        generate_strategic_reflection)
 from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, client,
-                   load_market_cache)
+                   load_market_cache, get_system_from_waypoint)
 
 API_BASE = "http://localhost:8000/api"
 
@@ -472,7 +472,7 @@ def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> 
             # Extract system to fetch accurate ship prices
             sys_sym = None
             if "headquarters" in agent:
-                sys_sym = "-".join(agent["headquarters"].split("-")[:2])
+                sys_sym = get_system_from_waypoint(agent["headquarters"])
 
             fin_assess = get_financial_assessment(sys_sym)
 
@@ -769,7 +769,7 @@ def discover_all_markets(fleet: FleetTracker):
     from tools import _save_market_to_cache, load_market_cache
 
     # Collect unique systems from the current fleet
-    systems = {s.location.rsplit("-", 1)[0] for s in fleet.ships.values() if s.location}
+    systems = {get_system_from_waypoint(s.location) for s in fleet.ships.values() if s.location}
     if not systems:
         return
 

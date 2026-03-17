@@ -153,6 +153,31 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - Eliminates need for separate tool calls; atomic consistency across bot/CLI.
 - `play_cli.py` reads advisor from state instead of calling tool directly.
 
+**Trading Margin Fixes (v1.5+):**
+- **Global Constants:** `TRADE_PROFIT_MARGIN = 0.10` and `JIT_TRADE_MARGIN = 0.02` replace hardcoded values throughout.
+- **Cargo Cost Tracking:** When selling cargo you already own, `_build_sell_sequence()` now uses actual `cargo_cost` paid instead of market prices.
+- **HQ JIT Planner Fix:** Critical bug fix — now properly decrements `spare_capacity` as trades are added, preventing overbooking (previously would queue 3 trades of 50 units each when only 100 units were available).
+- **Enhanced Logging:** `_evaluate_hq_opportunities()` now logs each decision point (debug for rejections, info for insertions) and limits to one step insertion per cycle.
+
+**Construct Step Improvements (v1.5+):**
+- **Auto-Sell Unwanted Cargo:** `_step_construct()` no longer pauses when encountering wrong cargo; instead calls `_build_sell_sequence()` to automatically sell it, then re-queue construct.
+- **Fleet-Aware Prevention:** HQ idle assignment now checks `_find_active_ships_with_keywords(['supply', 'construct'])` before assigning another ship to construction, preventing duplicate material gathering.
+- **Idle on Overflow:** If another ship is already delivering enough material, the construct step completes gracefully and lets the ship go idle (available for HQ reassignment).
+
+**Fleet-Aware Helper Functions (v1.5+):**
+- `_find_active_ships_with_keywords(keywords, exclude_ship)` — Returns set of ships actively running behaviors with given keywords (e.g., 'construct', 'supply').
+- `_extract_active_goods_for_keyword(keyword)` — Parses fleet behaviors to extract goods being traded with specific keywords (e.g., extract 'IRON_ORE' from 'buy IRON_ORE').
+- Used by both `autotrade` (to avoid duplicate trading) and `construct` (to avoid duplicate assignments).
+
+**Shared Sell Sequence Builder:**
+- `_build_sell_sequence(ship_symbol, cargo_map, ship)` — Extracted from trade route planner into reusable function. Finds best sell market for each cargo item, groups by destination, returns navigation/sell steps. Handles gate material special case (supply to jump gate if materials needed).
+- Used by both `_plan_trade_route()` (initial cargo clearance) and `_step_construct()` (clearing unwanted cargo before proceeding).
+
+**Utility Helpers (v1.6+):**
+- `get_system_from_waypoint(waypoint_symbol)` — Centralized string manipulation to extract system symbol (e.g., `'X1-DF14'` from `'X1-DF14-A1'`). Used throughout codebase for reliable waypoint parsing.
+- `calculate_distance(x1, y1, x2, y2)` and `waypoint_distance(wp1, wp2, cache)` — Centralized Euclidean distance functions used by pathfinding, probe planning, and trade analysis. Eliminates hardcoded math across multiple files.
+- Reduces code duplication: these helpers eliminated a dozen instances of manual string splitting and distance calculation.
+
 **HQ Design Philosophy — Short-Lived Behaviors + Idle Re-evaluation:**
 The core pattern is that ships receive short, focused behaviors (e.g., `goto WP, scout, stop` or a single trade route ending in `stop`). When a behavior completes, the ship becomes idle, and `assign_idle_ships()` re-evaluates what it should do next based on current game state. This means strategic pivots happen naturally — a hauler that just finished a trade run might be reassigned to buy construction materials, or a probe that just scouted a market might be sent to the most stale market across the entire system. No behavior needs to encode long-term strategy; the HQ director handles that by making fresh decisions each time a ship goes idle. This keeps individual behaviors simple while enabling complex fleet-wide coordination like "pause trading to fund jump gate construction" or "redirect probes to cover neglected market clusters."
 
