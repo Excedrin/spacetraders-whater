@@ -1809,55 +1809,93 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     return routes
 
 
-def _get_probe_plan(ship_location: str, phase: int, claimed_targets: set = None) -> str:
-    """Determines if a probe should chart local waypoints, refresh market prices, or jump to a new system.
-    claimed_targets: set of waypoint symbols already assigned to other probes this cycle."""
+def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_targets: set = None) -> str:
+    """
+    Determines a probe's mission using Time-Adjusted Staleness and Cluster Tours.
+
+    1. Seed Selection: Uses (Age - FlightTime) to prioritize globally oldest markets.
+    2. Cluster Tour: Once an urgent "Seed" is picked, adds nearby stale neighbors.
+    """
     import time
     system = ship_location.rsplit("-", 1)[0]
     cache = load_waypoint_cache()
+    ship_status = _get_local_ship(ship_symbol)
+    speed = max(1, ship_status.engine_speed)
 
     system_wps = [v for k, v in cache.items() if k.startswith(system + "-") and isinstance(v, dict)]
 
     # Priority 1: Charting
-    # If we know of waypoints in this system that aren't charted, explore them!
     uncharted = [wp for wp in system_wps if not wp.get("is_charted")]
     if uncharted:
         return "explore"
 
     # Priority 2: Market Refresh
     now = time.time()
-    markets = []
+    candidates = []
+
+    sx, sy = cache.get(ship_location, {}).get("x", 0), cache.get(ship_location, {}).get("y", 0)
+
     for wp in system_wps:
         if wp.get("has_market"):
             wp_sym = wp["symbol"]
             if wp_sym == ship_location:
-                continue  # Skip current location — we just scouted it
-            if claimed_targets and wp_sym in claimed_targets:
-                continue  # Another probe is already headed there
+                continue
+            if claimed_targets is not None and wp_sym in claimed_targets:
+                continue
+
             age = now - wp.get("last_updated", 0)
+            if age < 300: # Ignore anything refreshed in last 5m
+                continue
 
-            # Distance as minor tiebreaker only — staleness is the primary factor
-            sx, sy = cache.get(ship_location, {}).get("x", 0), cache.get(ship_location, {}).get("y", 0)
             wx, wy = wp.get("x", 0), wp.get("y", 0)
-            dist = max(1.0, math.sqrt((wx - sx)**2 + (wy - sy)**2))
+            dist_from_ship = calculate_distance(sx, sy, wx, wy)
 
-            # Primary: staleness (seconds). Tiebreaker: prefer closer (subtract small fraction)
-            score = age - dist * 0.1
-            markets.append((score, wp_sym, age))
+            # Heuristic: Flight Time = (Dist * (30/Speed)) + 15
+            flight_time = (dist_from_ship * (30 / speed)) + 15
 
-    if markets:
-        markets.sort(key=lambda x: x[0], reverse=True)
-        best_score, target_wp, oldest_age = markets[0]
+            # Score = Expected Age Upon Arrival.
+            # This prevents being "stuck" in local clusters because a very old
+            # distant market will eventually have a higher score than a fresh local one.
+            score = age - flight_time
+            candidates.append({"wp": wp_sym, "score": score, "age": age, "x": wx, "y": wy})
 
-        # Priority 3: Inter-System Expansion
-        # If the oldest market is reasonably fresh (< 30 mins) and we are in Phase 4, leave the system!
-        if phase >= 4 and oldest_age < 1800:
-            return "explore"  # _step_explore will now handle jumping through the gate
+    if candidates:
+        # 1. Pick the "Seed" (The market that will be the oldest when we arrive)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        seed = candidates[0]
 
-        return f"goto {target_wp}, scout, stop"
+        tour = [seed]
+        if claimed_targets is not None:
+            claimed_targets.add(seed["wp"])
+
+        # 2. Cluster Neighbors: Find up to 2 closest stale neighbors TO THE SEED.
+        # This ensures that once we pay the long-haul cost to reach a distant area,
+        # we maximize the value of that trip.
+        neighbors = [c for c in candidates if c["wp"] != seed["wp"] and c["age"] > 600]
+        neighbors.sort(key=lambda n: calculate_distance(seed["x"], seed["y"], n["x"], n["y"]))
+
+        for n in neighbors[:2]:
+            tour.append(n)
+            if claimed_targets is not None:
+                claimed_targets.add(n["wp"])
+
+        # 3. Path Optimization: Sort the tour stops by distance from the SHIP.
+        tour.sort(key=lambda t: calculate_distance(sx, sy, t["x"], t["y"]))
+
+        steps = []
+        for stop in tour:
+            steps.append(f"goto {stop['wp']}")
+            steps.append("scout")
+        steps.append("stop")
+
+        return ", ".join(steps)
+
+    # Priority 3: Inter-System Expansion
+    if phase >= 4:
+        return "explore"
 
     # Failsafe
-    return "explore"
+    return "stop"
 
 
 def assign_idle_ships(fleet, engine):
@@ -1941,13 +1979,10 @@ def assign_idle_ships(fleet, engine):
         # --- PROBES & SATELLITES ---
         if role == "SATELLITE":
             # Smart Scout (Refresh oldest market prices or expand)
-            plan = _get_probe_plan(ship_status.location, strat["phase"], claimed_targets=probe_targets)
+            plan = _get_probe_plan(ship_symbol, ship_status.location, strat["phase"], claimed_targets=probe_targets)
             log.info(f"👔 [HQ] Dispatching {ship_symbol} to Scout: {plan}")
             engine.assign(ship_symbol, plan)
-            # Extract target waypoint from plan so other probes avoid it
-            if plan.startswith("goto "):
-                target = plan.split(",")[0].replace("goto ", "").strip()
-                probe_targets.add(target)
+            # probe_targets updated inside _get_probe_plan now
             continue
 
         # --- HAULERS & COMMAND ---
@@ -2141,8 +2176,9 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, best, est_units = candidates[0]
 
+        spare -= est_units
         log.info(f"[TradeRoute] {ship_symbol} pick: {best['good']} src={best['src']} snk={best['snk']} "
-                 f"buy={best['buy']} sell={best['sell']} est_units={est_units} spare={spare} pos={pos}")
+                 f"buy={best['buy']} sell={best['sell']} units={est_units} remaining_spare={spare} pos={pos}")
 
         # Sell-as-you-go: if best source is also a sell sink for pending cargo
         for good, sell_info in list(pending_sells.items()):
@@ -2165,7 +2201,6 @@ def _plan_trade_route(ship_symbol: str, active_goods: set) -> str:
 
         pending_sells[best["good"]] = {"wp": best["snk"], "min_sell": int(best["sell"] * (1.0 - TRADE_PROFIT_MARGIN))}
         goods_in_plan.add(best["good"])
-        spare -= est_units
 
     # Phase 3: Sell remaining (group by destination)
     sell_groups = {}
@@ -2681,6 +2716,7 @@ class BehaviorEngine:
             result = client.supply_construction(
                 system, waypoint, cfg.ship_symbol, trade_symbol, units
             )
+            _intercept(cfg.ship_symbol, result)
             if isinstance(result, dict) and "error" in result:
                 raise Exception(f"Supply failed: {result['error']}")
         except Exception as e:
@@ -2713,6 +2749,7 @@ class BehaviorEngine:
 
         # 2. Call API
         result = client.chart(cfg.ship_symbol)
+        _intercept(cfg.ship_symbol, result)
 
         # 3. Handle errors (specifically 4230: Already Charted)
         if isinstance(result, dict) and "error" in result:
@@ -2754,6 +2791,7 @@ class BehaviorEngine:
 
         # 1. Check Cargo
         cargo_data = client.get_cargo(cfg.ship_symbol)
+        _intercept(cfg.ship_symbol, cargo_data)
 
         # Error handling
         if isinstance(cargo_data, dict) and "error" in cargo_data:
@@ -3007,6 +3045,7 @@ class BehaviorEngine:
 
         # 4. Cargo Check (If we already have the material, go supply it!)
         cargo = client.get_cargo(cfg.ship_symbol)
+        _intercept(cfg.ship_symbol, cargo)
         inv = cargo.get("inventory", [])
         for item in inv:
             if item["symbol"] == target_mat:
@@ -3094,7 +3133,7 @@ class BehaviorEngine:
         # 6. Execute!
         self.assign(
             cfg.ship_symbol,
-            f"goto {src_wp}, buy {target_mat} {buy_qty}, goto {jg_sym}, supply {target_mat}, stop",
+            f"goto {src_wp}, buy {target_mat} {buy_qty} min_qty:1, goto {jg_sym}, supply {target_mat}, stop",
         )
         return None
 
@@ -5246,7 +5285,7 @@ def assign_satellite_scout(ship_symbols: str, market_waypoints: str = "") -> str
                 loc = ship_status.location or ""
                 if loc:
                     strat = evaluate_fleet_strategy()
-                    plan = _get_probe_plan(loc, strat["phase"])
+                    plan = _get_probe_plan(ship_sym, loc, strat["phase"])
                 else:
                     plan = "explore"
             except Exception:
