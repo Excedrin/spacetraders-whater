@@ -336,6 +336,26 @@ def _get_local_ship(ship_symbol: str):
     raise Exception(f"Ship {ship_symbol} not found.")
 
 
+def _intercept_agent(data: dict):
+    """Intercepts action payloads to update local agent state (e.g., credits)."""
+    if _fleet and isinstance(data, dict) and "agent" in data:
+        _fleet.update_agent(data["agent"])
+
+
+def _get_local_agent() -> dict:
+    """Get agent from local tracker, eliminating GET /my/agent requests."""
+    if _fleet and _fleet.agent:
+        return _fleet.agent
+
+    # Absolute fallback if agent is not in tracker
+    raw = client.get_agent()
+    if isinstance(raw, dict) and "error" not in raw:
+        if _fleet:
+            _fleet.update_agent(raw)
+        return raw
+    return {}
+
+
 def _intercept(ship_symbol: str, data: dict):
     """Pipes action payloads directly into the local fleet tracker.
 
@@ -344,6 +364,7 @@ def _intercept(ship_symbol: str, data: dict):
     """
     if _fleet and isinstance(data, dict) and "error" not in data:
         _fleet.update_ship_partial(ship_symbol, data)
+        _intercept_agent(data)
 
 
 # ──────────────────────────────────────────────
@@ -450,8 +471,8 @@ def _get_contract_goods() -> set[str]:
 
 def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     """Core logic for game phase, budget, and fleet needs. Single source of truth."""
-    agent = client.get_agent()
-    credits = agent.get("credits", 0) if isinstance(agent, dict) and "error" not in agent else 0
+    agent = _get_local_agent()
+    credits = agent.get("credits", 0)
 
     # Read instantly from local memory instead of API
     ships = list(_fleet.ships.values()) if _fleet else []
@@ -1262,12 +1283,9 @@ def _buy_cargo_logic(
                 break
 
     # Cap by affordability using cached price + current credits
-    agent = client.get_agent()
-    credits = (
-        agent.get("credits")
-        if isinstance(agent, dict) and "error" not in agent
-        else None
-    )
+    agent = _get_local_agent()
+    credits = agent.get("credits")
+
     if credits is not None and cached_price and cached_price > 0:
         affordable = credits // cached_price
         if affordable <= 0:
@@ -1456,6 +1474,7 @@ def _buy_ship_logic(ship_type: str, waypoint_symbol: str, fleet=None) -> dict:
     if isinstance(data, dict) and "error" in data:
         raise Exception(data["error"])
 
+    _intercept_agent(data)
     new_ship = data.get("ship", {})
     agent = data.get("agent", {})
     credits_remaining = agent.get("credits", 0)
@@ -1873,7 +1892,7 @@ def assign_idle_ships(fleet, engine):
             constructor_assigned = True
             break
 
-    log.info(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
+    log.debug(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
              f"Credits: {strat['credits']:,} | Excess: {strat['excess']:,} | "
              f"Can buy hauler: {strat['can_buy_ship']} | Needs probe: {strat['needs_probe']} "
              f"({strat['probe_count']}/{strat['desired_probes']}) | Shipyard: {strat['cheapest_shipyard']}")
@@ -3054,7 +3073,7 @@ class BehaviorEngine:
         cost = buy_qty * price
 
         # Verify Budget
-        agent = client.get_agent()
+        agent = _get_local_agent()
         credits = agent.get("credits", 0)
 
         # Calculate Required Reserve (same logic as the HUD)
@@ -3179,7 +3198,7 @@ class BehaviorEngine:
 
         # 2. No Active Contract -> Go to HQ and Negotiate
         ship_status = _get_local_ship(cfg.ship_symbol)
-        hq = client.get_agent().get("headquarters")
+        hq = _get_local_agent().get("headquarters")
 
         if ship_status.location != hq:
             self.assign(cfg.ship_symbol, f"goto {hq}, negotiate")
@@ -4425,6 +4444,8 @@ def accept_contract(contract_id: str) -> str:
     data = client.accept_contract(contract_id)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
+
+    _intercept_agent(data)
     agent = data.get("agent", {})
     contract = data.get("contract", {})
     return (
@@ -4754,10 +4775,7 @@ def warp_ship(ship_symbol: str, waypoint_symbol: str) -> str:
 def negotiate_contract(ship_symbol: str) -> str:
     """[STATE: contracts] Negotiate a new contract. Creates a behavior to go to HQ and negotiate."""
     # Get HQ location from agent
-    agent = client.get_agent()
-    if isinstance(agent, dict) and "error" in agent:
-        return f"Error: {agent['error']}"
-
+    agent = _get_local_agent()
     hq_waypoint = agent.get("headquarters")
     if not hq_waypoint:
         return "Error: Could not find headquarters waypoint"
@@ -4881,6 +4899,8 @@ def fulfill_contract(contract_id: str) -> str:
     data = client.fulfill_contract(contract_id)
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
+
+    _intercept_agent(data)
     agent = data.get("agent", {})
     return (
         f"Contract {contract_id} fulfilled!\n"
@@ -4923,7 +4943,7 @@ def find_waypoints(
 
     if not system_symbol:
         # Fallback to agent HQ system
-        agent = client.get_agent()
+        agent = _get_local_agent()
         if "headquarters" in agent:
             system_symbol = "-".join(agent["headquarters"].split("-")[:2])
         else:

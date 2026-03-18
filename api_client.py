@@ -1,3 +1,4 @@
+import logging
 import sys
 import threading
 import time
@@ -5,6 +6,7 @@ import time
 import requests
 
 BASE_URL = "https://api.spacetraders.io/v2"
+log = logging.getLogger("api_client")
 _RETRYABLE = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
@@ -161,7 +163,7 @@ class SpaceTradersClient:
                     self._cache.pop(f"{ship_path}/cooldown", None)
                     self._cache.pop(f"{ship_path}/nav", None)
 
-        print(f"[API] {method} {path}", file=sys.stderr)
+        log.info(f"{method} {path}")
 
         last_err = None
         for attempt in range(retries):
@@ -178,8 +180,9 @@ class SpaceTradersClient:
                     time.sleep(1 + attempt)
                 continue
             except requests.exceptions.RequestException as e:
-                print(f"[API] error: {resp.text}", file=sys.stderr)
-                print(f"[API] error: {str(e)}", file=sys.stderr)
+                if 'resp' in locals():
+                    log.error(f"API error: {resp.text}")
+                log.error(f"API error: {str(e)}")
                 return {"error": str(e)}
 
             # Handle 429 specifically provided by server

@@ -32,7 +32,7 @@ behavior_engine = get_engine()
 alert_queue: List[str] = []
 set_alert_queue(alert_queue)  # Give tools.py access to alerts
 state_lock = Lock()  # Ensures thread-safe ticks & API calls
-TICK_INTERVAL = 2  # seconds
+TICK_INTERVAL = 1  # seconds
 
 
 # -------------------------

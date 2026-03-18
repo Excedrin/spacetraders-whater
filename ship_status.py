@@ -97,6 +97,7 @@ class FleetTracker:
 
     def __init__(self):
         self.ships: dict[str, ShipStatus] = {}
+        self.agent: dict = {}
         self._state_file = Path("fleet_state.json")
         self.last_persist = 0
         self._load()
@@ -107,6 +108,7 @@ class FleetTracker:
             try:
                 self.last_persist = os.stat(self._state_file).st_mtime
                 data = json.loads(self._state_file.read_text())
+                self.agent = data.get("agent", {})
                 for ship_data in data.get("ships", []):
                     ship = ShipStatus(
                         symbol=ship_data["symbol"],
@@ -136,6 +138,7 @@ class FleetTracker:
     def persist(self):
         """Save fleet state."""
         data = {
+            "agent": self.agent,
             "ships": [
                 {
                     "symbol": s.symbol,
@@ -206,6 +209,12 @@ class FleetTracker:
                     except ValueError:
                         pass
 
+        self.persist()
+
+    def update_agent(self, agent_data: dict):
+        """Update local agent status (credits, etc) from API payload."""
+        self._check_reload()
+        self.agent.update(agent_data)
         self.persist()
 
     def update_ship_partial(self, symbol: str, data: dict):
