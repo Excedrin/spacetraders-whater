@@ -52,20 +52,23 @@ def parse_and_run(tool, args_list):
         converted_args = []
         params = list(sig.parameters.values())
 
+        # Type converters: map type objects to their conversion functions
+        type_converters = {
+            int: int,
+            float: float,
+            bool: lambda x: x.lower() in ("true", "1", "yes"),
+        }
+
         for i, arg_str in enumerate(args_list):
             if i >= len(params):
                 break
             param = params[i]
 
-            # Simple Type Conversion
-            if param.annotation == int or param.annotation == "int":
-                val = int(arg_str)
-            elif param.annotation == float:
-                val = float(arg_str)
-            elif param.annotation == bool:
-                val = arg_str.lower() in ("true", "1", "yes")
+            # Convert using type converters if available, otherwise keep as string
+            if param.annotation in type_converters:
+                val = type_converters[param.annotation](arg_str)
             else:
-                val = arg_str  # Keep as string
+                val = arg_str
 
             converted_args.append(val)
 

@@ -205,7 +205,7 @@ def _ingest_waypoints(waypoints: list[dict]):
         _fetch_and_cache_construction(jg_sym)
 
 
-def get_system_waypoints(system_symbol: str, waypoint_type: str = None, trait: str = None) -> list[dict]:
+def get_system_waypoints(system_symbol: str, waypoint_type: str = None, trait: str | None = None) -> list[dict]:
     """Get waypoints for a system, using cache if fully fetched, else API.
 
     On first call for a system, fetches all waypoints from API and caches them.
@@ -469,7 +469,7 @@ def _get_contract_goods() -> set[str]:
     return goods
 
 
-def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
+def evaluate_fleet_strategy(system_symbol: str | None = None) -> dict:
     """Core logic for game phase, budget, and fleet needs. Single source of truth."""
     agent = _get_local_agent()
     credits = agent.get("credits", 0)
@@ -598,7 +598,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     }
 
 
-def get_financial_assessment(system_symbol: str = None) -> str:
+def get_financial_assessment(system_symbol: str | None = None) -> str:
     """Calculates fleet budget requirements and recommends expansion/construction using the DRY strategy engine."""
     strat = evaluate_fleet_strategy(system_symbol)
 
@@ -1136,9 +1136,9 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
 def _sell_cargo_logic(
     ship_symbol: str,
     trade_symbol: str,
-    units: int = None,
+    units: int | None = None,
     force: bool = False,
-    min_price: int = None,
+    min_price: int | None = None,
 ) -> str:
     # 1. Check Contract Safety
     if not force:
@@ -1241,9 +1241,9 @@ def _sell_cargo_logic(
 def _buy_cargo_logic(
     ship_symbol: str,
     trade_symbol: str,
-    units: int = None,
-    max_price: int = None,
-    min_qty: int = None,
+    units: int | None = None,
+    max_price: int | None = None,
+    min_qty: int | None = None,
 ) -> str:
     """Buy cargo from the current market. Splits purchases across multiple transactions if needed.
 
@@ -1688,7 +1688,7 @@ def get_engine() -> "BehaviorEngine":
     return _engine_instance
 
 
-def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[dict]:
+def _analyze_trade_routes(ship_symbol: str | None = None, min_profit: int = 1) -> list[dict]:
     """Helper: returns a list of trade dictionaries sorted by profitability."""
     import time
 
@@ -1808,7 +1808,7 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     return routes
 
 
-def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_targets: set = None, active_probe_systems: dict = None) -> str:
+def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_targets: set = None, active_probe_systems: dict | None = None) -> str:
     """
     Determines a probe's mission using Time-Adjusted Staleness and Cluster Tours.
 
@@ -2333,7 +2333,7 @@ class BehaviorEngine:
     def get_idle_ships(self, fleet) -> list[str]:
         return [s for s in fleet.ships if s not in self.behaviors]
 
-    def get_fleet_activities(self, fleet=None, exclude_ship: str = None) -> dict:
+    def get_fleet_activities(self, fleet=None, exclude_ship: str | None = None) -> dict:
         """Analyzes all active behaviors to summarize fleet activities.
 
         Returns:
@@ -3647,7 +3647,7 @@ def _get_ship_capabilities(ship: dict) -> list[str]:
 
 
 @tool
-def view_ships(system_symbol: str = None) -> str:
+def view_ships(system_symbol: str | None = None) -> str:
     """[READ-ONLY] List all ships with location, fuel, status, and assigned behaviors.
 
     Args:
@@ -3870,10 +3870,10 @@ def _find_best_source(trade_symbol: str, ship_system: str) -> Optional[str]:
 
 def _find_waypoints_logic(
     system_symbol: str,
-    waypoint_type: str = None,
-    trait: str = None,
-    trade_symbol: str = None,
-    ref_coords: tuple = None,
+    waypoint_type: str | None = None,
+    trait: str | None = None,
+    trade_symbol: str | None = None,
+    ref_coords: tuple | None = None,
 ) -> list[dict]:
     """
     Core logic for finding waypoints. Returns a list of dicts containing:
@@ -4111,7 +4111,7 @@ def view_ship_details(ship_symbol: str) -> str:
 @tool
 def scan_system(
     system_symbol: str,
-    reference_ship: str = None,
+    reference_ship: str | None = None,
     closest_only: bool = False,
     within_cruise_range: bool = False,
 ) -> str:
@@ -5017,11 +5017,11 @@ def fulfill_contract(contract_id: str) -> str:
 
 @tool
 def find_waypoints(
-    waypoint_type: str = None,
-    trait: str = None,
-    trade_symbol: str = None,
-    system_symbol: str = None,
-    reference_ship: str = None,
+    waypoint_type: str | None = None,
+    trait: str | None = None,
+    trade_symbol: str | None = None,
+    system_symbol: str | None = None,
+    reference_ship: str | None = None,
 ) -> str:
     """Find locations of interest. Merges functionality of finding waypoints, markets, and nearest resources.
 
@@ -5114,7 +5114,7 @@ def find_waypoints(
 
 
 @tool
-def find_trades(ship_symbol: str = None, good: str = None, min_profit: int = 1) -> str:
+def find_trades(ship_symbol: str | None = None, good: str | None = None, min_profit: int = 1) -> str:
     """[READ-ONLY] Find profitable trade routes from cached market data.
     Compares buy prices (exports/exchange) with sell prices (imports/exchange) across
     all known markets. Only uses cached price data — send ships to markets for fresh prices.
@@ -5273,7 +5273,7 @@ def assign_trade_route(
     buy_waypoint: str,
     buy_good: str,
     sell_waypoint: str,
-    sell_good: str = None,
+    sell_good: str | None = None,
     end_step: str = "stop",
     start_step: int = 0,
 ) -> str:
@@ -5404,7 +5404,7 @@ def assign_jump_gate_construction(ship_symbol: str) -> str:
 
 
 @tool
-def toggle_hq(set: str = None, add: str = None, remove: str = None) -> str:
+def toggle_hq(set: str | None = None, add: str | None = None, remove: str | None = None) -> str:
     """[STATE: hq] Configure which ships the HQ Fleet Director manages.
 
     Use 'set' to replace the entire target list, or 'add'/'remove' to modify the current list.
