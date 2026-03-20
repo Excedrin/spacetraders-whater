@@ -27,6 +27,7 @@ from rich.console import Console
 from events import write_event
 from narrative import (NarrativeContext, NarrativeSegment, generate_narrative,
                        generate_strategic_reflection)
+from ship_status import FleetTracker
 from tools import (ALL_TOOLS, SIGNIFICANT_TOOLS, TIER_1_TOOLS, client,
                    load_market_cache, get_system_from_waypoint)
 
@@ -326,11 +327,11 @@ def prune_messages(
 
     # Token budget check — drop oldest turns if over budget
     while len(cleaned_turns) > 1:
-        chars, tokens = estimate_token_count(result)
+        _, tokens = estimate_token_count(result)
         if tokens <= max_tokens:
             break
         # Drop the oldest turn
-        dropped = cleaned_turns.pop(0)
+        cleaned_turns.pop(0)
         result = anchored
         for turn in cleaned_turns:
             result.extend(turn)
@@ -415,7 +416,7 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
 
         # Fuel - make it VERY clear when ship doesn't use fuel
         if fuel.get("capacity", 0) == 0:
-            lines.append(f"  Fuel: SOLAR POWERED (FREE MOVEMENT - NO FUEL COST)")
+            lines.append("  Fuel: SOLAR POWERED (FREE MOVEMENT - NO FUEL COST)")
         else:
             lines.append(
                 f"  Fuel: {fuel.get('current', '?')}/{fuel.get('capacity', '?')}"
@@ -425,7 +426,7 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
         cap = cargo.get("capacity", 0)
         units = cargo.get("units", 0)
         if cap == 0:
-            lines.append(f"  Cargo: N/A")
+            lines.append("  Cargo: N/A")
         else:
             pct = round(100 * units / cap) if cap > 0 else 0
             lines.append(f"  Cargo: {units}/{cap} ({pct}%)")
@@ -438,7 +439,7 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
         if caps:
             lines.append(f"  Capabilities: {', '.join(caps)}")
         elif role == "SATELLITE":
-            lines.append(f"  Capabilities: CAN_NAVIGATE (FREE - uses no fuel)")
+            lines.append("  Capabilities: CAN_NAVIGATE (FREE - uses no fuel)")
 
         # Cooldown info from fleet tracker
         ship_status = fleet.get_ship(s["symbol"])
@@ -451,7 +452,7 @@ def _build_fleet_lines(ships_data: list, fleet: FleetTracker) -> list[str]:
     return lines
 
 
-def gather_game_state(fleet: FleetTracker, context: NarrativeContext = None) -> str:
+def gather_game_state(fleet: FleetTracker) -> str:
     """
     Gather comprehensive game state from the API.
 
