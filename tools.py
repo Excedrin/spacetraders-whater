@@ -369,17 +369,17 @@ def _get_local_ship(ship_symbol: str):
     Checks FleetTracker first for instant state. Only falls back to API
     if ship is not yet tracked.
     """
-    if _fleet:
-        ship = get_fleet().get_ship(ship_symbol)
+    if (fleet := try_get_fleet()):
+        ship = fleet.get_ship(ship_symbol)
         if ship:
             return ship
 
     # Absolute fallback if ship is not in tracker
     raw = client.get_ship(ship_symbol)
     if isinstance(raw, dict) and "error" not in raw:
-        if _fleet:
-            get_fleet().update_from_api([raw])
-            return get_fleet().get_ship(ship_symbol)
+        if (fleet := try_get_fleet()):
+            fleet.update_from_api([raw])
+            return fleet.get_ship(ship_symbol)
     raise Exception(f"Ship {ship_symbol} not found.")
 
 
@@ -397,8 +397,8 @@ def _get_local_agent() -> dict:
     # Absolute fallback if agent is not in tracker
     raw = client.get_agent()
     if isinstance(raw, dict) and "error" not in raw:
-        if _fleet:
-            _fleet.update_agent(raw)
+        if (fleet := try_get_fleet()):
+            fleet.update_agent(raw)
         return raw
     return {}
 
@@ -409,8 +409,8 @@ def _intercept(ship_symbol: str, data: dict):
     Called after any action (dock, orbit, navigate, buy, sell, extract, etc.)
     to update local state without polling the API.
     """
-    if _fleet and isinstance(data, dict) and "error" not in data:
-        _fleet.update_ship_partial(ship_symbol, data)
+    if isinstance(data, dict) and "error" not in data and (fleet := try_get_fleet()):
+        fleet.update_ship_partial(ship_symbol, data)
         _intercept_agent(data)
 
 
@@ -522,7 +522,7 @@ def evaluate_fleet_strategy(system_symbol: str | None = None) -> dict:
     credits = agent.get("credits", 0)
 
     # Read instantly from local memory instead of API
-    ships = list(get_fleet().ships.values()) if _fleet else []
+    ships = list(get_fleet().ships.values()) if try_get_fleet() else []
 
     total_ships = len(ships)
     trader_count = sum(
@@ -1117,8 +1117,8 @@ def _navigate_ship_logic(
     # fall back to the calculated estimate so transit always registers.
     if wait_secs <= 0:
         wait_secs = max(float(direct_time), 1.0)
-    if _fleet:
-        get_fleet().set_transit(ship_symbol, wait_secs)
+    if (fleet := try_get_fleet()):
+        fleet.set_transit(ship_symbol, wait_secs)
     result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
 
     if is_multi_hop:
@@ -1132,8 +1132,8 @@ def _navigate_ship_logic(
 def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     """Returns (log_string, cooldown_seconds)."""
     # Check cooldown from fleet tracker (avoids an extra API call)
-    if _fleet:
-        ship_status = get_fleet().get_ship(ship_symbol)
+    if (fleet := try_get_fleet()):
+        ship_status = fleet.get_ship(ship_symbol)
         if (
             ship_status
             and not ship_status.is_available()
@@ -1175,7 +1175,7 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     result = f"Extracted {yielded.get('units', '?')} {yielded.get('symbol', '?')}."
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
     cd_secs = float(cd.get("remainingSeconds", 0))
-    if _fleet and cd_secs > 0:
+    if cd_secs > 0 and (fleet := try_get_fleet()):
         get_fleet().set_extraction_cooldown(ship_symbol, cd_secs)
     return result, cd_secs
 
@@ -1528,7 +1528,7 @@ def _buy_ship_logic(ship_type: str, waypoint_symbol: str, fleet=None) -> dict:
     # Update fleet state with the new ship so it's instantly available
     if fleet and "ship" in data:
         fleet.update_from_api([data["ship"]])
-    elif _fleet and "ship" in data:
+    elif "ship" in data and (fleet := try_get_fleet()):
         get_fleet().update_from_api([data["ship"]])
 
     return {
@@ -1575,8 +1575,8 @@ def _transfer_cargo_logic(
                 raise Exception(data["error"])
 
             # Sync updated cargo state to fleet tracker
-            if _fleet and isinstance(data, dict):
-                _fleet.update_ship_partial(from_ship, data)
+            if isinstance(data, dict) and (fleet := try_get_fleet()):
+                fleet.update_ship_partial(from_ship, data)
 
             results.append(f"  {symbol}: {transfer_units} units")
             total_units += transfer_units
@@ -1611,8 +1611,8 @@ def _transfer_cargo_logic(
         raise Exception(data["error"])
 
     # Sync updated cargo state to fleet tracker
-    if _fleet and isinstance(data, dict):
-        _fleet.update_ship_partial(from_ship, data)
+    if isinstance(data, dict) and (fleet := try_get_fleet()):
+        fleet.update_ship_partial(from_ship, data)
 
     cargo = data.get("cargo", {})
     return (
@@ -3231,7 +3231,7 @@ class BehaviorEngine:
         credits = agent.get("credits", 0)
 
         # Calculate Required Reserve (same logic as the HUD)
-        ships = list(get_fleet().ships.values()) if _fleet else []
+        ships = list(get_fleet().ships.values()) if try_get_fleet() else []
         trader_count = sum(
             1
             for s in ships
@@ -3704,8 +3704,8 @@ def view_ships(system_symbol: str | None = None) -> str:
     if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
 
-    if _fleet:
-        get_fleet().update_from_api(data)
+    if (fleet := try_get_fleet()):
+        fleet.update_from_api(data)
 
     # Filter by system first if requested
     if system_symbol:
@@ -3732,8 +3732,8 @@ def view_ships(system_symbol: str | None = None) -> str:
 
             # Check extraction cooldown
             cd_text = ""
-            if _fleet:
-                ship_status = get_fleet().get_ship(symbol)
+            if (fleet := try_get_fleet()):
+                ship_status = fleet.get_ship(symbol)
                 if (
                     ship_status
                     and not ship_status.is_available()
@@ -4086,7 +4086,7 @@ def view_cargo(ship_symbol: str) -> str:
         lines.append("  (empty)")
     else:
         # Get cargo costs from FleetTracker if available
-        ship = _get_local_ship(ship_symbol) if _fleet else None
+        ship = _get_local_ship(ship_symbol) if try_get_fleet() else None
         for item in inventory:
             symbol = item['symbol']
             item_units = item['units']
