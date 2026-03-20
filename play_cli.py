@@ -38,13 +38,31 @@ def get_arg_details(tool):
     return ", ".join(args_list)
 
 
+def _coerce(val, annotation):
+    """Convert a value to the specified type based on annotation.
+
+    Args:
+        val: The value to convert (typically a string from CLI)
+        annotation: The target type (int, float, bool, str, etc.)
+
+    Returns:
+        The converted value, or the original value if no conversion applies
+    """
+    if annotation is int:
+        return int(val)
+    elif annotation is bool:
+        return str(val).lower() in ("true", "1", "yes")
+    elif annotation is float:
+        return float(val)
+    return val
+
+
 def parse_and_run(tool, args_list):
     """
     Matches command line string arguments to the tool's function signature,
     converting types (int, float, etc.) where necessary.
     """
     sig = get_arg_type_hints(tool)
-    bound_args = None
 
     try:
         # 1. Map string args to function parameters
@@ -52,24 +70,13 @@ def parse_and_run(tool, args_list):
         converted_args = []
         params = list(sig.parameters.values())
 
-        # Type converters: map type objects to their conversion functions
-        type_converters = {
-            int: int,
-            float: float,
-            bool: lambda x: x.lower() in ("true", "1", "yes"),
-        }
-
         for i, arg_str in enumerate(args_list):
             if i >= len(params):
                 break
             param = params[i]
 
-            # Convert using type converters if available, otherwise keep as string
-            if param.annotation in type_converters:
-                val = type_converters[param.annotation](arg_str)
-            else:
-                val = arg_str
-
+            # Convert using type coercion
+            val = _coerce(arg_str, param.annotation)
             converted_args.append(val)
 
         # 2. Call the tool
@@ -212,7 +219,7 @@ def main_loop(tools_list):
                 sig = inspect.signature(tool.func if hasattr(tool, "func") else tool)
                 params = list(sig.parameters.values())
 
-                for i, arg in enumerate(args):
+                for arg in args:
                     # Don't uppercase if it looks like a boolean or number
                     if arg.lower() in ["true", "false"]:
                         final_args.append(arg)
@@ -238,15 +245,6 @@ def main_loop(tools_list):
                             kwargs[k] = v
                         else:
                             positional.append(arg)
-
-                    def _coerce(val, annotation):
-                        if annotation == int or annotation == "int":
-                            return int(val)
-                        elif annotation == bool:
-                            return str(val).lower() in ("true", "1", "yes")
-                        elif annotation == float:
-                            return float(val)
-                        return val
 
                     param_map = {p.name: p for p in params}
 
