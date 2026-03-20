@@ -90,6 +90,7 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 
 **Core Engine (`tools.py`):**
 - `BehaviorEngine.tick()`: Main state machine dispatcher. Core of autonomous execution.
+- `BehaviorEngine.get_fleet_activities()`: Single-pass analysis of all active behaviors. Returns structured dict with targeted waypoints, active probe systems, active goods being bought, and ship activity flags (constructing, buying, supply). Eliminates fragile string parsing in favor of StepType inspection.
 - `BehaviorEngine._step_*()`: Individual step handlers (goto, mine, buy, sell, autotrade, explore, etc.).
 - `_navigate_ship_logic()`: Most complex core function (refueling, multi-hop pathfinding, mode selection).
 - `_analyze_trade_routes()`: Scans market cache for profitable arbitrage, fleet-aware filtering.
@@ -116,7 +117,7 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 **Fleet State Tracking:**
 - `ship.cargo_inventory` — Local tracking of cargo items (avoids GET /cargo calls).
 - `ship.engine_speed` — Ship engine speed for pathfinding calculations.
-- `FleetTracker.update_ship_partial()` — Intercepts tool response payloads to update state in-place without extra API calls.
+- `FleetTracker.update_ship_partial()` — Intercepts tool response payloads to update state in-place without extra API calls. Auto-clears `in_transit` cooldown when nav_status changes from IN_TRANSIT to another state (v1.7+).
 
 **Step Sequence Enhancements:**
 - `repeat [N]` syntax — Execute steps N times, or forever if N omitted.
@@ -127,26 +128,31 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - LLM can acknowledge/clear alerts via `DELETE /api/alerts/{index}`.
 
 **HQ Fleet Director (v1.4+):**
-- **Toggleable Autonomy:** `toggle_hq` tool enables/disables automated fleet management (in-memory flag, no persistence needed).
-- **DRY Strategy Engine:** `evaluate_fleet_strategy()` — Single source of truth for game phase, budget, and fleet scaling decisions.
+- **Toggleable Autonomy:** `toggle_hq` tool enables/disables automated fleet management with flexible add/remove operations (e.g., `toggle_hq add="WHATER-1"` or `toggle_hq remove="HAULER"`).
+- **DRY Strategy Engine:** `evaluate_fleet_strategy()` — Single source of truth for game phase, budget, and fleet scaling decisions. Uses HQ headquarters location for jump gate tracking; searches globally for cheapest shipyards.
 - **Four-Phase Progression:**
   1. **BOOTSTRAP** (<2 traders): Get first Hauler, basic autotrade
   2. **BUILDUP** (<3 traders): Buy second Hauler, saturate local market
   3. **GATE CONSTRUCTION** (3+ traders, gate incomplete): Slow-mode gate funding (1/3 of haulers) + autotrade
   4. **EXPANSION** (gate complete): Multi-system exploration, expand to 15 traders
-- **Smart Satellite Routing:** `_get_probe_plan()` three-tier priority:
-  1. Chart uncharted waypoints (triggers explore)
-  2. Refresh oldest markets (local scouting)
-  3. Jump to unexplored systems (Phase 4 only, when local markets <30min old)
-- **Shipyard Squatting:** When fleet can expand, satellites automatically park at cheapest shipyard until purchase completes.
+- **Smart Satellite Routing:** `_get_probe_plan()` with Time-Adjusted Staleness + Cluster Tours:
+  1. Priority 1: Chart uncharted waypoints in current system (triggers explore)
+  2. Priority 2: Refresh oldest markets (local scouting with 5-min staleness threshold)
+  3. Priority 3: Jump to oldest markets globally (Phase 4 only)
+  4. **Probe Distribution:** Active probe system tracking prevents clustering — each system in the target list gets a score penalty (20000s per probe already assigned) so new probes are steered to under-scouted systems
+  5. **Cluster Tours:** Once a stale seed market is picked, up to 2 nearby stale neighbors (same system) are added to maximize multi-stop value
+- **Shipyard Squatting:** When fleet can expand, satellites automatically park at cheapest shipyard (searched globally across all known waypoints, not just local system) until purchase completes.
 - **Improved Fleet Distribution:** `assign_idle_ships()` with reality checks:
+  - Uses `get_fleet_activities()` for single-pass fleet state analysis
   - Only gate construction when gate exists AND needs materials AND excess > 150k
-  - Consistent hash assignment (same ships always do construction duty)
+  - Consistent assignment (same ships always do construction duty)
   - Haulers default to autotrade when no construction work
-- **Adaptive Exploration:** `_step_explore()` now auto-jumps between systems:
-  - When system fully charted/scouted, checks jump gate for unexplored connections
-  - Automatically chains `goto GATE, jump WAYPOINT, explore` for continuous exploration
-  - Stops exploring only when all connected space is fully mapped
+  - Buy gate permissions gated by `can_buy_ships` flag (toggle_hq BUY_SHIPS setting)
+- **Adaptive Exploration:** `_step_explore()` now:
+  - Caches jump gate connections to avoid repeated API calls
+  - Checks both local jump gate (Priority 3a) and all known gates globally (Priority 3b) for unfetched systems
+  - Short-lived behavior pattern: navigates to target and stops (HQ reassigns to explore/scout)
+  - Prevents duplicate assignments by checking `get_fleet_activities()` for targeted waypoints
 
 **Advisor Status in Server State:**
 - `GET /api/state` now includes `"advisor"` field with current financial assessment.
@@ -159,15 +165,19 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - **HQ JIT Planner Fix:** Critical bug fix — now properly decrements `spare_capacity` as trades are added, preventing overbooking (previously would queue 3 trades of 50 units each when only 100 units were available).
 - **Enhanced Logging:** `_evaluate_hq_opportunities()` now logs each decision point (debug for rejections, info for insertions) and limits to one step insertion per cycle.
 
-**Construct Step Improvements (v1.5+):**
+**Construct Step Improvements (v1.5+, v1.7+ consolidated):**
 - **Auto-Sell Unwanted Cargo:** `_step_construct()` no longer pauses when encountering wrong cargo; instead calls `_build_sell_sequence()` to automatically sell it, then re-queue construct.
-- **Fleet-Aware Prevention:** HQ idle assignment now checks `_find_active_ships_with_keywords(['supply', 'construct'])` before assigning another ship to construction, preventing duplicate material gathering.
+- **Fleet-Aware Prevention:** `_step_construct()` and `assign_idle_ships()` now use `get_fleet_activities()` to check for other ships already doing construction/supply work, preventing duplicate material gathering. Uses structured `constructing_ships` and `supply_ships` sets instead of string parsing.
 - **Idle on Overflow:** If another ship is already delivering enough material, the construct step completes gracefully and lets the ship go idle (available for HQ reassignment).
 
-**Fleet-Aware Helper Functions (v1.5+):**
-- `_find_active_ships_with_keywords(keywords, exclude_ship)` — Returns set of ships actively running behaviors with given keywords (e.g., 'construct', 'supply').
-- `_extract_active_goods_for_keyword(keyword)` — Parses fleet behaviors to extract goods being traded with specific keywords (e.g., extract 'IRON_ORE' from 'buy IRON_ORE').
-- Used by both `autotrade` (to avoid duplicate trading) and `construct` (to avoid duplicate assignments).
+**Fleet-Aware Coordination (v1.5+, consolidated in v1.7+):**
+- Consolidated into single `get_fleet_activities()` method that scans behaviors once and returns structured data:
+  - `targeted_waypoints`: GOTO step destinations for all ships (prevents duplicate routing)
+  - `active_goods`: Goods in BUY steps (for autotrade to avoid duplicate trading)
+  - `constructing_ships`, `buying_ships`, `supply_ships`: Sets of ships with those step types
+  - `active_probe_systems`: Dict of system → probe count (probes in or heading to that system)
+- Used by `_step_autotrade()` to avoid trading goods other ships are buying.
+- Used by `_step_explore()` and `assign_idle_ships()` to avoid duplicate assignments.
 
 **Shared Sell Sequence Builder:**
 - `_build_sell_sequence(ship_symbol, cargo_map, ship)` — Extracted from trade route planner into reusable function. Finds best sell market for each cargo item, groups by destination, returns navigation/sell steps. Handles gate material special case (supply to jump gate if materials needed).
@@ -177,6 +187,12 @@ The core concept: **Fast Loop (Server Tick)** runs deterministic behaviors every
 - `get_system_from_waypoint(waypoint_symbol)` — Centralized string manipulation to extract system symbol (e.g., `'X1-DF14'` from `'X1-DF14-A1'`). Used throughout codebase for reliable waypoint parsing.
 - `calculate_distance(x1, y1, x2, y2)` and `waypoint_distance(wp1, wp2, cache)` — Centralized Euclidean distance functions used by pathfinding, probe planning, and trade analysis. Eliminates hardcoded math across multiple files.
 - Reduces code duplication: these helpers eliminated a dozen instances of manual string splitting and distance calculation.
+
+**Fleet Activity Consolidation (v1.7+):**
+- **Unified Fleet Analysis:** `get_fleet_activities(fleet, exclude_ship)` replaces fragile string-based parsing (`_find_active_ships_with_keywords`, `_extract_active_goods_for_keyword`). Single pass over all behaviors using structured StepType inspection yields reliable fleet coordination data.
+- **Probe System Counting Fix:** Only counts a probe's current system if staying local; if heading cross-system, only counts destination system(s). Prevents inflated counts that discourage probe distribution.
+- **Cross-System Penalty in Probe Planning:** Progressive score degradation (20000s per probe) applied to non-local market targets, preventing all probes from clustering in the same high-value system.
+- **Dynamic Probe Reassignment:** Within a single HQ tick, as each idle probe is assigned, the `active_probe_systems` dict is updated so subsequent idle probes in the same tick see the updated occupation and make better routing decisions.
 
 **HQ Design Philosophy — Short-Lived Behaviors + Idle Re-evaluation:**
 The core pattern is that ships receive short, focused behaviors (e.g., `goto WP, scout, stop` or a single trade route ending in `stop`). When a behavior completes, the ship becomes idle, and `assign_idle_ships()` re-evaluates what it should do next based on current game state. This means strategic pivots happen naturally — a hauler that just finished a trade run might be reassigned to buy construction materials, or a probe that just scouted a market might be sent to the most stale market across the entire system. No behavior needs to encode long-term strategy; the HQ director handles that by making fresh decisions each time a ship goes idle. This keeps individual behaviors simple while enabling complex fleet-wide coordination like "pause trading to fund jump gate construction" or "redirect probes to cover neglected market clusters."

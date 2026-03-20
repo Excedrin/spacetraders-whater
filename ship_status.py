@@ -231,8 +231,13 @@ class FleetTracker:
 
         if "nav" in data:
             ship.location = data["nav"].get("waypointSymbol", ship.location)
-            ship.nav_status = data["nav"].get("status", ship.nav_status)
+            new_status = data["nav"].get("status", ship.nav_status)
+            ship.nav_status = new_status
             ship.flight_mode = data["nav"].get("flightMode", ship.flight_mode)
+
+            # Clear in_transit cooldown if we are no longer in transit
+            if new_status != "IN_TRANSIT" and ship.busy_reason == "in_transit":
+                ship.clear_cooldown()
         if "fuel" in data:
             ship.fuel_current = data["fuel"].get("current", ship.fuel_current)
             ship.fuel_capacity = data["fuel"].get("capacity", ship.fuel_capacity)

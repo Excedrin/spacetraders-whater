@@ -495,13 +495,15 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
     if not search_sys and ships and ships[0].location:
         search_sys = get_system_from_waypoint(ships[0].location)
 
-    # --- Check Jump Gate Status (from waypoint cache, fetch if missing) ---
+    # --- Check Jump Gate Status ---
+    hq_sys = get_system_from_waypoint(agent.get("headquarters", "")) if agent.get("headquarters") else search_sys
     gate_built = False
     needs_gate_materials = False
-    if search_sys:
-        cache = load_waypoint_cache()
+    cache = load_waypoint_cache()
+
+    if hq_sys:
         for wp_sym, wp_data in cache.items():
-            if not isinstance(wp_data, dict) or not wp_sym.startswith(search_sys + "-"):
+            if not isinstance(wp_data, dict) or not wp_sym.startswith(hq_sys + "-"):
                 continue
             if wp_data.get("type") == "JUMP_GATE":
                 if "construction" not in wp_data:
@@ -514,7 +516,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
                     needs_gate_materials = True
                 break
 
-    # --- UPDATED: Phase Logic ---
+    # --- Phase Logic ---
     if trader_count < 2:
         phase = 1
         phase_name = "PHASE 1: BOOTSTRAP (Goal: Accumulate credits for first Hauler)"
@@ -528,43 +530,40 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
         phase = 4
         phase_name = "PHASE 4: EXPANSION (Goal: Chart new systems, build massive fleet)"
 
-    # Shipyard Info — check cache for ship pricing, fall back to has_shipyard flag
-    cache = load_market_cache()
+    # Shipyard Info — Search globally for the cheapest ship prices
     hauler_price = float("inf")
     probe_price = float("inf")
     cheapest_shipyard = "Unknown"
     cheapest_probe_shipyard = "Unknown"
     fallback_shipyard = None
 
-    # Count markets for probe scaling
+    # Count markets globally for probe scaling
     market_count = 0
-    if search_sys:
-        for wp, data in cache.items():
-            if isinstance(data, dict) and wp.startswith(search_sys + "-") and data.get("has_market"):
-                market_count += 1
+    for wp, data in cache.items():
+        if not isinstance(data, dict) or wp == "_systems_fetched":
+            continue
 
-    if search_sys:
-        for wp, data in cache.items():
-            if not isinstance(data, dict) or not wp.startswith(search_sys + "-"):
-                continue
-            if "ships" in data:
-                for s in data["ships"]:
-                    if s["type"] in ["SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_COMMAND_FRIGATE"]:
-                        if s.get("purchasePrice", float("inf")) < hauler_price:
-                            hauler_price = s["purchasePrice"]
-                            cheapest_shipyard = wp
-                    if s["type"] == "SHIP_PROBE":
-                        if s.get("purchasePrice", float("inf")) < probe_price:
-                            probe_price = s["purchasePrice"]
-                            cheapest_probe_shipyard = wp
-            elif data.get("has_shipyard") and not fallback_shipyard:
-                fallback_shipyard = wp
+        if data.get("has_market"):
+            market_count += 1
 
-        # If no priced shipyard found, use any known shipyard with default price
-        if cheapest_shipyard == "Unknown" and fallback_shipyard:
-            cheapest_shipyard = fallback_shipyard
-        if cheapest_probe_shipyard == "Unknown" and fallback_shipyard:
-            cheapest_probe_shipyard = fallback_shipyard
+        if "ships" in data:
+            for s in data["ships"]:
+                if s["type"] in ["SHIP_LIGHT_HAULER", "SHIP_HEAVY_FREIGHTER", "SHIP_COMMAND_FRIGATE"]:
+                    if s.get("purchasePrice", float("inf")) < hauler_price:
+                        hauler_price = s["purchasePrice"]
+                        cheapest_shipyard = wp
+                if s["type"] == "SHIP_PROBE":
+                    if s.get("purchasePrice", float("inf")) < probe_price:
+                        probe_price = s["purchasePrice"]
+                        cheapest_probe_shipyard = wp
+        elif data.get("has_shipyard") and not fallback_shipyard:
+            fallback_shipyard = wp
+
+    # If no priced shipyard found, use any known shipyard with default price
+    if cheapest_shipyard == "Unknown" and fallback_shipyard:
+        cheapest_shipyard = fallback_shipyard
+    if cheapest_probe_shipyard == "Unknown" and fallback_shipyard:
+        cheapest_probe_shipyard = fallback_shipyard
 
     ship_at_shipyard = False
     if cheapest_shipyard != "Unknown":
@@ -572,7 +571,7 @@ def evaluate_fleet_strategy(system_symbol: str = None) -> dict:
 
     # --- Allow fleet expansion post-gate ---
     # Max 3 traders before gate, max 15 traders after gate.
-    max_traders = 15 if gate_built else 3
+    max_traders = 15 if gate_built else 2
     can_buy_ship = excess > hauler_price and trader_count < max_traders
 
     # Probe scaling: ~1 probe per 15 markets, minimum 1
@@ -649,9 +648,9 @@ def _calculate_travel_cost(
     Returns: (distance, fuel_cost, flight_seconds)
     """
     # 1. Calculate Distance
-    dx = dest_wp["x"] - origin_wp["x"]
-    dy = dest_wp["y"] - origin_wp["y"]
-    distance = math.sqrt(dx**2 + dy**2)
+    distance = calculate_distance(
+        origin_wp["x"], origin_wp["y"], dest_wp["x"], dest_wp["y"]
+    )
 
     # 2. Get Ship Engine Speed (Default to 30 for Command Ships if missing)
     # Satellites usually have speed 10, Command ships 30, Interceptors >30
@@ -909,7 +908,7 @@ def _navigate_ship_logic(
                     if "error" in cs_data:
                         continue
                     cx, cy = cs_data.get("x", 0), cs_data.get("y", 0)
-                    dist = math.sqrt((cx - dx) ** 2 + (cy - dy) ** 2)
+                    dist = calculate_distance(cx, cy, dx, dy)
 
                     if dist < best_dist:
                         best_dist = dist
@@ -930,9 +929,7 @@ def _navigate_ship_logic(
 
             cd = jump_res.get("cooldown", {}).get("remainingSeconds", 0)
             if _fleet and cd > 0:
-                _fleet.set_transit(
-                    ship_symbol, float(cd)
-                )  # Treat as transit so engine waits
+                _fleet.set_transit(ship_symbol, float(cd))
 
             next_sys = "-".join(next_jump_target.split("-")[:2])
             return (
@@ -1785,9 +1782,9 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
                 if ship_pos:
                     src_pos_coords = wp_coords.get(src_wp)
                     if src_pos_coords:
-                        d = math.sqrt(
-                            (src_pos_coords[0] - ship_pos[0]) ** 2
-                            + (src_pos_coords[1] - ship_pos[1]) ** 2
+                        d = calculate_distance(
+                            src_pos_coords[0], src_pos_coords[1],
+                            ship_pos[0], ship_pos[1]
                         )
                         route["dist"] = max(d, 1.0)
 
@@ -1809,7 +1806,7 @@ def _analyze_trade_routes(ship_symbol: str = None, min_profit: int = 1) -> list[
     return routes
 
 
-def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_targets: set = None) -> str:
+def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_targets: set = None, active_probe_systems: dict = None) -> str:
     """
     Determines a probe's mission using Time-Adjusted Staleness and Cluster Tours.
 
@@ -1817,14 +1814,17 @@ def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_ta
     2. Cluster Tour: Once an urgent "Seed" is picked, adds nearby stale neighbors.
     """
     import time
+    if active_probe_systems is None:
+        active_probe_systems = {}
     system = ship_location.rsplit("-", 1)[0]
     cache = load_waypoint_cache()
     ship_status = _get_local_ship(ship_symbol)
     speed = max(1, ship_status.engine_speed)
 
-    system_wps = [v for k, v in cache.items() if k.startswith(system + "-") and isinstance(v, dict)]
+    all_wps = [v for k, v in cache.items() if k != "_systems_fetched" and isinstance(v, dict)]
+    system_wps = [wp for wp in all_wps if wp["symbol"].startswith(system + "-")]
 
-    # Priority 1: Charting
+    # Priority 1: Charting Local System
     uncharted = [wp for wp in system_wps if not wp.get("is_charted")]
     if uncharted:
         return "explore"
@@ -1835,7 +1835,12 @@ def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_ta
 
     sx, sy = cache.get(ship_location, {}).get("x", 0), cache.get(ship_location, {}).get("y", 0)
 
-    for wp in system_wps:
+    # In phase 4, we consider ALL known markets. Otherwise, only local markets.
+    search_wps = all_wps if phase >= 4 else system_wps
+    #min_age = 3600 if phase >= 4 else 300  # 1 hour in phase 4, 5 mins in phase 1-3
+    min_age = 600 if phase >= 4 else 300  # 1 hour in phase 4, 5 mins in phase 1-3
+
+    for wp in search_wps:
         if wp.get("has_market"):
             wp_sym = wp["symbol"]
             if wp_sym == ship_location:
@@ -1843,35 +1848,52 @@ def _get_probe_plan(ship_symbol: str, ship_location: str, phase: int, claimed_ta
             if claimed_targets is not None and wp_sym in claimed_targets:
                 continue
 
-            age = now - wp.get("last_updated", 0)
-            if age < 300: # Ignore anything refreshed in last 5m
+            last_updated = wp.get("last_updated", 0)
+            if last_updated == 0:
+                # Never scouted: cap age at 24h so the system clustering penalty actually works
+                age = 86400
+            else:
+                age = now - last_updated
+
+            if age < min_age:
                 continue
 
             wx, wy = wp.get("x", 0), wp.get("y", 0)
-            dist_from_ship = calculate_distance(sx, sy, wx, wy)
 
-            # Heuristic: Flight Time = (Dist * (30/Speed)) + 15
-            flight_time = (dist_from_ship * (30 / speed)) + 15
+            # Cross-system penalty
+            if wp_sym.startswith(system + "-"):
+                dist_from_ship = calculate_distance(sx, sy, wx, wy)
+                flight_time = (dist_from_ship * (30 / speed)) + 15
+            else:
+                flight_time = 500  # Jump overhead penalty
 
-            # Score = Expected Age Upon Arrival.
-            # This prevents being "stuck" in local clusters because a very old
-            # distant market will eventually have a higher score than a fresh local one.
             score = age - flight_time
-            candidates.append({"wp": wp_sym, "score": score, "age": age, "x": wx, "y": wy})
+
+            wp_sys = wp_sym.rsplit("-", 1)[0]
+            if wp_sys != system:
+                probes_in_target = active_probe_systems.get(wp_sys, 0)
+                # Apply a ~5.5 hour score penalty per probe already in or headed to that system
+                score -= (probes_in_target * 20000)
+
+            candidates.append({"wp": wp_sym, "score": score, "age": age, "x": wx, "y": wy, "sys": wp_sys})
 
     if candidates:
-        # 1. Pick the "Seed" (The market that will be the oldest when we arrive)
+        # 1. Pick the "Seed"
         candidates.sort(key=lambda x: x["score"], reverse=True)
         seed = candidates[0]
+
+        # If seed is in another system, just go there and scout.
+        if seed["sys"] != system:
+            if claimed_targets is not None:
+                claimed_targets.add(seed["wp"])
+            return f"goto {seed['wp']}, scout, stop"
 
         tour = [seed]
         if claimed_targets is not None:
             claimed_targets.add(seed["wp"])
 
         # 2. Cluster Neighbors: Find up to 2 closest stale neighbors TO THE SEED.
-        # This ensures that once we pay the long-haul cost to reach a distant area,
-        # we maximize the value of that trip.
-        neighbors = [c for c in candidates if c["wp"] != seed["wp"] and c["age"] > 600]
+        neighbors = [c for c in candidates if c["wp"] != seed["wp"] and c["sys"] == system and c["age"] > 600]
         neighbors.sort(key=lambda n: calculate_distance(seed["x"], seed["y"], n["x"], n["y"]))
 
         for n in neighbors[:2]:
@@ -1908,27 +1930,17 @@ def assign_idle_ships(fleet, engine):
         return
 
     strat = evaluate_fleet_strategy()
+    targets_set = {t.strip() for t in _hq_managed_ships.split(",")}
+    can_buy_ships = "ALL" in targets_set or "BUY_SHIPS" in targets_set
 
     needs_gate_materials = strat["needs_gate_materials"]
 
-    # Track probe destinations to avoid duplicate scouting assignments
-    # Seed with GOTO destinations of probes already running behaviors
-    probe_targets = set()
-    for sym, cfg in engine.behaviors.items():
-        ship_st = fleet.get_ship(sym)
-        if ship_st and ship_st.role == "SATELLITE" and sym not in idle_ships:
-            for step in cfg.steps:
-                if step.step_type == StepType.GOTO and step.args:
-                    probe_targets.add(step.args[0])
-
-    buyer_assigned = False
-    constructor_assigned = False
-
-    # Check if any ship is already doing construction
-    for sym, cfg in engine.behaviors.items():
-        if any(s.step_type == StepType.CONSTRUCT for s in cfg.steps):
-            constructor_assigned = True
-            break
+    # Get fleet activities: probe targets, active probe systems, and assignment flags
+    acts = engine.get_fleet_activities(fleet)
+    probe_targets = acts["targeted_waypoints"]
+    active_probe_systems = acts["active_probe_systems"]
+    constructor_assigned = len(acts["constructing_ships"]) > 0
+    buyer_assigned = len(acts["buying_ships"]) > 0
 
     log.debug(f"👔 [HQ] Idle ships: {idle_ships} | Phase: {strat['phase']} | "
              f"Credits: {strat['credits']:,} | Excess: {strat['excess']:,} | "
@@ -1947,7 +1959,7 @@ def assign_idle_ships(fleet, engine):
         role = ship_status.role
 
         # FEATURE 2a: Buy Probe (cheap, high value — check first)
-        if strat["needs_probe"] and not buyer_assigned and strat["cheapest_probe_shipyard"] != "Unknown":
+        if can_buy_ships and strat["needs_probe"] and not buyer_assigned and strat["cheapest_probe_shipyard"] != "Unknown":
             target_sy = strat["cheapest_probe_shipyard"]
             ship_to_buy = "SHIP_PROBE"
 
@@ -1962,7 +1974,7 @@ def assign_idle_ships(fleet, engine):
             continue
 
         # FEATURE 2b: Buy Hauler (Can be done by any ship)
-        if strat["can_buy_ship"] and not buyer_assigned and strat["cheapest_shipyard"] != "Unknown":
+        if can_buy_ships and strat["can_buy_ship"] and not buyer_assigned and strat["cheapest_shipyard"] != "Unknown":
             target_sy = strat["cheapest_shipyard"]
             ship_to_buy = "SHIP_LIGHT_HAULER"
 
@@ -1979,10 +1991,19 @@ def assign_idle_ships(fleet, engine):
         # --- PROBES & SATELLITES ---
         if role == "SATELLITE":
             # Smart Scout (Refresh oldest market prices or expand)
-            plan = _get_probe_plan(ship_symbol, ship_status.location, strat["phase"], claimed_targets=probe_targets)
+            plan = _get_probe_plan(ship_symbol, ship_status.location, strat["phase"], claimed_targets=probe_targets, active_probe_systems=active_probe_systems)
             log.info(f"👔 [HQ] Dispatching {ship_symbol} to Scout: {plan}")
             engine.assign(ship_symbol, plan)
-            # probe_targets updated inside _get_probe_plan now
+
+            # Update active probe systems so next idle probe this tick doesn't follow
+            if plan.startswith("goto "):
+                dest_wp = plan.split()[1].strip(",")
+                dest_sys = get_system_from_waypoint(dest_wp)
+                active_probe_systems[dest_sys] = active_probe_systems.get(dest_sys, 0) + 1
+            elif plan == "explore":
+                sys = get_system_from_waypoint(ship_status.location)
+                active_probe_systems[sys] = active_probe_systems.get(sys, 0) + 1
+
             continue
 
         # --- HAULERS & COMMAND ---
@@ -1990,8 +2011,7 @@ def assign_idle_ships(fleet, engine):
             # FEATURE 1: Supply closest Jump Gate with needed materials
             # Assign first idle trader to construction; rest autotrade.
             # Avoid assigning multiple ships to construct by checking if any other ship is already doing it
-            active_construct_ships = engine._find_active_ships_with_keywords(["supply", "construct"])
-            if needs_gate_materials and strat["excess"] > GATE_MIN_CREDIT_BUFFER and not constructor_assigned and not active_construct_ships:
+            if needs_gate_materials and strat["excess"] > GATE_MIN_CREDIT_BUFFER and not constructor_assigned and not acts["supply_ships"]:
                 log.info(f"👔 [HQ] Assigned {ship_symbol} to Jump Gate Construction.")
                 engine.assign(ship_symbol, "construct")
                 constructor_assigned = True
@@ -2310,6 +2330,68 @@ class BehaviorEngine:
 
     def get_idle_ships(self, fleet) -> list[str]:
         return [s for s in fleet.ships if s not in self.behaviors]
+
+    def get_fleet_activities(self, fleet=None, exclude_ship: str = None) -> dict:
+        """Analyzes all active behaviors to summarize fleet activities.
+
+        Returns:
+            targeted_waypoints: set of waypoint symbols any ship has a GOTO step for
+            active_probe_systems: dict of system_symbol -> probe count (probes in/heading to that system)
+            active_goods: set of trade goods currently being bought by any ship (for autotrade dedup)
+            constructing_ships: set of ship symbols with a CONSTRUCT step
+            buying_ships: set of ship symbols with a BUY_SHIP step
+            supply_ships: set of ship symbols with a SUPPLY step
+        """
+        activities = {
+            "targeted_waypoints": set(),
+            "active_probe_systems": {},
+            "active_goods": set(),
+            "constructing_ships": set(),
+            "buying_ships": set(),
+            "supply_ships": set(),
+        }
+
+        for sym, cfg in self.behaviors.items():
+            if exclude_ship and sym == exclude_ship:
+                continue
+
+            ship_sys = None
+            is_probe = False
+
+            if fleet:
+                ship_st = fleet.get_ship(sym)
+                if ship_st:
+                    if ship_st.location:
+                        ship_sys = get_system_from_waypoint(ship_st.location)
+                    if ship_st.role == "SATELLITE":
+                        is_probe = True
+
+            cross_sys_dests = set()
+            for step in cfg.steps:
+                if step.step_type == StepType.GOTO and step.args:
+                    wp = step.args[0]
+                    activities["targeted_waypoints"].add(wp)
+                    if is_probe and ship_sys:
+                        dest_sys = get_system_from_waypoint(wp)
+                        if dest_sys != ship_sys:
+                            cross_sys_dests.add(dest_sys)
+                elif step.step_type == StepType.BUY and step.args:
+                    activities["active_goods"].add(step.args[0])
+                elif step.step_type == StepType.CONSTRUCT:
+                    activities["constructing_ships"].add(sym)
+                elif step.step_type == StepType.BUY_SHIP:
+                    activities["buying_ships"].add(sym)
+                elif step.step_type == StepType.SUPPLY:
+                    activities["supply_ships"].add(sym)
+
+            if is_probe and ship_sys:
+                # If probe is heading to another system, count destination(s) only.
+                # If probe is staying local, count current system.
+                target_systems = cross_sys_dests if cross_sys_dests else {ship_sys}
+                for sys in target_systems:
+                    activities["active_probe_systems"][sys] = activities["active_probe_systems"].get(sys, 0) + 1
+
+        return activities
 
     def summary(self) -> str:
         if not self.behaviors:
@@ -2784,10 +2866,8 @@ class BehaviorEngine:
         1. Analyzes market/cargo to generate a multi-stop trade route string.
         2. Calls self.assign() to overwrite the current behavior with the new plan.
         """
-        # --- FLEET-AWARE LOGIC ---
         # Find goods currently being bought by OTHER ships to avoid duplication
-        active_goods = self._extract_active_goods_for_keyword("buy")
-        # ----------------------------
+        active_goods = self.get_fleet_activities(exclude_ship=cfg.ship_symbol)["active_goods"]
 
         # 1. Check Cargo
         cargo_data = client.get_cargo(cfg.ship_symbol)
@@ -2835,16 +2915,25 @@ class BehaviorEngine:
         if isinstance(wps, dict) and "error" in wps:
             raise Exception(wps["error"])
 
-        cache = load_market_cache()
+        cache = load_waypoint_cache()
         target_wp = None
         action = None
 
+        acts = self.get_fleet_activities(exclude_ship=cfg.ship_symbol)
+        targeted_wps = acts["targeted_waypoints"]
+        targeted_systems = {get_system_from_waypoint(wp) for wp in targeted_wps}
+
         for wp in wps:
             wp_sym = wp["symbol"]
+
+            # Skip if another ship is already en route here
+            if wp_sym in targeted_wps:
+                continue
+
             traits = [t["symbol"] for t in wp.get("traits", [])]
 
             # Priority 1: Charting
-            if not wp.get("chart"):
+            if not wp.get("is_charted"):
                 target_wp = wp_sym
                 action = "chart"
                 break
@@ -2858,40 +2947,62 @@ class BehaviorEngine:
 
         if target_wp:
             # Inject a goto and the action, then return to exploring
-            self.assign(cfg.ship_symbol, f"goto {target_wp}, {action}, explore")
+            self.assign(cfg.ship_symbol, f"goto {target_wp}, {action}, stop")
             return None
 
-        # --- NEW: SYSTEM IS FULLY EXPLORED ---
         # Priority 3: Jump to a new uncharted system
+        fetched = cache.get("_systems_fetched", [])
+
+        # 3a. Check LOCAL jump gate first
         jgs = [wp for wp in wps if wp.get("type") == "JUMP_GATE"]
         if jgs:
             jg_sym = jgs[0]["symbol"]
-            jg_data = client.get_jump_gate(sys_sym, jg_sym)
+            jg_cache_data = cache.get(jg_sym, {})
 
-            if isinstance(jg_data, dict) and "error" not in jg_data:
-                connections = jg_data.get("connections", [])
+            if "connections" not in jg_cache_data:
+                jg_data = client.get_jump_gate(sys_sym, jg_sym)
+                if isinstance(jg_data, dict) and "error" not in jg_data:
+                    jg_cache_data["connections"] = jg_data.get("connections", [])
+                    cache[jg_sym] = jg_cache_data
+                    _save_cache(cache)
 
-                # Find a connected system we haven't fully explored
-                cache = load_waypoint_cache()
-                fetched = cache.get("_systems_fetched", [])
-
-                unfetched_systems = []
-                for conn in connections:
-                    conn_sys = conn.rsplit("-", 1)[0]
-                    if conn_sys not in fetched:
-                        unfetched_systems.append(conn)
-
-                if unfetched_systems:
-                    target_gate = unfetched_systems[0]
-                    # We inject jumping into the behavior, and then immediately explore the new system
-                    self.assign(cfg.ship_symbol, f"goto {jg_sym}, jump {target_gate}, explore")
+            connections = jg_cache_data.get("connections", [])
+            for conn in connections:
+                conn_sym = conn.get("symbol") if isinstance(conn, dict) else conn
+                conn_sys = conn_sym.rsplit("-", 1)[0]
+                if conn_sys not in fetched:
+                    self.assign(cfg.ship_symbol, f"goto {conn_sym}, stop")
                     return None
 
-        # If no jump gate, or all connected systems are fully explored:
+        # 3b. Check ALL jump gates globally for unfetched connections
+        all_wps = [v for k, v in cache.items() if k != "_systems_fetched" and isinstance(v, dict)]
+        global_jgs = [wp for wp in all_wps if wp.get("type") == "JUMP_GATE"]
+        for jg in global_jgs:
+            jg_sys = jg["symbol"].rsplit("-", 1)[0]
+            if jg_sys == sys_sym:
+                continue # Already checked local
+
+            jg_cache_data = cache.get(jg["symbol"], {})
+            if "connections" not in jg_cache_data:
+                jg_data = client.get_jump_gate(jg_sys, jg["symbol"])
+                if isinstance(jg_data, dict) and "error" not in jg_data:
+                    jg_cache_data["connections"] = jg_data.get("connections", [])
+                    cache[jg["symbol"]] = jg_cache_data
+                    _save_cache(cache)
+
+            connections = jg_cache_data.get("connections", [])
+            for conn in connections:
+                conn_sym = conn.get("symbol") if isinstance(conn, dict) else conn
+                conn_sys = conn_sym.rsplit("-", 1)[0]
+                if conn_sys not in fetched:
+                    self.assign(cfg.ship_symbol, f"goto {conn_sym}, stop")
+                    return None
+
+        # If no charting/scouting work or unfetched systems available:
         cfg.paused = True
         cfg.alert_sent = True
         self._save()
-        return f"{cfg.ship_symbol} ALERT: Exploration of {sys_sym} complete! All waypoints charted and connected systems fetched."
+        return f"{cfg.ship_symbol} ALERT: Exploration complete! All known connected systems are fetched."
 
     def _find_closest_incomplete_jump_gate(self, ship_location: str) -> Optional[str]:
         """Find the closest incomplete JUMP_GATE from waypoint cache.
@@ -2931,7 +3042,7 @@ class BehaviorEngine:
                 wp_x = wp_data.get("x")
                 wp_y = wp_data.get("y")
                 if wp_x is not None and wp_y is not None:
-                    dist = math.sqrt((wp_x - ship_x) ** 2 + (wp_y - ship_y) ** 2)
+                    dist = calculate_distance(wp_x, wp_y, ship_x, ship_y)
 
             candidates.append((dist, wp_sym))
 
@@ -2941,47 +3052,6 @@ class BehaviorEngine:
         # Return closest (sort by distance)
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
-
-    def _find_active_ships_with_keywords(self, keywords: list[str], exclude_ship: str = None) -> set:
-        """
-        Find all ships that have any of the given keywords in their behavior steps.
-
-        Args:
-            keywords: List of keywords to search for (e.g., ['supply', 'construct'])
-            exclude_ship: Ship symbol to skip (typically the current ship)
-
-        Returns:
-            Set of ship symbols that have the keywords in their behavior
-        """
-        matching = set()
-        for cfg in self.behaviors.values():
-            if exclude_ship and cfg.ship_symbol == exclude_ship:
-                continue
-            for keyword in keywords:
-                if keyword in cfg.steps_str:
-                    matching.add(cfg.ship_symbol)
-                    break
-        return matching
-
-    def _extract_active_goods_for_keyword(self, keyword: str) -> set:
-        """
-        Extract goods/items being actively processed with a keyword by other ships.
-
-        Args:
-            keyword: The keyword to search for (e.g., 'buy', 'sell')
-
-        Returns:
-            Set of goods/items found (e.g., {'IRON_ORE', 'COPPER_ORE'})
-        """
-        goods = set()
-        for cfg in self.behaviors.values():
-            for part in cfg.steps_str.split(","):
-                part = part.strip()
-                if part.startswith(f"{keyword} "):
-                    tokens = part.split()
-                    if len(tokens) > 1:
-                        goods.add(tokens[1])
-        return goods
 
     def _step_construct(self, cfg, ship, step=None) -> Optional[str]:
         """Smart construction: Check jump gate needs, check budget, buy, supply.
@@ -3062,12 +3132,8 @@ class BehaviorEngine:
 
         # 4b. Check for other ships already delivering this material
         in_transit = 0
-        for other_ship_sym, other_cfg in self.behaviors.items():
-            if other_ship_sym == cfg.ship_symbol:
-                continue  # Skip self
-            if "construct" not in other_cfg.steps_str:
-                continue  # Not a construct ship
-
+        acts = self.get_fleet_activities(exclude_ship=cfg.ship_symbol)
+        for other_ship_sym in acts["constructing_ships"]:
             # Check this ship's cargo for the target material
             other_cargo = client.get_cargo(other_ship_sym)
             for item in other_cargo.get("inventory", []):
@@ -3879,8 +3945,8 @@ def _find_waypoints_logic(
                 if ref_coords and wp_data:
                     wx, wy = wp_data.get("x"), wp_data.get("y")
                     if wx is not None:
-                        dist = math.sqrt(
-                            (wx - ref_coords[0]) ** 2 + (wy - ref_coords[1]) ** 2
+                        dist = calculate_distance(
+                            wx, wy, ref_coords[0], ref_coords[1]
                         )
 
                 candidates.append(
@@ -3938,8 +4004,8 @@ def _find_waypoints_logic(
         for wp in filtered_wps:
             dist = float("inf")
             if ref_coords:
-                dist = math.sqrt(
-                    (wp["x"] - ref_coords[0]) ** 2 + (wp["y"] - ref_coords[1]) ** 2
+                dist = calculate_distance(
+                    wp["x"], wp["y"], ref_coords[0], ref_coords[1]
                 )
 
             candidates.append(
@@ -4103,7 +4169,7 @@ def scan_system(
             return 0
         wx, wy = wp.get("x", 0), wp.get("y", 0)
         rx, ry = reference_position
-        return math.sqrt((wx - rx) ** 2 + (wy - ry) ** 2)
+        return calculate_distance(wx, wy, rx, ry)
 
     # Process waypoints and extract market data
     markets_found = 0
@@ -5336,22 +5402,61 @@ def assign_jump_gate_construction(ship_symbol: str) -> str:
 
 
 @tool
-def toggle_hq(targets: str) -> str:
+def toggle_hq(set: str = None, add: str = None, remove: str = None) -> str:
     """[STATE: hq] Configure which ships the HQ Fleet Director manages.
-    Args:
-        targets: "ALL" (manage all ships), "NONE" (disable HQ), or comma-separated list of ship roles/names
-                 Ship roles: HAULER, FREIGHTER, SATELLITE, COMMAND
-                 Examples: "ALL", "HAULER,SATELLITE", "WHATER-1,WHATER-2"
-    """
-    set_hq_enabled(targets)
 
-    targets_upper = targets.strip().upper()
-    if targets_upper == "NONE":
+    Use 'set' to replace the entire target list, or 'add'/'remove' to modify the current list.
+
+    Args:
+        set:    Replace the target list entirely. Special values: "ALL" (all ships), "NONE" (disable HQ).
+                Roles: HAULER, FREIGHTER, SATELLITE, COMMAND. Add BUY_SHIPS to allow purchasing.
+                Examples: set="ALL", set="NONE", set="SATELLITE,HAULER,BUY_SHIPS"
+        add:    Add tokens to the current list (comma-separated ship names or roles).
+                Example: add="WHATER-1" or add="WHATER-1,BUY_SHIPS"
+        remove: Remove tokens from the current list (comma-separated).
+                Example: remove="HAULER" or remove="WHATER-2,BUY_SHIPS"
+
+    Returns current HQ state after the change. You can call with no args to just read the current state.
+    """
+    current = _hq_managed_ships  # e.g. "SATELLITE,HAULER,BUY_SHIPS" or "ALL" or "NONE"
+
+    if set is not None:
+        new_targets = set.strip().upper()
+    elif add is not None or remove is not None:
+        # Build the current token set, treating ALL/NONE as opaque tokens
+        if current in ("ALL", "NONE"):
+            tokens = {current}
+        else:
+            tokens = {t.strip() for t in current.split(",") if t.strip()}
+
+        if add:
+            for t in add.upper().split(","):
+                t = t.strip()
+                if t:
+                    tokens.add(t)
+        if remove:
+            for t in remove.upper().split(","):
+                t = t.strip()
+                tokens.discard(t)
+
+        if not tokens:
+            new_targets = "NONE"
+        elif "ALL" in tokens:
+            new_targets = "ALL"
+        else:
+            tokens.discard("NONE")
+            new_targets = ",".join(sorted(tokens))
+    else:
+        new_targets = current  # no-op: just report status
+
+    set_hq_enabled(new_targets)
+
+    if new_targets == "NONE":
         status = "DISABLED (Manual control only)"
-    elif targets_upper == "ALL":
+    elif new_targets == "ALL":
         status = "ENABLED for ALL ships"
     else:
-        status = f"ENABLED for: {targets}"
+        status = f"ENABLED for: {new_targets}"
 
     return f"HQ Fleet Director is now {status}."
 
