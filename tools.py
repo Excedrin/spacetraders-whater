@@ -779,6 +779,99 @@ def _find_refuel_path(
 # ──────────────────────────────────────────────
 
 
+def _plan_route_logic(
+    current_wp: str,
+    destination_symbol: str,
+    ship_dict: dict,
+    mode: str,
+) -> Tuple[str, float]:
+    """Planning mode: returns route forecast without executing actions."""
+    current_sys = get_system_from_waypoint(current_wp) if current_wp else ""
+    dest_sys = get_system_from_waypoint(destination_symbol)
+    is_inter_system = current_sys != dest_sys
+
+    if is_inter_system:
+        local_jgs = get_system_waypoints(current_sys, waypoint_type="JUMP_GATE")
+        if not local_jgs or (isinstance(local_jgs, dict) and "error" in local_jgs):
+            return f"Error: No Jump Gate found in current system {current_sys}.", 0.0
+
+        local_jg_sym = local_jgs[0]["symbol"]
+
+        lines = [f"Inter-System Route Plan: {current_wp} -> {destination_symbol}"]
+
+        local_wps = get_system_waypoints(current_sys)
+        if isinstance(local_wps, dict) and "error" in local_wps:
+            return f"Error: {local_wps['error']}", 0.0
+
+        origin_obj = next((w for w in local_wps if w["symbol"] == current_wp), None)
+        local_jg_obj = next((w for w in local_wps if w["symbol"] == local_jg_sym), None)
+
+        t1, c1 = 0, 0
+        if current_wp != local_jg_sym and origin_obj and local_jg_obj:
+            _, c1, t1 = _calculate_travel_cost(ship_dict, local_jg_obj, origin_obj, mode)
+
+        lines.append(f"1. Nav to local gate ({local_jg_sym}): {t1}s, {c1} fuel")
+
+        jg_data = client.get_jump_gate(current_sys, local_jg_sym)
+        connections = (
+            jg_data.get("connections", [])
+            if isinstance(jg_data, dict) and "error" not in jg_data
+            else []
+        )
+        connected_systems = [get_system_from_waypoint(cw) for cw in connections]
+
+        if dest_sys in connected_systems:
+            lines.append(f"2. Jump directly to {dest_sys} gate: Antimatter / Cooldown")
+        else:
+            lines.append(f"2. Multi-system Jump Route to {dest_sys}: (Auto-routing via nearest connected system)")
+
+        lines.append(f"3. Nav to final dest ({destination_symbol}): Calculated upon arrival in {dest_sys}")
+        return "\n".join(lines), 0.0
+
+    # Intra-system planning
+    waypoints = get_system_waypoints(current_sys)
+    if isinstance(waypoints, dict) and "error" in waypoints:
+        return f"Error: {waypoints['error']}", 0.0
+
+    origin_obj = next((w for w in waypoints if w["symbol"] == current_wp), None)
+    target_obj = next((w for w in waypoints if w["symbol"] == destination_symbol), None)
+
+    if not origin_obj or not target_obj:
+        return "Error: Could not resolve origin or destination coordinates.", 0.0
+
+    lines = [f"Route Plan: {current_wp} -> {destination_symbol}"]
+    dist, direct_cost, direct_time = _calculate_travel_cost(
+        ship_dict, target_obj, origin_obj, "CRUISE"
+    )
+    lines.append(f"Direct Distance: {dist}")
+    lines.append("\nFlight Modes:")
+
+    fuel_capacity = ship_dict["fuel"]["capacity"]
+    fuel_current = ship_dict["fuel"]["current"]
+
+    for m in ["CRUISE", "DRIFT", "BURN"]:
+        path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode=m)
+        _, cost, time = _calculate_travel_cost(ship_dict, target_obj, origin_obj, m)
+
+        status = ""
+        if fuel_capacity > 0:
+            if cost <= fuel_current:
+                status = "✅ Direct"
+            elif path:
+                stops = len(path) - 2
+                status = f"✅ Multi-hop ({stops} stops: {'->'.join(path)})"
+            else:
+                status = "❌ Impossible (Max range exceeded)"
+        else:
+            status = "✅ (Solar)"
+
+        lines.append(
+            f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}"
+        )
+
+    return "\n".join(lines), 0.0
+
+
 def _navigate_ship_logic(
     ship_symbol: str,
     destination_symbol: str,
@@ -799,21 +892,21 @@ def _navigate_ship_logic(
 
     ship_status = _get_local_ship(ship_symbol)
     current_wp = ship_status.location or ""
-    current_sys = current_wp.rsplit("-", 1)[0] if current_wp else ""
-    fuel_current = ship_status.fuel_current
-    fuel_capacity = ship_status.fuel_capacity
-    engine_speed = ship_status.engine_speed
+    current_sys = get_system_from_waypoint(current_wp) if current_wp else ""
 
     ship_dict = {
-        "fuel": {"current": fuel_current, "capacity": fuel_capacity},
-        "engine": {"speed": engine_speed},
+        "fuel": {"current": ship_status.fuel_current, "capacity": ship_status.fuel_capacity},
+        "engine": {"speed": ship_status.engine_speed},
     }
+
+    if not execute:
+        return _plan_route_logic(current_wp, destination_symbol, ship_dict, mode)
 
     if current_wp == destination_symbol:
         return f"{ship_symbol} is already at {destination_symbol}.", 0.0
 
     # Inter-System Check
-    dest_sys = "-".join(destination_symbol.split("-")[:2])
+    dest_sys = get_system_from_waypoint(destination_symbol)
     target_wp_symbol = destination_symbol
     is_inter_system = current_sys != dest_sys
 
@@ -825,50 +918,6 @@ def _navigate_ship_logic(
 
         local_jg_sym = local_jgs[0]["symbol"]
 
-        # ---------------------------------------------------------
-        # PLAN MODE (execute=False)
-        # ---------------------------------------------------------
-        if not execute:
-            lines = [f"Inter-System Route Plan: {current_wp} -> {destination_symbol}"]
-
-            # Leg 1: Distance to local gate
-            local_wps = get_system_waypoints(current_sys)
-            origin_obj = next((w for w in local_wps if w["symbol"] == current_wp), None)
-            local_jg_obj = next(
-                (w for w in local_wps if w["symbol"] == local_jg_sym), None
-            )
-            t1, c1 = 0, 0
-            if current_wp != local_jg_sym and origin_obj and local_jg_obj:
-                _, c1, t1 = _calculate_travel_cost(ship_dict, local_jg_obj, origin_obj, mode)
-
-            lines.append(f"1. Nav to local gate ({local_jg_sym}): {t1}s, {c1} fuel")
-
-            # Check connections
-            jg_data = client.get_jump_gate(current_sys, local_jg_sym)
-            connections = (
-                jg_data.get("connections", [])
-                if isinstance(jg_data, dict) and "error" not in jg_data
-                else []
-            )
-            connected_systems = ["-".join(cw.split("-")[:2]) for cw in connections]
-
-            if dest_sys in connected_systems:
-                lines.append(
-                    f"2. Jump directly to {dest_sys} gate: Antimatter / Cooldown"
-                )
-            else:
-                lines.append(
-                    f"2. Multi-system Jump Route to {dest_sys}: (Auto-routing via nearest connected system)"
-                )
-
-            lines.append(
-                f"3. Nav to final dest ({destination_symbol}): Calculated upon arrival in {dest_sys}"
-            )
-            return "\n".join(lines), 0.0
-
-        # ---------------------------------------------------------
-        # EXECUTE MODE (execute=True)
-        # ---------------------------------------------------------
         if current_wp != local_jg_sym:
             # Step 1: Navigate to the local jump gate first.
             target_wp_symbol = local_jg_sym
@@ -885,7 +934,7 @@ def _navigate_ship_logic(
             # Map connections to their system symbols (sys -> exact waypoint)
             connected_systems = {}
             for cw in connections:
-                cs = "-".join(cw.split("-")[:2])
+                cs = get_system_from_waypoint(cw)
                 connected_systems[cs] = cw
 
             if dest_sys in connected_systems:
@@ -931,7 +980,7 @@ def _navigate_ship_logic(
             if _fleet and cd > 0:
                 _fleet.set_transit(ship_symbol, float(cd))
 
-            next_sys = "-".join(next_jump_target.split("-")[:2])
+            next_sys = get_system_from_waypoint(next_jump_target)
             return (
                 f"🚀 JUMPED to {next_sys} (Routing towards {dest_sys}). Cooldown: {cd}s.",
                 float(cd),
@@ -957,127 +1006,80 @@ def _navigate_ship_logic(
         # If we are inter-system, target_obj is the Jump Gate, which must exist (checked above)
         raise Exception("Could not resolve Jump Gate coordinates.")
 
-    # Execute Logic
-    if execute:
-        # 1. SMART REFUEL AT DEPARTURE
-        # Only refuel if the current market sells fuel AND we are not full.
-        if fuel_capacity > 0:
-            market_cache = load_market_cache()
-            curr_market = market_cache.get(current_wp, {})
-            has_fuel = "FUEL" in curr_market.get(
-                "exchange", []
-            ) or "FUEL" in curr_market.get("exports", [])
+    # 1. SMART REFUEL AT DEPARTURE
+    # Only refuel if the current market sells fuel AND we are not full.
+    fuel_current = ship_status.fuel_current
+    fuel_capacity = ship_status.fuel_capacity
+    if fuel_capacity > 0:
+        market_cache = load_market_cache()
+        curr_market = market_cache.get(current_wp, {})
+        has_fuel = "FUEL" in curr_market.get(
+            "exchange", []
+        ) or "FUEL" in curr_market.get("exports", [])
 
-            if has_fuel and fuel_current < fuel_capacity:
-                try:
-                    _refuel_ship_logic(ship_symbol)
-                    # Re-read from fleet tracker (synced via _intercept inside _refuel_ship_logic)
-                    ship_status = _get_local_ship(ship_symbol)
-                    fuel_current = ship_status.fuel_current
-                    fuel_capacity = ship_status.fuel_capacity
-                    ship_dict["fuel"] = {"current": fuel_current, "capacity": fuel_capacity}
-                except Exception:
-                    pass
+        if has_fuel and fuel_current < fuel_capacity:
+            try:
+                _refuel_ship_logic(ship_symbol)
+                # Re-read from fleet tracker (synced via _intercept inside _refuel_ship_logic)
+                ship_status = _get_local_ship(ship_symbol)
+                fuel_current = ship_status.fuel_current
+                fuel_capacity = ship_status.fuel_capacity
+                ship_dict["fuel"] = {"current": fuel_current, "capacity": fuel_capacity}
+            except Exception:
+                pass
 
-        _, direct_cost, direct_time = _calculate_travel_cost(
-            ship_dict, target_obj, origin_obj, mode
-        )
+    _, direct_cost, direct_time = _calculate_travel_cost(
+        ship_dict, target_obj, origin_obj, mode
+    )
 
-        # 2. Route Check
-        next_hop = target_wp_symbol
-        is_multi_hop = False
+    # 2. Route Check
+    next_hop = target_wp_symbol
+    is_multi_hop = False
 
-        if fuel_capacity > 0 and direct_cost > fuel_current:
-            path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode)
-            if not path:
-                raise Exception(
-                    f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found."
-                )
-
-            if len(path) > 1:
-                next_hop = path[1]
-                is_multi_hop = True
-                next_hop_obj = next(
-                    (w for w in waypoints if w["symbol"] == next_hop), None
-                )
-                _, _, direct_time = _calculate_travel_cost(
-                    ship_dict, next_hop_obj, origin_obj, mode
-                )
-
-        # Action
-        _ensure_orbit_logic(ship_symbol)
-        if ship_status.flight_mode != mode:
-            client.set_flight_mode(ship_symbol, mode)
-            _intercept(ship_symbol, {"nav": {"flightMode": mode}})
-
-        data = client.navigate(ship_symbol, next_hop)
-        _intercept(ship_symbol, data)
-        if isinstance(data, dict) and "error" in data:
-            raise Exception(f"Error navigating: {data['error']}")
-
-        wait_secs = _parse_arrival(data.get("nav", {}))
-        # Navigate was called — transit MUST be > 0. If _parse_arrival returned 0
-        # (e.g. arrival already past due to latency, or missing nav data),
-        # fall back to the calculated estimate so transit always registers.
-        if wait_secs <= 0:
-            wait_secs = max(float(direct_time), 1.0)
-        if _fleet:
-            _fleet.set_transit(ship_symbol, wait_secs)
-        result = (
-            f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
-        )
-
-        if is_multi_hop:
-            result += (
-                f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
-            )
-            result += (
-                f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
-            )
-        elif is_inter_system:
-            result += (
-                f"\nNote: En route to Jump Gate. Will execute system jump upon arrival."
+    if fuel_capacity > 0 and direct_cost > fuel_current:
+        path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode)
+        if not path:
+            raise Exception(
+                f"Stranded. Cannot reach {target_wp_symbol} ({direct_cost} fuel needed) and no refueling path found."
             )
 
-        return result, wait_secs
-
-    else:
-        # 4. Planning Mode (Comparison Table)
-        lines = [f"Route Plan: {current_wp} -> {target_wp_symbol}"]
-        if is_inter_system:
-            lines.append(
-                f"Note: {target_wp_symbol} is the Jump Gate to reach {dest_sys}."
+        if len(path) > 1:
+            next_hop = path[1]
+            is_multi_hop = True
+            next_hop_obj = next(
+                (w for w in waypoints if w["symbol"] == next_hop), None
+            )
+            _, _, direct_time = _calculate_travel_cost(
+                ship_dict, next_hop_obj, origin_obj, mode
             )
 
-        # Check Direct
-        dist, direct_cost, direct_time = _calculate_travel_cost(
-            ship_dict, target_obj, origin_obj, "CRUISE"
-        )
-        lines.append(f"Direct Distance: {dist}")
+    # Action
+    _ensure_orbit_logic(ship_symbol)
+    if ship_status.flight_mode != mode:
+        client.set_flight_mode(ship_symbol, mode)
+        _intercept(ship_symbol, {"nav": {"flightMode": mode}})
 
-        lines.append("\nFlight Modes:")
-        for m in ["CRUISE", "DRIFT", "BURN"]:
-            path = _find_refuel_path(ship_dict, origin_obj, target_obj, waypoints, mode=m)
+    data = client.navigate(ship_symbol, next_hop)
+    _intercept(ship_symbol, data)
+    if isinstance(data, dict) and "error" in data:
+        raise Exception(f"Error navigating: {data['error']}")
 
-            _, cost, time = _calculate_travel_cost(ship_dict, target_obj, origin_obj, m)
+    wait_secs = _parse_arrival(data.get("nav", {}))
+    # Navigate was called — transit MUST be > 0. If _parse_arrival returned 0
+    # (e.g. arrival already past due to latency, or missing nav data),
+    # fall back to the calculated estimate so transit always registers.
+    if wait_secs <= 0:
+        wait_secs = max(float(direct_time), 1.0)
+    if _fleet:
+        _fleet.set_transit(ship_symbol, wait_secs)
+    result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
 
-            status = ""
-            if fuel_capacity > 0:
-                if cost <= fuel_current:
-                    status = "✅ Direct"
-                elif path:
-                    stops = len(path) - 2  # Exclude start/end
-                    status = f"✅ Multi-hop ({stops} stops: {'->'.join(path)})"
-                else:
-                    status = "❌ Impossible (Max range exceeded)"
-            else:
-                status = "✅ (Solar)"
+    if is_multi_hop:
+        result += f"\nNote: Multi-hop route initiated. Stopping at {next_hop} to refuel."
+    elif is_inter_system:
+        result += f"\nNote: En route to Jump Gate. Will execute system jump upon arrival."
 
-            lines.append(
-                f"  {m.ljust(7)}: {str(time).rjust(4)}s | Fuel: {str(cost).rjust(4)} | {status}"
-            )
-
-        return "\n".join(lines), 0.0
+    return result, wait_secs
 
 
 def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
