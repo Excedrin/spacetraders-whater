@@ -65,8 +65,11 @@ class ShipStatus:
         new_avg = (current_avg * current_units + price_per_unit * units_bought) / (current_units + units_bought)
         self.cargo_costs[good_symbol] = new_avg
 
-    def update_cargo_costs_on_sell(self, good_symbol: str, units_sold: int):
-        """Update cargo costs when cargo is sold/jettisoned."""
+    def update_cargo_costs_on_sell(self, good_symbol: str):
+        """Update cargo costs when cargo is sold/jettisoned.
+
+        Removes cost tracking for goods that are no longer in inventory.
+        """
         if good_symbol not in self.cargo_costs:
             return
         remaining_units = sum(u for item in self.cargo_inventory if item["symbol"] == good_symbol for u in [item["units"]])

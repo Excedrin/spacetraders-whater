@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import math
@@ -8,7 +7,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ship_status import FleetTracker
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -27,12 +29,57 @@ GATE_MIN_CREDIT_BUFFER = 250_000
 RESERVE_BUFFER = 350_000
 
 # Fleet tracker — injected by the caller (bot.py or play_cli.py) via set_fleet().
-_fleet = None
+_fleet_impl: "FleetTracker | None" = None
 
 
-def set_fleet(f):
-    global _fleet
-    _fleet = f
+def get_fleet() -> "FleetTracker":
+    """Get the fleet tracker. Raises error if not initialized.
+
+    Returns:
+        The FleetTracker instance
+
+    Raises:
+        RuntimeError: If set_fleet() was not called first
+    """
+    if _fleet_impl is None:
+        raise RuntimeError(
+            "Fleet tracker not initialized. Call set_fleet() before using tools."
+        )
+    return _fleet_impl
+
+
+def set_fleet(f: "FleetTracker"):
+    """Initialize the fleet tracker instance.
+
+    Args:
+        f: FleetTracker instance to use for ship state management
+    """
+    global _fleet_impl
+    _fleet_impl = f
+    # Also initialize strategy module with fleet reference
+    try:
+        from strategy import (
+            set_fleet as set_strategy_fleet,
+            set_hq_managed_ships as set_strategy_hq
+        )
+        set_strategy_fleet(f)
+        # Sync HQ settings if already initialized
+        global _hq_managed_ships
+        set_strategy_hq(_hq_managed_ships)
+    except ImportError:
+        pass  # strategy.py not yet available
+
+
+def try_get_fleet() -> "FleetTracker | None":
+    """Try to get the fleet tracker, returning None if not initialized.
+
+    Use this for optional operations where it's OK if the fleet isn't available.
+    For required operations, use get_fleet() instead.
+
+    Returns:
+        The FleetTracker instance, or None if not initialized
+    """
+    return _fleet_impl
 
 
 # Alert queue — injected by the server via set_alert_queue()
@@ -323,7 +370,7 @@ def _get_local_ship(ship_symbol: str):
     if ship is not yet tracked.
     """
     if _fleet:
-        ship = _fleet.get_ship(ship_symbol)
+        ship = get_fleet().get_ship(ship_symbol)
         if ship:
             return ship
 
@@ -331,21 +378,21 @@ def _get_local_ship(ship_symbol: str):
     raw = client.get_ship(ship_symbol)
     if isinstance(raw, dict) and "error" not in raw:
         if _fleet:
-            _fleet.update_from_api([raw])
-        return _fleet.get_ship(ship_symbol)
+            get_fleet().update_from_api([raw])
+            return get_fleet().get_ship(ship_symbol)
     raise Exception(f"Ship {ship_symbol} not found.")
 
 
 def _intercept_agent(data: dict):
     """Intercepts action payloads to update local agent state (e.g., credits)."""
-    if _fleet and isinstance(data, dict) and "agent" in data:
-        _fleet.update_agent(data["agent"])
+    if isinstance(data, dict) and "agent" in data:
+        get_fleet().update_agent(data["agent"])
 
 
 def _get_local_agent() -> dict:
     """Get agent from local tracker, eliminating GET /my/agent requests."""
-    if _fleet and _fleet.agent:
-        return _fleet.agent
+    if get_fleet().agent:
+        return get_fleet().agent
 
     # Absolute fallback if agent is not in tracker
     raw = client.get_agent()
@@ -475,7 +522,7 @@ def evaluate_fleet_strategy(system_symbol: str | None = None) -> dict:
     credits = agent.get("credits", 0)
 
     # Read instantly from local memory instead of API
-    ships = list(_fleet.ships.values()) if _fleet else []
+    ships = list(get_fleet().ships.values()) if _fleet else []
 
     total_ships = len(ships)
     trader_count = sum(
@@ -977,8 +1024,8 @@ def _navigate_ship_logic(
                 )
 
             cd = jump_res.get("cooldown", {}).get("remainingSeconds", 0)
-            if _fleet and cd > 0:
-                _fleet.set_transit(ship_symbol, float(cd))
+            if cd > 0:
+                get_fleet().set_transit(ship_symbol, float(cd))
 
             next_sys = get_system_from_waypoint(next_jump_target)
             return (
@@ -1071,7 +1118,7 @@ def _navigate_ship_logic(
     if wait_secs <= 0:
         wait_secs = max(float(direct_time), 1.0)
     if _fleet:
-        _fleet.set_transit(ship_symbol, wait_secs)
+        get_fleet().set_transit(ship_symbol, wait_secs)
     result = f"🚀 {ship_symbol} navigating to {next_hop} ({mode}). Est: {direct_time}s."
 
     if is_multi_hop:
@@ -1086,7 +1133,7 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     """Returns (log_string, cooldown_seconds)."""
     # Check cooldown from fleet tracker (avoids an extra API call)
     if _fleet:
-        ship_status = _fleet.get_ship(ship_symbol)
+        ship_status = get_fleet().get_ship(ship_symbol)
         if (
             ship_status
             and not ship_status.is_available()
@@ -1129,7 +1176,7 @@ def _extract_ore_logic(ship_symbol: str) -> Tuple[str, float]:
     result += f" Cargo: {cargo.get('units', 0)}/{cargo.get('capacity', '?')}."
     cd_secs = float(cd.get("remainingSeconds", 0))
     if _fleet and cd_secs > 0:
-        _fleet.set_extraction_cooldown(ship_symbol, cd_secs)
+        get_fleet().set_extraction_cooldown(ship_symbol, cd_secs)
     return result, cd_secs
 
 
@@ -1214,7 +1261,7 @@ def _sell_cargo_logic(
         sell_count += 1
 
         # Update cargo costs on sell
-        ship.update_cargo_costs_on_sell(trade_symbol, units_sold)
+        ship.update_cargo_costs_on_sell(trade_symbol)
 
         # 1. Did the price drop below our floor on THIS transaction?
         if min_price and price_per_unit < min_price:
@@ -1482,7 +1529,7 @@ def _buy_ship_logic(ship_type: str, waypoint_symbol: str, fleet=None) -> dict:
     if fleet and "ship" in data:
         fleet.update_from_api([data["ship"]])
     elif _fleet and "ship" in data:
-        _fleet.update_from_api([data["ship"]])
+        get_fleet().update_from_api([data["ship"]])
 
     return {
         "ship": new_ship,
@@ -3184,7 +3231,7 @@ class BehaviorEngine:
         credits = agent.get("credits", 0)
 
         # Calculate Required Reserve (same logic as the HUD)
-        ships = list(_fleet.ships.values()) if _fleet else []
+        ships = list(get_fleet().ships.values()) if _fleet else []
         trader_count = sum(
             1
             for s in ships
@@ -3658,7 +3705,7 @@ def view_ships(system_symbol: str | None = None) -> str:
         return f"Error: {data['error']}"
 
     if _fleet:
-        _fleet.update_from_api(data)
+        get_fleet().update_from_api(data)
 
     # Filter by system first if requested
     if system_symbol:
@@ -3686,7 +3733,7 @@ def view_ships(system_symbol: str | None = None) -> str:
             # Check extraction cooldown
             cd_text = ""
             if _fleet:
-                ship_status = _fleet.get_ship(symbol)
+                ship_status = get_fleet().get_ship(symbol)
                 if (
                     ship_status
                     and not ship_status.is_available()
